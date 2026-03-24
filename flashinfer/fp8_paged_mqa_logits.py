@@ -71,7 +71,7 @@ def fp8_paged_mqa_logits(
     assert fused_kv_cache.dtype == torch.uint8
     assert weights.dtype == torch.float32
     assert head_dim_with_sf == head_dim + 4
-    assert block_kv == 64
+    assert block_kv in (32, 64), f"block_kv must be 32 or 64, got {block_kv}"
     assert next_n in (1, 2)
 
     q_flat = q.reshape(batch * next_n * num_heads, head_dim).contiguous()
