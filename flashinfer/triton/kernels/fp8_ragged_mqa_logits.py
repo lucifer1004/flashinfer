@@ -49,7 +49,11 @@ def _fp8_ragged_mqa_logits_kernel(
     BLOCK_KV: tl.constexpr,
     KV_GROUPS: tl.constexpr,
 ):
-    """FP8 ragged MQA logits: one program per (Q token, KV group)."""
+    """FP8 ragged MQA logits: one program per (Q token, KV group).
+
+    Uses tl.dot for tensor core matmul.
+    Processes KV_GROUPS consecutive KV blocks per program, amortizing Q load.
+    """
     pid_q = tl.program_id(0)
     pid_kv_group = tl.program_id(1)
 
@@ -61,9 +65,9 @@ def _fp8_ragged_mqa_logits_kernel(
     if first_kv >= kv_len:
         return
 
-    token_offsets = tl.arange(0, BLOCK_KV)
     dim_offsets = tl.arange(0, HEAD_DIM)
     head_offsets = tl.arange(0, NUM_HEADS)
+    token_offsets = tl.arange(0, BLOCK_KV)
 
     # Load Q once: [NUM_HEADS, HEAD_DIM] as FP8
     q_ptrs = Q + (pid_q * NUM_HEADS + head_offsets[:, None]) * HEAD_DIM + dim_offsets[None, :]
@@ -77,10 +81,10 @@ def _fp8_ragged_mqa_logits_kernel(
         kv_offset = first_kv + grp * BLOCK_KV
 
         if kv_offset < kv_len:
-            abs_kv = kv_start + kv_offset  # absolute position in K buffer
+            abs_kv = kv_start + kv_offset
             valid_tokens = tl.minimum(BLOCK_KV, kv_len - kv_offset)
 
-            # Load K: [BLOCK_KV, HEAD_DIM] FP8
+            # Load K: [BLOCK_KV, HEAD_DIM] FP8 — contiguous in K buffer
             k_ptrs = K_FP8 + (abs_kv + token_offsets[:, None]) * stride_k + dim_offsets[None, :]
             k_mask = token_offsets[:, None] < valid_tokens
             k_fp8 = tl.load(k_ptrs, mask=k_mask, other=0.0)
@@ -88,7 +92,7 @@ def _fp8_ragged_mqa_logits_kernel(
             # Q @ K^T → [NUM_HEADS, BLOCK_KV] via tensor cores
             s = tl.dot(q_fp8, tl.trans(k_fp8), out_dtype=tl.float32)
 
-            # Load per-token scale: [BLOCK_KV] (single scale per token for indexer K)
+            # Load per-token scale: [BLOCK_KV]
             scales = tl.load(
                 K_SCALE + (abs_kv + token_offsets) * stride_ks,
                 mask=token_offsets < valid_tokens, other=0.0,
@@ -98,8 +102,8 @@ def _fp8_ragged_mqa_logits_kernel(
             s = s * scales[None, :]
             s = tl.maximum(s, 0.0)
             s = s * weights[:, None]
-            logits_out = tl.sum(s, axis=0)  # [BLOCK_KV]
+            logits_out = tl.sum(s, axis=0)
 
-            # Store to output at absolute KV position
+            # Store
             out_ptrs = LOGITS + pid_q * stride_logits + abs_kv + token_offsets
             tl.store(out_ptrs, logits_out, mask=token_offsets < valid_tokens)

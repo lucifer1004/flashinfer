@@ -81,8 +81,12 @@ def fp8_ragged_mqa_logits(
     # Compute max KV range for grid sizing
     max_kv_len = (ke - ks).max().item()
     BLOCK_KV = 64
-    KV_GROUPS = min(4, (max_kv_len + BLOCK_KV - 1) // BLOCK_KV) if max_kv_len > 0 else 1
-    grid_kv = (max_kv_len + BLOCK_KV * KV_GROUPS - 1) // (BLOCK_KV * KV_GROUPS)
+    num_kv_blocks = (max_kv_len + BLOCK_KV - 1) // BLOCK_KV if max_kv_len > 0 else 1
+
+    # More KV blocks per program → amortize Q load, reduce grid overhead.
+    # With num_stages=2, Triton pipelines K loads with tl.dot compute.
+    KV_GROUPS = min(32, num_kv_blocks)
+    grid_kv = (num_kv_blocks + KV_GROUPS - 1) // KV_GROUPS
 
     grid = (num_q_total, grid_kv)
     _fp8_ragged_mqa_logits_kernel[grid](
@@ -101,7 +105,7 @@ def fp8_ragged_mqa_logits(
         BLOCK_KV=BLOCK_KV,
         KV_GROUPS=KV_GROUPS,
         num_warps=4,
-        num_stages=1,
+        num_stages=2,
     )
 
     if clean_logits:
