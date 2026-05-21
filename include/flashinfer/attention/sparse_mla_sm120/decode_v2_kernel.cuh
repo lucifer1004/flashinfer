@@ -277,21 +277,25 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
             (PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE || !is_extra_tile) ? page_block_size
                                                                          : page_block_size_extra;
 
-        const uint8_t* entry_base[ENTRIES_PER_WARP];
-        if constexpr (KV::V_HAS_ROPE) {
-#pragma unroll
-          for (int e = 0; e < ENTRIES_PER_WARP; e++) {
-            int idx = ib[qk_nb + e];
-            idx = (idx >= 0) ? idx : 0;
-            int bi_e = idx / tile_page_block_size;
-            int li_e = idx % tile_page_block_size;
-            entry_base[e] =
-                tile_kv_cache + (size_t)bi_e * tile_stride + (size_t)li_e * IO::IO_STRIDE;
-          }
-        } else {
+        // Only entry_base[gid] is read (line ~329 below), and gid is per-lane
+        // constant within a warp (= lane >> 2 ∈ 0..7). Each thread therefore
+        // needs just ONE pointer, not an array of 8. The previous version
+        // declared a full register array of size ENTRIES_PER_WARP and the
+        // V_HAS_ROPE branch initialised all 8 slots — 7 of which were dead
+        // per thread, costing ~56 B of spill stack each. Single-pointer form
+        // matches the !V_HAS_ROPE branch's intent and is correct for both.
+        const uint8_t* entry_base_local;
+        {
           int idx = ib[qk_nb + gid];
           idx = (idx >= 0) ? idx : 0;
-          entry_base[gid] = tile_kv_cache + (size_t)idx * IO::IO_STRIDE;
+          if constexpr (KV::V_HAS_ROPE) {
+            int bi_e = idx / tile_page_block_size;
+            int li_e = idx % tile_page_block_size;
+            entry_base_local =
+                tile_kv_cache + (size_t)bi_e * tile_stride + (size_t)li_e * IO::IO_STRIDE;
+          } else {
+            entry_base_local = tile_kv_cache + (size_t)idx * IO::IO_STRIDE;
+          }
         }
 
         for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
@@ -326,7 +330,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
         }
 
         KVRopePrefetch rope_pf = prefetch_kv_rope(
-            reinterpret_cast<const bf16*>(entry_base[gid] + KV::KV_ROPE_GMEM_OFFSET), lane);
+            reinterpret_cast<const bf16*>(entry_base_local + KV::KV_ROPE_GMEM_OFFSET), lane);
 
         // QK nope
         float qk[4] = {0.f, 0.f, 0.f, 0.f};
@@ -446,24 +450,29 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
         warp_l[0] += ls0;
         warp_l[1] += ls1;
 
-        float vsc_cache[CT::N_V_CHUNKS][2];
+        // Phase 1: compute per-(vc, head) max |w * vsc| via atomicMax for
+        // FP8 scale extraction. Previously cached vsc into a 7×2 per-thread
+        // register array for re-use in phase 2 below; that cost ~56 B of
+        // spill stack per math thread. Re-reading from shared memory in
+        // phase 2 instead is cheaper than the spill traffic.
         {
           const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
           const uint8_t* e0_base = kv_warp_base + tid * 2 * KV::KV_SMEM_STRIDE;
           const uint8_t* e1_base = e0_base + KV::KV_SMEM_STRIDE;
 #pragma unroll
           for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
+            float vsc0, vsc1;
             if constexpr (KV::SCALE_IN_KV_SMEM) {
-              vsc_cache[vc][0] = reinterpret_cast<const float*>(e0_base + KV::D_NOPE)[vc];
-              vsc_cache[vc][1] = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
+              vsc0 = reinterpret_cast<const float*>(e0_base + KV::D_NOPE)[vc];
+              vsc1 = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
             } else {
-              vsc_cache[vc][0] =
-                  ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
-              vsc_cache[vc][1] =
-                  ue8m0_to_fp32(sm.kv_scale_bufs[ti & 1][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+              vsc0 = ue8m0_to_fp32(
+                  sm.kv_scale_bufs[ti & 1][e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+              vsc1 = ue8m0_to_fp32(
+                  sm.kv_scale_bufs[ti & 1][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
             }
-            float ws00 = w0 * vsc_cache[vc][0], ws01 = w1 * vsc_cache[vc][1];
-            float ws10 = w2 * vsc_cache[vc][0], ws11 = w3 * vsc_cache[vc][1];
+            float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
+            float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
             atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid]),
                       __float_as_int(fmaxf(fabsf(ws00), fabsf(ws01))));
             atomicMax(reinterpret_cast<int*>(&sm.w_head_sc_all[vc * HPB + gid + 8]),
@@ -479,12 +488,25 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
         // XV nope
         {
           const int e0i = qk_nb + tid * 2, e1i = e0i + 1;
+          const uint8_t* e0_base = kv_warp_base + tid * 2 * KV::KV_SMEM_STRIDE;
+          const uint8_t* e1_base = e0_base + KV::KV_SMEM_STRIDE;
 #pragma unroll
           for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
             float* vc_sc = sm.w_head_sc_all + vc * HPB;
             uint8_t* wfp8 = sm.w_fp8 + vc * L::SMEM_W_FP8_ONE;
             float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
-            float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
+            // Re-read per-token scales from smem (was cached in vsc_cache,
+            // now reread to save register/spill pressure).
+            float vsc0, vsc1;
+            if constexpr (KV::SCALE_IN_KV_SMEM) {
+              vsc0 = reinterpret_cast<const float*>(e0_base + KV::D_NOPE)[vc];
+              vsc1 = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
+            } else {
+              vsc0 = ue8m0_to_fp32(
+                  sm.kv_scale_bufs[ti & 1][e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+              vsc1 = ue8m0_to_fp32(
+                  sm.kv_scale_bufs[ti & 1][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+            }
             float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
             float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
             __nv_fp8_e4m3 f00(fmaxf(-FP8_MAX, fminf(FP8_MAX, ws00 * si0)));
