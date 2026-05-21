@@ -124,6 +124,27 @@ def main():
     print(f"  v3 output  abs.max = {out_v3.abs().max().item():.4f}")
     print(f"  v3 lse     abs.max = {lse_v3.abs().max().item():.4f}")
 
+    # Perf bench v3
+    import time
+    module = gen_sparse_mla_sm120_module().build_and_load()
+    d_v = 512
+    mid = torch.empty(num_tokens, num_heads, 8, d_v, dtype=torch.bfloat16, device=device)
+    mid_lse = torch.empty(num_tokens, num_heads, 8, dtype=torch.float32, device=device)
+    output_v3 = torch.empty(num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device)
+    out_lse_v3 = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
+    for _ in range(5):
+        module.sparse_mla_sm120_decode_v3(q, kv_flat, indices, mid, mid_lse, output_v3, out_lse_v3, 8, sm_scale, None)
+    torch.cuda.synchronize()
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    start_evt.record()
+    for _ in range(50):
+        module.sparse_mla_sm120_decode_v3(q, kv_flat, indices, mid, mid_lse, output_v3, out_lse_v3, 8, sm_scale, None)
+    end_evt.record()
+    torch.cuda.synchronize()
+    v3_us = start_evt.elapsed_time(end_evt) / 50 * 1000
+    print(f"\n  v3 perf: {v3_us:.1f} us/iter at h={num_heads} topk={topk} T={num_tokens}")
+
     # Compare
     out_f32_v2 = out_v2.float()
     out_f32_v3 = out_v3.float()

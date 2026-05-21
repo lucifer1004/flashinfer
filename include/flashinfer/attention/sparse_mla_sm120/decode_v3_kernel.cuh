@@ -98,6 +98,10 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   bf16* sm_kv = sm_q + (size_t)HPB * D_QK;
   float* sm_warp_max = reinterpret_cast<float*>(sm_kv + (size_t)V3_BI * D_QK);
   float* sm_warp_sum = sm_warp_max + V3_N_WARPS * HPB;
+  // Cross-warp XV merge buffer — separate from sm_kv because we still
+  // need to read V from sm_kv across the outer head loop. Cannot reuse
+  // sm_kv; that would corrupt V midway through the loop.
+  float* sm_head_buf = sm_warp_sum + V3_N_WARPS * HPB;  // [D_V] = 2 KB
 
   // ── Stage 0: load Q for (t_idx, h_block) ─────────────────────────
   // Q layout: [num_tokens, num_heads, D_QK] bf16. We load HPB heads
@@ -176,9 +180,12 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
         const int qt = b / QUANT_TILE;  // which scale tile
         const uint8_t scale_byte = static_cast<uint8_t>((scale_packed >> (qt * 8)) & 0xFF);
         const float scale = ue8m0_to_fp32(scale_byte);
-        const __nv_fp8_e4m3 raw{
-            static_cast<__nv_fp8_storage_t>(data_base[b])};
-        const float v = static_cast<float>(raw);
+        // Note: `__nv_fp8_e4m3 raw{byte}; static_cast<float>(raw)` was
+        // dropping the sign bit (positive-only output) — confirmed via
+        // printf. Use __half conversion as the canonical decode path.
+        __nv_fp8_e4m3 raw;
+        raw.__x = static_cast<__nv_fp8_storage_t>(data_base[b]);
+        const float v = static_cast<float>(static_cast<__half>(raw));
         kv_dst[b] = __float2bfloat16(is_valid_cand ? (v * scale) : 0.0f);
       }
       // RoPE half: already bf16 in gmem, 128 bytes = 64 bf16, copy verbatim.
@@ -335,16 +342,31 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
 
   // First HPB threads compute global max/sum per head and overwrite the
   // [0..HPB) slots of sm_warp_max/sm_warp_sum with the global values.
+  // CAUTION: sm_warp_max[w*HPB+h] for w=0, h=0 is the SAME slot as
+  // sm_warp_max[0]. So the first thread (which writes h=0 slot) needs
+  // to read all 4 warp_max values FIRST before overwriting. The loop
+  // below reads then writes — sequence is fine in this single-thread
+  // body, but we must NOT have other threads writing to slot 0 from a
+  // different access while we read. The __syncthreads above guarantees
+  // all 4 warps' writes have completed before any thread reads.
+  // After the write, slot 0 holds gmax for h=0 (overwriting warp 0's
+  // local_max for h=0). The same is true for the next 15 slots.
   if (threadIdx.x < HPB) {
     const int h = threadIdx.x;
+    // Read all 4 per-warp values into registers FIRST.
+    float wmax[V3_N_WARPS];
+    float wsum[V3_N_WARPS];
+#pragma unroll
+    for (int w = 0; w < V3_N_WARPS; w++) {
+      wmax[w] = sm_warp_max[w * HPB + h];
+      wsum[w] = sm_warp_sum[w * HPB + h];
+    }
     float gmax = -1e30f;
 #pragma unroll
-    for (int w = 0; w < V3_N_WARPS; w++)
-      gmax = fmaxf(gmax, sm_warp_max[w * HPB + h]);
+    for (int w = 0; w < V3_N_WARPS; w++) gmax = fmaxf(gmax, wmax[w]);
     float gsum = 0.f;
 #pragma unroll
-    for (int w = 0; w < V3_N_WARPS; w++)
-      gsum += sm_warp_sum[w * HPB + h] * exp2f(sm_warp_max[w * HPB + h] - gmax);
+    for (int w = 0; w < V3_N_WARPS; w++) gsum += wsum[w] * exp2f(wmax[w] - gmax);
     sm_warp_max[h] = gmax;
     sm_warp_sum[h] = gsum;
   }
@@ -397,7 +419,6 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   //
   // Per-lane register state: warp_acc[16] = 64 bytes. Trivial.
   // The cross-warp merge is via shared memory atomic-add.
-  float* sm_head_buf = reinterpret_cast<float*>(sm_kv);  // reuse 64 KB
   const bf16* sm_kv_warp_x = sm_kv + (size_t)warp_id * V3_ENTRIES_PER_WARP * D_QK;
   const size_t mid_o_base_ll = ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V +
                                (size_t)split_idx * D_V;

@@ -32,16 +32,16 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
 
   // Stage 1: decode-v3 partial-output kernel.
   // Dynamic smem layout (matches kernel allocation):
-  //   sm_q   [HPB, D_QK]            bf16   = 16 KB
-  //   sm_kv  [V3_BI, D_QK]          bf16   = 64 KB
-  //   sm_warp_max [V3_N_WARPS * HPB] float = 0.25 KB
-  //   sm_warp_sum [V3_N_WARPS * HPB] float = 0.25 KB
-  // Static smem (compiler-allocated, not in this number):
-  //   sm_p_storage [N_WARPS, HPB, ENTRIES_PER_WARP] float = 4 KB
-  //   sm_partial   [HPB, D_V]                       float = 32 KB
+  //   sm_q          [HPB, D_QK]            bf16  = 16 KB
+  //   sm_kv         [V3_BI, D_QK]          bf16  = 64 KB
+  //   sm_warp_max   [V3_N_WARPS * HPB]     float = 0.25 KB
+  //   sm_warp_sum   [V3_N_WARPS * HPB]     float = 0.25 KB
+  //   sm_head_buf   [D_V]                   float = 2 KB
+  // Static smem:
+  //   sm_p_storage  [N_WARPS, HPB, ENTRIES_PER_WARP] float = 4 KB
   constexpr int DYN_SMEM_BYTES =
       HPB * KV::D_QK * (int)sizeof(bf16) + V3_BI * KV::D_QK * (int)sizeof(bf16) +
-      2 * V3_N_WARPS * HPB * (int)sizeof(float);
+      2 * V3_N_WARPS * HPB * (int)sizeof(float) + KV::D_V * (int)sizeof(float);
 
   auto kernel = sparse_mla_decode_v3_kernel<MT, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
   CUDA_CHECK_BOOL(cudaFuncSetAttribute(
