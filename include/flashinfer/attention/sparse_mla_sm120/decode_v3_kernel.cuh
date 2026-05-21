@@ -365,8 +365,8 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   // heads but DIFFERENT 16-candidate slices. Need to reduce across
   // warps before writing.
   //
-  // Step: reduce per-(head, dim) across warps via shared memory.
-  __shared__ float sm_partial[HPB][D_V];  // 16 × 512 × 4 = 32 KB
+  // Step: reduce per-(head, dim) across warps via shared memory. We reuse
+  // sm_kv (dynamic, 64 KB) after the XV pass — see below.
   // Each warp writes its partial output into sm_partial (with atomic
   // add to merge), normalized by its local_sum so the output is
   // (sum_c p[c] V[c, :]) / sum_c p[c]. Combined with warp_max →
@@ -419,21 +419,21 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
     acc[1][d] *= warp_resc1 * inv_g_sum1;
   }
 
-  // Use sm_partial to sum across warps.
-  // Initialize:
-  if (warp_id == 0) {
-    // We re-purpose sm_partial. Need to zero it first.
-    for (int i = threadIdx.x; i < HPB * D_V; i += V3_BLOCK_THREADS) {
-      reinterpret_cast<float*>(&sm_partial[0][0])[i] = 0.0f;
-    }
+  // Reuse sm_kv (64 KB) as the cross-warp merge buffer (32 KB needed for
+  // sm_partial[HPB=16][D_V=512] float). sm_kv is dead after the XV pass.
+  // Layout: sm_partial[h][d] = sm_kv_as_float[h * D_V + d].
+  float* sm_partial = reinterpret_cast<float*>(sm_kv);
+  // Zero the partial buffer.
+  for (int i = threadIdx.x; i < HPB * D_V; i += V3_BLOCK_THREADS) {
+    sm_partial[i] = 0.0f;
   }
   __syncthreads();
 
   // Each lane atomicAdds its 32 floats (2 heads × 16 dim) into sm_partial.
 #pragma unroll
   for (int d = 0; d < DIM_PER_LANE; d++) {
-    atomicAdd(&sm_partial[gid][lane * DIM_PER_LANE + d], acc[0][d]);
-    atomicAdd(&sm_partial[gid + 8][lane * DIM_PER_LANE + d], acc[1][d]);
+    atomicAdd(&sm_partial[gid * D_V + lane * DIM_PER_LANE + d], acc[0][d]);
+    atomicAdd(&sm_partial[(gid + 8) * D_V + lane * DIM_PER_LANE + d], acc[1][d]);
   }
   __syncthreads();
 
@@ -449,7 +449,7 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
       const int linear = threadIdx.x * ELEMS_PER_THREAD + i;
       const int h = linear / D_V;
       const int d = linear % D_V;
-      float v = sm_partial[h][d];
+      float v = sm_partial[h * D_V + d];
       bf16 bv = __float2bfloat16(v);
       mid_out[mid_o_base + (size_t)h * num_splits * D_V + d] = bv;
     }
