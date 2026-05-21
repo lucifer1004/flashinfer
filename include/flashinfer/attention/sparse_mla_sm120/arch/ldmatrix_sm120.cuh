@@ -98,3 +98,17 @@ __device__ __forceinline__ void ldmatrix_load_A_bf16(uint32_t& a0, uint32_t& a1,
   int col = (lane >> 4) * 8;
   ldmatrix_x4(a0, a1, a2, a3, smem_base + row * stride_elems + col);
 }
+
+// BF16 B operand [16k × 8n] stored as a contiguous [k, n] matrix in smem.
+// For m16n8k16 MMA the B-operand mapping wants each thread to hold 4 BF16
+// values arranged as two K-rows (rows {tid*2, tid*2+1}) × {n=gid, n=gid+...}.
+// We use the .trans variant of ldmatrix.x2 which transposes 8x8 b16 tiles
+// on load — that maps shared-memory rows (=K) to register columns (=N) for
+// each thread, which is the layout the MMA expects.
+__device__ __forceinline__ void ldmatrix_load_B_bf16(uint32_t& b0, uint32_t& b1,
+                                                     const bf16* smem_base, int stride_elems,
+                                                     int lane) {
+  int row = lane & 7;
+  int col = ((lane >> 3) & 1) * 8;
+  ldmatrix_x2_trans(b0, b1, smem_base + row * stride_elems + col);
+}
