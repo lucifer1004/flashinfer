@@ -62,6 +62,8 @@ from .utils import (
 # include/flashinfer/attention/sparse_mla_sm120/{arch,model}/*.cuh.
 _HPB = 16  # heads per HPB tile (HEADS_PER_BLOCK)
 _D_V = 512  # value head dim (universal across V32 and MODEL1)
+_BI = 64  # KV partition tile size in candidates (BLOCK_SIZE_N)
+_MAX_OCCUPANCY = 2  # max additional waves of split-K parallelism beyond baseline
 _FIXED_OVERHEAD = 64  # scheduler tile-overhead constant
 
 # Decode-v2 cutoff: num_tokens > _DECODE_MAX_TOKENS routes to the prefill
@@ -73,11 +75,46 @@ _FIXED_OVERHEAD = 64  # scheduler tile-overhead constant
 _DECODE_MAX_TOKENS = 64
 
 
-def _compute_num_sm_parts(num_heads: int, device: torch.device) -> int:
-    """FlashMLA partitioning heuristic: ``num_SMs // replicate_h`` (s_q == 1)."""
+def _compute_num_sm_parts(
+    num_heads: int,
+    device: torch.device,
+    num_tokens: Optional[int] = None,
+    topk: Optional[int] = None,
+) -> int:
+    """Choose split-K partition count for decode-v2.
+
+    Without shape (``num_tokens``/``topk`` = None): returns the FlashMLA
+    baseline so the wrapper can size its workspace for any later runtime call.
+
+    With shape: pick the partition count that maximises throughput by
+    weighing two effects in the kernel:
+
+    1. The decode-v2 kernel has a bf16-direct-write fast path
+       (``is_no_split=true``, skips f32 o_accum staging and the combine
+       kernel) whenever a partition fully covers each of its batches with
+       no neighbour-partition split. For ``s_q == 1`` callers this fires
+       when ``num_sm_parts <= num_tokens`` and per-batch work fits in
+       each partition.
+    2. Grid size = ``replicate_h × num_sm_parts``; falling below ~half the
+       SM count underfills the GPU and dominates any bf16-path savings.
+
+    The chosen rule: prefer ``min(num_tokens, baseline)`` (no-split path)
+    when it still fills at least half the SMs across the head-tile dim,
+    else fall back to the FlashMLA baseline. ``num_tokens == 1`` is a
+    common decode path; we take the no-split path unconditionally there
+    since the per-token launch overhead dominates even when underfilled.
+    """
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     replicate_h = (num_heads + _HPB - 1) // _HPB
-    return max(num_sms // replicate_h, 1)
+    baseline = max(num_sms // replicate_h, 1)
+    if num_tokens is None or topk is None:
+        return baseline
+    if num_tokens == 1:
+        return 1
+    no_split = min(num_tokens, baseline)
+    if no_split * replicate_h >= num_sms // 2:
+        return no_split
+    return baseline
 
 
 # Workspace section alignment. The combine kernel issues float4 loads against
@@ -207,7 +244,8 @@ def get_sparse_mla_sm120_module():
         extra_topk_length: Optional[torch.Tensor],
     ) -> None:
         num_tokens, num_heads, _ = q.shape
-        num_sm_parts = _compute_num_sm_parts(num_heads, q.device)
+        topk = indices.shape[-1]
+        num_sm_parts = _compute_num_sm_parts(num_heads, q.device, num_tokens, topk)
         # Decode-v2 uses the workspace partitions; prefill writes output /
         # out_lse directly and ignores them. Cap the partition request at
         # the decode cutoff so the caller's workspace_buffer only needs to

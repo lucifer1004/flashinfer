@@ -243,10 +243,12 @@ void SparseMlaSm120PagedAttention(
                      << " extra_page_block_size=" << extra_page_block_size;
 
   // 3) Combine: merge per-split partials when num_sm_parts > 1.
-  // Skip the combine launch entirely for batch=1, num_sm_parts=1 (no splits
-  // to merge); the decode kernel writes the final output directly when
-  // num_splits == 1, identical to upstream's v1-bypass behavior.
-  if (num_sm_parts > 1) {
+  // Skip the combine launch entirely when no splits are possible: either
+  // num_sm_parts == 1 (single partition, decode writes output directly), or
+  // num_sm_parts <= num_batches (each partition covers a whole batch end-to-
+  // end on the s_q==1 path, so decode takes the bf16 fast path and o_accum
+  // is never populated). Matches upstream's v1-bypass behavior.
+  if (num_sm_parts > 1 && num_sm_parts > num_batches) {
     const bool combine_ok =
         launch_combine_v2(oa_ptr, la_ptr, O_ptr, LSE_ptr, ns_ptr, num_batches, s_q, num_heads,
                           static_cast<int>(num_sm_parts), attn_sink_ptr, stream);
