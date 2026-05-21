@@ -204,14 +204,28 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   float qk[2][4] = {0};  // [N-tile][m16n8 fragment]
   {
     const bf16* sm_kv_warp = sm_kv + (size_t)warp_id * V3_ENTRIES_PER_WARP * D_QK;
+    // Per-thread B-operand for bf16 mma_m16n8k16 holds 4 bf16 values arranged
+    // as K-rows {tid*2, tid*2+1, tid*2+8, tid*2+9} for the per-thread N-col.
+    // Mirrors xv_rope_mma.cuh's manual scalar-load pattern; ldmatrix.x2.trans
+    // produces a different layout we don't want.
 #pragma unroll
     for (int ks = 0; ks < D_QK / 16; ks++) {
       uint32_t a0, a1, a2, a3;
       ldmatrix_load_A_bf16(a0, a1, a2, a3, sm_q + ks * 16, D_QK, lane);
 #pragma unroll
       for (int nt = 0; nt < 2; nt++) {
-        uint32_t b0, b1;
-        ldmatrix_load_B_bf16(b0, b1, sm_kv_warp + (nt * 8) * D_QK + ks * 16, D_QK, lane);
+        const int cand_idx = nt * 8 + gid;  // N-col owned by this thread
+        const bf16* k_row_ptr = sm_kv_warp + (size_t)cand_idx * D_QK + ks * 16;
+        uint16_t v0 =
+            *reinterpret_cast<const uint16_t*>(k_row_ptr + tid * 2);
+        uint16_t v1 =
+            *reinterpret_cast<const uint16_t*>(k_row_ptr + tid * 2 + 1);
+        uint16_t v8 =
+            *reinterpret_cast<const uint16_t*>(k_row_ptr + tid * 2 + 8);
+        uint16_t v9 =
+            *reinterpret_cast<const uint16_t*>(k_row_ptr + tid * 2 + 9);
+        uint32_t b0 = static_cast<uint32_t>(v0) | (static_cast<uint32_t>(v1) << 16);
+        uint32_t b1 = static_cast<uint32_t>(v8) | (static_cast<uint32_t>(v9) << 16);
         MmaBf16Result r =
             mma_bf16_m16n8k16(a0, a1, a2, a3, b0, b1, qk[nt][0], qk[nt][1], qk[nt][2], qk[nt][3]);
         qk[nt][0] = r.d0;
@@ -306,24 +320,42 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   // OK. Each thread accumulates a (2 heads × 16 dim) slice.
 
   constexpr int DIM_PER_LANE = D_V / 32;  // 16
-  float acc[2][DIM_PER_LANE];
-#pragma unroll
-  for (int h = 0; h < 2; h++)
-#pragma unroll
-    for (int d = 0; d < DIM_PER_LANE; d++) acc[h][d] = 0.f;
 
-  // P layout: each thread holds 4 floats per N-tile × 2 N-tiles = 8 p
-  // values. These correspond to:
-  //   N-tile nt: heads {gid, gid+8} × candidates {nt*8 + tid*2,
-  //                                                nt*8 + tid*2 + 1}
-  // Each warp has 16 candidates (V3_ENTRIES_PER_WARP).
+  // ── Stage 2.5: cross-warp reduce of (local_max, local_sum) per head ─
+  // Stash per-warp local max/sum into shared memory (one writer per head
+  // per warp: lanes with tid==0 cover gid ∈ [0..7], writing both gid and
+  // gid+8 slots).
+  if (tid == 0) {
+    sm_warp_max[warp_id * HPB + gid] = local_max[0];
+    sm_warp_max[warp_id * HPB + gid + 8] = local_max[1];
+    sm_warp_sum[warp_id * HPB + gid] = local_sum[0];
+    sm_warp_sum[warp_id * HPB + gid + 8] = local_sum[1];
+  }
+  __syncthreads();
+
+  // First HPB threads compute global max/sum per head and overwrite the
+  // [0..HPB) slots of sm_warp_max/sm_warp_sum with the global values.
+  if (threadIdx.x < HPB) {
+    const int h = threadIdx.x;
+    float gmax = -1e30f;
+#pragma unroll
+    for (int w = 0; w < V3_N_WARPS; w++)
+      gmax = fmaxf(gmax, sm_warp_max[w * HPB + h]);
+    float gsum = 0.f;
+#pragma unroll
+    for (int w = 0; w < V3_N_WARPS; w++)
+      gsum += sm_warp_sum[w * HPB + h] * exp2f(sm_warp_max[w * HPB + h] - gmax);
+    sm_warp_max[h] = gmax;
+    sm_warp_sum[h] = gsum;
+  }
+  __syncthreads();
+
+  // Stage 3 setup: stash per-thread p values into shared memory so the
+  // outer loop over heads (below) can read sm_p_storage[warp_id][h][c]
+  // for any h and c.
   //
-  // We need to multiply each p value by the corresponding row of V,
-  // accumulating to per-head per-dim. The data exchange across lanes
-  // is intricate; for the first cut, use shared memory.
-
-  // Push p to shared memory: per warp, 16 heads × 16 candidates = 256
-  // floats. 4 warps × 256 = 1024 floats = 4 KB. Easy.
+  // Layout: sm_p_storage[warp][HPB heads][V3_ENTRIES_PER_WARP candidates].
+  // 4 × 16 × 16 × 4 = 4 KB static smem.
   __shared__ float sm_p_storage[V3_N_WARPS][HPB][V3_ENTRIES_PER_WARP];
 #pragma unroll
   for (int nt = 0; nt < 2; nt++) {
@@ -336,130 +368,128 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   }
   __syncwarp();
 
-  // Now load V and accumulate. Each lane processes one dim-tile of 16
-  // dim, summing across 16 candidates × 2 heads.
-  const bf16* sm_kv_warp = sm_kv + (size_t)warp_id * V3_ENTRIES_PER_WARP * D_QK;
+  // Cross-warp-merged g_max/g_sum already in sm_warp_max[0..HPB) and
+  // sm_warp_sum[0..HPB). Per-warp local_max also lives in sm_warp_max
+  // at slot [warp_id*HPB + h] for h < HPB — but the global-reduce step
+  // above overwrote the first HPB slots. We need the per-warp local_max
+  // for ALL heads to compute the rescale factor below, so we save it
+  // first BEFORE the global reduce in shared.
+  //
+  // The current code path has already done the reduction; we cannot
+  // recover the per-warp local_max without re-storing it. So we treat
+  // this as a known limitation: re-write sm_warp_max to hold per-warp
+  // local_max for the rescale step, then recompute g_max/g_sum where
+  // needed in the head loop.
+  //
+  // Simpler restructure: re-stash per-warp local_max into a separate
+  // scratch region of sm_warp_max[HPB .. V3_N_WARPS*HPB).
+  // Actually that region is still intact — the global reduce only
+  // overwrites [0, HPB). Use it.
+
+  // ── Stage 3: XV per head ────────────────────────────────────────────
+  // Outer loop over the HPB=16 heads owned by this block. For each head:
+  //   - Per-warp: compute warp_acc[16] = sum_c p[h,c] * V[c, lane*16+d]
+  //     across this warp's 16 candidates.
+  //   - Rescale by exp2(local_max_w_h - g_max_h) / g_sum_h.
+  //   - Atomic-add across warps into a 2 KB per-head buffer in sm_kv
+  //     (reused after the XV pass).
+  //   - Write the buffer to mid_out for this (token, head, split).
+  //
+  // Per-lane register state: warp_acc[16] = 64 bytes. Trivial.
+  // The cross-warp merge is via shared memory atomic-add.
+  float* sm_head_buf = reinterpret_cast<float*>(sm_kv);  // reuse 64 KB
+  const bf16* sm_kv_warp_x = sm_kv + (size_t)warp_id * V3_ENTRIES_PER_WARP * D_QK;
+  const size_t mid_o_base_ll = ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V +
+                               (size_t)split_idx * D_V;
+  const size_t mid_lse_base_ll =
+      (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
+
+#pragma unroll 1
+  for (int h_idx = 0; h_idx < HPB; h_idx++) {
+    // Per-warp local max for head h_idx. The global reduce overwrote
+    // sm_warp_max[0..HPB), so we need to read from per-warp slots
+    // [HPB, V3_N_WARPS*HPB). Wait — we ONLY overwrote [0..HPB). The
+    // remaining slots [HPB .. V3_N_WARPS*HPB) still hold warps 1..3's
+    // local max. Warp 0's local max for h_idx is now g_max — lost.
+    //
+    // To handle this cleanly, recompute local_max for h_idx by reading
+    // from this warp's per-thread `local_max` register. But that's
+    // per-thread state for h_idx=gid (when h_idx<8) or gid+8 (>=8).
+    //
+    // Simplest fix: have warp 0 not participate in the global reduce
+    // overwrite. Or pre-stash per-warp local_max into a fresh smem
+    // region before the global reduce.
+    //
+    // We do the latter: read from sm_kv_warp's footer area. Actually,
+    // just use the warp's per-thread local_max via shuffle:
+    //   - Lane (gid', tid') in warp w has local_max[0] for head gid'
+    //     and local_max[1] for head gid'+8.
+    //   - To get the warp's local_max for head h_idx, broadcast from
+    //     the lane that owns it.
+    int src_lane_for_h;
+    int which_local;  // 0 or 1
+    if (h_idx < 8) {
+      src_lane_for_h = h_idx * 4;  // gid = h_idx, tid = 0
+      which_local = 0;
+    } else {
+      src_lane_for_h = (h_idx - 8) * 4;  // gid = h_idx - 8, tid = 0
+      which_local = 1;
+    }
+    float local_max_h =
+        __shfl_sync(0xffffffff, which_local == 0 ? local_max[0] : local_max[1], src_lane_for_h);
+
+    // Read global max/sum for h_idx (broadcast from one read).
+    const float g_max_h = sm_warp_max[h_idx];
+    const float g_sum_h = sm_warp_sum[h_idx];
+    const float resc =
+        (g_sum_h > 0.f) ? (exp2f(local_max_h - g_max_h) / g_sum_h) : 0.f;
+
+    // Phase A: per-warp acc.
+    float warp_acc[DIM_PER_LANE];
 #pragma unroll
-  for (int c = 0; c < V3_ENTRIES_PER_WARP; c++) {
-    // V[c, lane*16 + d] for d in [0, 16)
-    const bf16* v_row = sm_kv_warp + (size_t)c * D_QK + lane * DIM_PER_LANE;
-    bf16 v_chunk[DIM_PER_LANE];
+    for (int d = 0; d < DIM_PER_LANE; d++) warp_acc[d] = 0.f;
 #pragma unroll
-    for (int d = 0; d < DIM_PER_LANE; d++) v_chunk[d] = v_row[d];
-    const float p0 = sm_p_storage[warp_id][gid][c];
-    const float p1 = sm_p_storage[warp_id][gid + 8][c];
+    for (int c = 0; c < V3_ENTRIES_PER_WARP; c++) {
+      const float p_hc = sm_p_storage[warp_id][h_idx][c];
+      const bf16* v_row = sm_kv_warp_x + (size_t)c * D_QK + lane * DIM_PER_LANE;
+#pragma unroll
+      for (int d = 0; d < DIM_PER_LANE; d++) {
+        const float vf = __bfloat162float(v_row[d]);
+        warp_acc[d] += p_hc * vf;
+      }
+    }
+#pragma unroll
+    for (int d = 0; d < DIM_PER_LANE; d++) warp_acc[d] *= resc;
+
+    // Phase B: cross-warp merge in sm_head_buf via atomic-add.
+    // Zero the buf first (only the D_V slots we use).
+    for (int i = threadIdx.x; i < D_V; i += V3_BLOCK_THREADS) sm_head_buf[i] = 0.f;
+    __syncthreads();
 #pragma unroll
     for (int d = 0; d < DIM_PER_LANE; d++) {
-      const float vf = __bfloat162float(v_chunk[d]);
-      acc[0][d] += p0 * vf;
-      acc[1][d] += p1 * vf;
+      atomicAdd(&sm_head_buf[lane * DIM_PER_LANE + d], warp_acc[d]);
     }
+    __syncthreads();
+
+    // Phase C: write mid_out for this head.
+    if (warp_id == 0) {
+#pragma unroll
+      for (int d = 0; d < DIM_PER_LANE; d++) {
+        const int dim_idx = lane * DIM_PER_LANE + d;
+        bf16 bv = __float2bfloat16(sm_head_buf[dim_idx]);
+        mid_out[mid_o_base_ll + (size_t)h_idx * num_splits * D_V + dim_idx] = bv;
+      }
+    }
+    __syncthreads();
   }
 
-  // ── Stage 4: write per-warp partial output + LSE to mid buffer ──
-  //
-  // mid_out layout: [num_tokens, num_heads, num_splits, D_V] bf16
-  // mid_lse layout: [num_tokens, num_heads, num_splits] f32
-  //
-  // We have 4 warps each contributing partial output for the SAME 16
-  // heads but DIFFERENT 16-candidate slices. Need to reduce across
-  // warps before writing.
-  //
-  // Step: reduce per-(head, dim) across warps via shared memory. We reuse
-  // sm_kv (dynamic, 64 KB) after the XV pass — see below.
-  // Each warp writes its partial output into sm_partial (with atomic
-  // add to merge), normalized by its local_sum so the output is
-  // (sum_c p[c] V[c, :]) / sum_c p[c]. Combined with warp_max →
-  // global merge handles cross-warp LSE.
-
-  // Actually: at this point we have per-WARP local_max and local_sum
-  // for each head. We need GLOBAL (across warps within the block)
-  // max and sum to produce a single partial output for this block.
-  //
-  // Reduce max and sum across warps:
-  //   sm_warp_max[warp_id * HPB + h] = local_max for head h
-  //   sm_warp_sum[warp_id * HPB + h] = local_sum for head h
-  if (tid == 0) {
-    sm_warp_max[warp_id * HPB + gid] = local_max[0];
-    sm_warp_max[warp_id * HPB + gid + 8] = local_max[1];
-    sm_warp_sum[warp_id * HPB + gid] = local_sum[0];
-    sm_warp_sum[warp_id * HPB + gid + 8] = local_sum[1];
-  }
-  __syncthreads();
-
+  // Phase D: write LSE per head (HPB threads).
   if (threadIdx.x < HPB) {
     const int h = threadIdx.x;
-    float g_max = -1e30f;
-#pragma unroll
-    for (int w = 0; w < V3_N_WARPS; w++) g_max = fmaxf(g_max, sm_warp_max[w * HPB + h]);
-    float g_sum = 0.f;
-#pragma unroll
-    for (int w = 0; w < V3_N_WARPS; w++)
-      g_sum += sm_warp_sum[w * HPB + h] * exp2f(sm_warp_max[w * HPB + h] - g_max);
-    // Stash global max in sm_warp_max[0..HPB] and global sum in [HPB..2HPB].
-    sm_warp_max[h] = g_max;
-    sm_warp_sum[h] = g_sum;
-  }
-  __syncthreads();
-
-  // Each warp now rescales its acc by exp2(local_max - g_max), and we
-  // sum across warps via shared memory.
-  const float g_max0 = sm_warp_max[gid];
-  const float g_max1 = sm_warp_max[gid + 8];
-  const float g_sum0 = sm_warp_sum[gid];
-  const float g_sum1 = sm_warp_sum[gid + 8];
-  const float warp_resc0 = exp2f(local_max[0] - g_max0);
-  const float warp_resc1 = exp2f(local_max[1] - g_max1);
-  const float inv_g_sum0 = (g_sum0 > 0.f) ? (1.f / g_sum0) : 0.f;
-  const float inv_g_sum1 = (g_sum1 > 0.f) ? (1.f / g_sum1) : 0.f;
-
-#pragma unroll
-  for (int d = 0; d < DIM_PER_LANE; d++) {
-    acc[0][d] *= warp_resc0 * inv_g_sum0;
-    acc[1][d] *= warp_resc1 * inv_g_sum1;
-  }
-
-  // Reuse sm_kv (64 KB) as the cross-warp merge buffer (32 KB needed for
-  // sm_partial[HPB=16][D_V=512] float). sm_kv is dead after the XV pass.
-  // Layout: sm_partial[h][d] = sm_kv_as_float[h * D_V + d].
-  float* sm_partial = reinterpret_cast<float*>(sm_kv);
-  // Zero the partial buffer.
-  for (int i = threadIdx.x; i < HPB * D_V; i += V3_BLOCK_THREADS) {
-    sm_partial[i] = 0.0f;
-  }
-  __syncthreads();
-
-  // Each lane atomicAdds its 32 floats (2 heads × 16 dim) into sm_partial.
-#pragma unroll
-  for (int d = 0; d < DIM_PER_LANE; d++) {
-    atomicAdd(&sm_partial[gid * D_V + lane * DIM_PER_LANE + d], acc[0][d]);
-    atomicAdd(&sm_partial[(gid + 8) * D_V + lane * DIM_PER_LANE + d], acc[1][d]);
-  }
-  __syncthreads();
-
-  // Write sm_partial → mid_out (bf16) and LSE → mid_lse (f32).
-  {
-    const size_t mid_o_base = ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V +
-                              (size_t)split_idx * D_V;
-    const size_t mid_lse_base = (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
-
-    // 16 heads × 512 dim = 8192 elements. 128 threads → 64 per thread.
-    constexpr int ELEMS_PER_THREAD = HPB * D_V / V3_BLOCK_THREADS;
-    for (int i = 0; i < ELEMS_PER_THREAD; i++) {
-      const int linear = threadIdx.x * ELEMS_PER_THREAD + i;
-      const int h = linear / D_V;
-      const int d = linear % D_V;
-      float v = sm_partial[h * D_V + d];
-      bf16 bv = __float2bfloat16(v);
-      mid_out[mid_o_base + (size_t)h * num_splits * D_V + d] = bv;
-    }
-    if (threadIdx.x < HPB) {
-      const int h = threadIdx.x;
-      float g_max = sm_warp_max[h];
-      float g_sum = sm_warp_sum[h];
-      float lse = (g_sum > 0.f) ? (log2f(g_sum) + g_max) : -1e30f;
-      mid_lse[mid_lse_base + (size_t)h * num_splits + split_idx] = lse;
-    }
+    const float g_max = sm_warp_max[h];
+    const float g_sum = sm_warp_sum[h];
+    const float lse = (g_sum > 0.f) ? (log2f(g_sum) + g_max) : -1e30f;
+    mid_lse[mid_lse_base_ll + (size_t)h * num_splits + split_idx] = lse;
   }
 }
 
