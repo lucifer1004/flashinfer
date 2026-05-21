@@ -1,0 +1,280 @@
+// Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+// 1. Redistributions of source code must retain the above copyright notice, this
+// list of conditions and the following disclaimer.
+//
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+// this list of conditions and the following disclaimer in the documentation
+// and/or other materials provided with the distribution.
+//
+// 3. Neither the name of the copyright holder nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+// FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+// DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+// SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+// CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+// OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+// Sparse-MLA SM120 decode (v2, scheduler-driven). Single raw-pointer entry
+// point that dispatches V32 / MODEL1 + num_heads × topk × extra-page-size
+// template variants. Drops the v1 (split-KV + manual combine) path.
+//
+// Raw-pointer interface; framework-agnostic.
+
+#include <cuda_runtime.h>
+#include <flashinfer/attention/sparse_mla_sm120/common/sched_params.h>
+#include <flashinfer/attention/sparse_mla_sm120/model/model_type.h>
+
+#include <flashinfer/attention/sparse_mla_sm120/arch/common.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/common/smem_layout.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/decode_v2_kernel.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh>
+
+namespace flashinfer::sparse_mla_sm120 {
+
+namespace {
+
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
+          int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE>
+void launch_decode_v2(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+                      const uint8_t* extra_KV_cache, const int32_t* extra_indices, float* o_accum,
+                      float* lse_accum, bf16* output, float* out_lse,
+                      const DecodingSchedMeta* sched_meta, const int* num_splits_ptr,
+                      float sm_scale, int num_batches, int s_q, int topk, size_t stride_kv_block,
+                      int num_sm_parts, size_t stride_oa_split, size_t stride_oa_sq,
+                      size_t stride_la_split, size_t stride_la_sq, const float* attn_sink,
+                      const int* topk_length, int extra_topk, const int* extra_topk_length,
+                      size_t stride_extra_kv_block, cudaStream_t stream) {
+  constexpr size_t smem_bytes = SmemLayout<MT, CM>::TOTAL;
+  constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
+
+  auto kernel =
+      sparse_mla_decode_v2_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, PAGE_BLOCK_SIZE_EXTRA>;
+  static bool configured = false;
+  if (!configured && smem_bytes > 48 * 1024) {
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    configured = true;
+  }
+
+  dim3 grid(REPLICATE_H, s_q, num_sm_parts);
+  dim3 block(BLOCK_THREADS);
+
+  DecodeV2ColdParams cold{sm_scale,
+                          num_batches,
+                          s_q,
+                          stride_kv_block,
+                          topk,
+                          stride_oa_split,
+                          stride_oa_sq,
+                          stride_la_split,
+                          stride_la_sq,
+                          attn_sink,
+                          topk_length,
+                          extra_topk,
+                          extra_topk_length,
+                          stride_extra_kv_block};
+
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  cudaLaunchConfig_t config{grid, block, smem_bytes, stream, attrs, 1};
+  void* args[] = {(void*)&Q,
+                  (void*)&KV_cache,
+                  (void*)&indices,
+                  (void*)&extra_KV_cache,
+                  (void*)&extra_indices,
+                  (void*)&o_accum,
+                  (void*)&lse_accum,
+                  (void*)&output,
+                  (void*)&out_lse,
+                  (void*)&sched_meta,
+                  (void*)&num_splits_ptr,
+                  (void*)&cold};
+  CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
+}
+
+// Return false if no template variant matches (caller raises).
+inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* KV,
+                         const int32_t* indices, const uint8_t* extra_KV,
+                         const int32_t* extra_indices, float* o_accum, float* lse_accum,
+                         bf16* output, float* out_lse, const DecodingSchedMeta* sched_meta,
+                         const int* num_splits_ptr, float sm_scale, int num_batches, int s_q,
+                         size_t stride_kv_block, int num_sm_parts, size_t stride_oa_split,
+                         size_t stride_oa_sq, size_t stride_la_split, size_t stride_la_sq,
+                         const float* attn_sink, const int* topk_length, int extra_topk,
+                         const int* extra_topk_length, size_t stride_extra_kv_block,
+                         cudaStream_t stream) {
+  if (topk != 2048) return false;
+
+#define DISPATCH_V32(NH)                                                                        \
+  launch_decode_v2<ModelType::V32, ComputeMode::FP8, NH, 2048, 1>(                              \
+      Q, KV, indices, extra_KV, extra_indices, o_accum, lse_accum, output, out_lse, sched_meta, \
+      num_splits_ptr, sm_scale, num_batches, s_q, topk, stride_kv_block, num_sm_parts,          \
+      stride_oa_split, stride_oa_sq, stride_la_split, stride_la_sq, attn_sink, topk_length,     \
+      extra_topk, extra_topk_length, stride_extra_kv_block, stream)
+
+  switch (num_heads) {
+    case 8:
+      DISPATCH_V32(8);
+      return true;
+    case 16:
+      DISPATCH_V32(16);
+      return true;
+    case 32:
+      DISPATCH_V32(32);
+      return true;
+    case 64:
+      DISPATCH_V32(64);
+      return true;
+    case 128:
+      DISPATCH_V32(128);
+      return true;
+    default:
+      return false;
+  }
+#undef DISPATCH_V32
+}
+
+inline bool dispatch_model1(int num_heads, int topk, int ext_pbs, const bf16* Q, const uint8_t* KV,
+                            const int32_t* indices, const uint8_t* extra_KV,
+                            const int32_t* extra_indices, float* o_accum, float* lse_accum,
+                            bf16* output, float* out_lse, const DecodingSchedMeta* sched_meta,
+                            const int* num_splits_ptr, float sm_scale, int num_batches, int s_q,
+                            size_t stride_kv_block, int num_sm_parts, size_t stride_oa_split,
+                            size_t stride_oa_sq, size_t stride_la_split, size_t stride_la_sq,
+                            const float* attn_sink, const int* topk_length, int extra_topk,
+                            const int* extra_topk_length, size_t stride_extra_kv_block,
+                            cudaStream_t stream) {
+  // ext_pbs: 0 = no extra cache; 64 = C4A; 2 = C128A
+  if (ext_pbs != 0 && ext_pbs != 64 && ext_pbs != 2) return false;
+
+#define DISPATCH_MODEL1(NH, TK, PBSX)                                                           \
+  launch_decode_v2<ModelType::MODEL1, ComputeMode::FP8, NH, TK, 64, PBSX>(                      \
+      Q, KV, indices, extra_KV, extra_indices, o_accum, lse_accum, output, out_lse, sched_meta, \
+      num_splits_ptr, sm_scale, num_batches, s_q, topk, stride_kv_block, num_sm_parts,          \
+      stride_oa_split, stride_oa_sq, stride_la_split, stride_la_sq, attn_sink, topk_length,     \
+      extra_topk, extra_topk_length, stride_extra_kv_block, stream)
+
+#define DISPATCH_BY_PBSX(NH, TK)   \
+  do {                             \
+    if (ext_pbs == 2) {            \
+      DISPATCH_MODEL1(NH, TK, 2);  \
+    } else {                       \
+      DISPATCH_MODEL1(NH, TK, 64); \
+    }                              \
+  } while (0)
+
+  if (topk == 128) {
+    switch (num_heads) {
+      case 16:
+        DISPATCH_BY_PBSX(16, 128);
+        return true;
+      case 32:
+        DISPATCH_BY_PBSX(32, 128);
+        return true;
+      case 64:
+        DISPATCH_BY_PBSX(64, 128);
+        return true;
+      case 128:
+        DISPATCH_BY_PBSX(128, 128);
+        return true;
+      default:
+        return false;
+    }
+  } else if (topk == 512) {
+    switch (num_heads) {
+      case 8:
+        DISPATCH_BY_PBSX(8, 512);
+        return true;
+      case 16:
+        DISPATCH_BY_PBSX(16, 512);
+        return true;
+      case 32:
+        DISPATCH_BY_PBSX(32, 512);
+        return true;
+      case 64:
+        DISPATCH_BY_PBSX(64, 512);
+        return true;
+      case 128:
+        DISPATCH_BY_PBSX(128, 512);
+        return true;
+      default:
+        return false;
+    }
+  } else if (topk == 1024) {
+    switch (num_heads) {
+      case 16:
+        DISPATCH_BY_PBSX(16, 1024);
+        return true;
+      case 32:
+        DISPATCH_BY_PBSX(32, 1024);
+        return true;
+      case 64:
+        DISPATCH_BY_PBSX(64, 1024);
+        return true;
+      case 128:
+        DISPATCH_BY_PBSX(128, 1024);
+        return true;
+      default:
+        return false;
+    }
+  }
+  return false;
+#undef DISPATCH_BY_PBSX
+#undef DISPATCH_MODEL1
+}
+
+}  // namespace
+
+// Public dispatcher. Returns false if no template variant matches the
+// (model_type, num_heads, topk, extra_page_block_size) combination, so the
+// orchestrator can produce a precise error message at the framework boundary.
+bool sparse_mla_decode_v2_dispatch(ModelType mt, int num_heads, int topk, int page_block_size,
+                                   int extra_page_block_size,  // 0 if no extra cache
+                                   const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+                                   const uint8_t* extra_KV_cache, const int32_t* extra_indices,
+                                   float* o_accum, float* lse_accum, bf16* output, float* out_lse,
+                                   const DecodingSchedMeta* sched_meta, const int* num_splits_ptr,
+                                   float sm_scale, int num_batches, int s_q, int stride_kv_row,
+                                   int num_sm_parts, const float* attn_sink, const int* topk_length,
+                                   int extra_topk, const int* extra_topk_length,
+                                   int extra_stride_kv_row, cudaStream_t stream) {
+  const size_t stride_kv_block = (size_t)page_block_size * (size_t)stride_kv_row;
+  const size_t stride_extra_kv_block =
+      (extra_KV_cache != nullptr) ? (size_t)extra_page_block_size * (size_t)extra_stride_kv_row : 0;
+
+  const size_t stride_oa_split = (size_t)s_q * num_heads * D_V;
+  const size_t stride_oa_sq = (size_t)num_heads * D_V;
+  const size_t stride_la_split = (size_t)s_q * num_heads;
+  const size_t stride_la_sq = (size_t)num_heads;
+
+  switch (mt) {
+    case ModelType::V32:
+      return dispatch_v32(num_heads, topk, Q, KV_cache, indices, extra_KV_cache, extra_indices,
+                          o_accum, lse_accum, output, out_lse, sched_meta, num_splits_ptr, sm_scale,
+                          num_batches, s_q, stride_kv_block, num_sm_parts, stride_oa_split,
+                          stride_oa_sq, stride_la_split, stride_la_sq, attn_sink, topk_length,
+                          extra_topk, extra_topk_length, stride_extra_kv_block, stream);
+    case ModelType::MODEL1:
+      return dispatch_model1(num_heads, topk, extra_page_block_size, Q, KV_cache, indices,
+                             extra_KV_cache, extra_indices, o_accum, lse_accum, output, out_lse,
+                             sched_meta, num_splits_ptr, sm_scale, num_batches, s_q,
+                             stride_kv_block, num_sm_parts, stride_oa_split, stride_oa_sq,
+                             stride_la_split, stride_la_sq, attn_sink, topk_length, extra_topk,
+                             extra_topk_length, stride_extra_kv_block, stream);
+  }
+  return false;
+}
+
+}  // namespace flashinfer::sparse_mla_sm120

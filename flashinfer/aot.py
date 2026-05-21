@@ -103,6 +103,7 @@ from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
 from .jit.rope import gen_rope_module
 from .jit.sampling import gen_sampling_module
+from .jit.sparse_mla_sm120 import gen_sparse_mla_sm120_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.tllm_utils import gen_trtllm_utils_module
@@ -544,6 +545,8 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
             jit_specs.append(gen_trtllm_fmha_v2_sm120_module())
+            # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
+            jit_specs.append(gen_sparse_mla_sm120_module())
         if has_sm120f:
             jit_specs.append(gen_fp4_quantization_sm120f_module())
 
