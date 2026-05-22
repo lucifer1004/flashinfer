@@ -53,7 +53,7 @@
 // is_no_split direct-bf16 output fast path (skips the combine kernel).
 // ============================================================================
 
-struct DecodeV2ColdParams {
+struct DecodeDsv3_2ColdParams {
   float sm_scale;
   int num_batches;
   int s_q;
@@ -88,7 +88,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
                                 bf16* __restrict__ output, float* __restrict__ out_lse,
                                 const DecodingSchedMeta* __restrict__ sched_meta,
                                 const int* __restrict__ num_splits_ptr,
-                                __grid_constant__ const DecodeV2ColdParams cold) {
+                                __grid_constant__ const DecodeDsv3_2ColdParams cold) {
   const float sm_scale = cold.sm_scale;
   const int num_batches = cold.num_batches;
   const int s_q = cold.s_q;

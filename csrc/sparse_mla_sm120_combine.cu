@@ -44,7 +44,7 @@ constexpr int COMBINE_BLOCK_H = 8;
 constexpr int COMBINE_THREADS = COMBINE_BLOCK_H * 32;     // 256
 constexpr int COMBINE_ELEMS_PER_THREAD = D_V / (32 * 4);  // 512/(32*4) = 4
 
-struct CombineV2Params {
+struct CombineParams {
   const float* o_accum;
   const float* lse_accum;
   bf16* output;
@@ -59,7 +59,7 @@ struct CombineV2Params {
 
 template <int MAX_SPLITS>
 __global__ void __launch_bounds__(COMBINE_THREADS)
-    sparse_mla_combine_v2_kernel(__grid_constant__ const CombineV2Params params) {
+    sparse_mla_combine_kernel(__grid_constant__ const CombineParams params) {
   cudaGridDependencySynchronize();
 
   const int batch_sq_idx = blockIdx.x;
@@ -206,13 +206,13 @@ bool launch_combine_dsv3_2(const float* o_accum, const float* lse_accum, bf16* o
     dim3 block(COMBINE_THREADS);
     size_t smem_bytes = COMBINE_BLOCK_H * MAX_SPLITS * sizeof(float);
 
-    auto kernel = sparse_mla_combine_v2_kernel<MAX_SPLITS>;
+    auto kernel = sparse_mla_combine_kernel<MAX_SPLITS>;
     if (smem_bytes > 48 * 1024) {
       CUDA_CHECK(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
     }
 
-    CombineV2Params params{o_accum,   lse_accum, output,          out_lse,         num_splits_ptr,
+    CombineParams params{o_accum,   lse_accum, output,          out_lse,         num_splits_ptr,
                            num_heads, s_q,       stride_oa_split, stride_la_split, attn_sink};
 
     cudaLaunchAttribute attrs[1];

@@ -70,7 +70,7 @@ void launch_decode_dsv3_2(const bf16* Q, const uint8_t* KV_cache, const int32_t*
   dim3 grid(REPLICATE_H, s_q, num_sm_parts);
   dim3 block(BLOCK_THREADS);
 
-  DecodeV2ColdParams cold{sm_scale,
+  DecodeDsv3_2ColdParams cold{sm_scale,
                           num_batches,
                           s_q,
                           stride_kv_block,

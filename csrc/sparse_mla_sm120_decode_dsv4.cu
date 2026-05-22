@@ -41,33 +41,33 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache,
   constexpr int H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
 
   // Stage 1: decode-dsv4 (A1.2) partial-output kernel.
-  // Dynamic smem layout (FP8 XV, DSV4, V3_BI=64, double-buffered KV):
+  // Dynamic smem layout (FP8 XV, DSV4, DSV4_BI=64, double-buffered KV):
   //   sm_q_rope    HPB * D_ROPE * 2B                      =  2 KB
   //   sm_q_fp8     HPB * Q_NOPE_STRIDE                    = 7.25 KB
   //   sm_q_sc      HPB * NUM_SCALES * 4B                  = 0.44 KB
-  //   sm_kv_fp8    2 * V3_BI * KV_SMEM_STRIDE             = 58 KB
-  //   sm_kv_sc     2 * V3_BI * SCALE_BYTES_PER_TOKEN      =  1 KB
-  //   sm_kv_rope   2 * V3_BI * D_ROPE * 2B                = 16 KB
-  //   sm_reduce    2 * V3_N_WARPS * HPB * 4               = 1 KB
+  //   sm_kv_fp8    2 * DSV4_BI * KV_SMEM_STRIDE             = 58 KB
+  //   sm_kv_sc     2 * DSV4_BI * SCALE_BYTES_PER_TOKEN      =  1 KB
+  //   sm_kv_rope   2 * DSV4_BI * D_ROPE * 2B                = 16 KB
+  //   sm_reduce    2 * DSV4_N_WARPS * HPB * 4               = 1 KB
   //   sm_w_head_sc N_V_CHUNKS * HPB * 4                   = 448 B
-  //   sm_w_fp8 ×2  2 * HPB * (V3_BI + 16)                 = 2.5 KB
+  //   sm_w_fp8 ×2  2 * HPB * (DSV4_BI + 16)                 = 2.5 KB
   //   Total                                               ~ 88 KB
   // Static smem (kernel-side):
-  //   sm_p_full    HPB * V3_BI * 2B (bf16)                =  2 KB
+  //   sm_p_full    HPB * DSV4_BI * 2B (bf16)                =  2 KB
   // Grand total ~ 89 KB (under 100 KB SM120 carveout, 1 block/SM).
   constexpr int N_V_CHUNKS_LAUNCH = KV::D_NOPE / KV::QUANT_TILE;        // 7
   constexpr int DYN_SMEM_BYTES =
       HPB * KV::D_ROPE * (int)sizeof(bf16)                              // sm_q_rope
       + HPB * KV::Q_NOPE_STRIDE                                          // sm_q_fp8
       + HPB * KV::NUM_SCALES * (int)sizeof(float)                        // sm_q_sc
-      + V3_KV_BUF_COUNT * V3_BI * KV::KV_SMEM_STRIDE                     // sm_kv_fp8 ×2
-      + V3_KV_BUF_COUNT * V3_BI * KV::SCALE_BYTES_PER_TOKEN              // sm_kv_sc ×2
-      + V3_KV_BUF_COUNT * V3_BI * KV::D_ROPE * (int)sizeof(bf16)         // sm_kv_rope ×2
+      + DSV4_KV_BUF_COUNT * DSV4_BI * KV::KV_SMEM_STRIDE                     // sm_kv_fp8 ×2
+      + DSV4_KV_BUF_COUNT * DSV4_BI * KV::SCALE_BYTES_PER_TOKEN              // sm_kv_sc ×2
+      + DSV4_KV_BUF_COUNT * DSV4_BI * KV::D_ROPE * (int)sizeof(bf16)         // sm_kv_rope ×2
       + 16                                                               // mbar align pad
       + 4 * (int)sizeof(uint64_t)                                        // mbar_full+empty
-      + 2 * V3_N_WARPS * HPB * (int)sizeof(float)                        // sm_reduce
+      + 2 * DSV4_N_WARPS * HPB * (int)sizeof(float)                        // sm_reduce
       + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                     // sm_w_head_sc
-      + 2 * HPB * (V3_BI + 16);                                          // sm_w_fp8 ×2 (vc parity)
+      + 2 * HPB * (DSV4_BI + 16);                                          // sm_w_fp8 ×2 (vc parity)
 
   auto kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
   CUDA_CHECK_BOOL(cudaFuncSetAttribute(
@@ -114,7 +114,7 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache,
   // allocation without extra coordination.
   (void)num_splits_eff;
   dim3 grid1(num_tokens, H_BLOCKS, num_splits);
-  dim3 block1(V3_BLOCK_THREADS);
+  dim3 block1(DSV4_BLOCK_THREADS);
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
       Q, KV_cache, indices, mid_out, mid_lse, topk_length,
       extra_KV_cache, extra_indices, extra_topk_length, extra_topk,
@@ -158,7 +158,7 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk,
                                  float sm_scale, size_t stride_kv_block,
                                  cudaStream_t stream) {
   if (mt != ModelType::DSV4 || page_block_size != 64) return false;
-#define V3_DISPATCH(H, K)                                                \
+#define DSV4_DISPATCH(H, K)                                                \
   if (num_heads == (H) && topk == (K)) {                                 \
     return launch_decode_dsv4_impl<ModelType::DSV4, (H), (K), 64>(       \
         Q, KV_cache, indices, mid_out, mid_lse, topk_length, output,     \
@@ -167,20 +167,20 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk,
         stride_extra_kv_block, num_tokens, num_splits,                   \
         chunks_per_block_override, sm_scale, stride_kv_block, stream);   \
   }
-  V3_DISPATCH(8, 512)
-  V3_DISPATCH(16, 128)
-  V3_DISPATCH(16, 512)
-  V3_DISPATCH(16, 1024)
-  V3_DISPATCH(32, 128)
-  V3_DISPATCH(32, 512)
-  V3_DISPATCH(32, 1024)
-  V3_DISPATCH(64, 128)
-  V3_DISPATCH(64, 512)
-  V3_DISPATCH(64, 1024)
-  V3_DISPATCH(128, 128)
-  V3_DISPATCH(128, 512)
-  V3_DISPATCH(128, 1024)
-#undef V3_DISPATCH
+  DSV4_DISPATCH(8, 512)
+  DSV4_DISPATCH(16, 128)
+  DSV4_DISPATCH(16, 512)
+  DSV4_DISPATCH(16, 1024)
+  DSV4_DISPATCH(32, 128)
+  DSV4_DISPATCH(32, 512)
+  DSV4_DISPATCH(32, 1024)
+  DSV4_DISPATCH(64, 128)
+  DSV4_DISPATCH(64, 512)
+  DSV4_DISPATCH(64, 1024)
+  DSV4_DISPATCH(128, 128)
+  DSV4_DISPATCH(128, 512)
+  DSV4_DISPATCH(128, 1024)
+#undef DSV4_DISPATCH
   return false;
 }
 
