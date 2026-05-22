@@ -28,6 +28,11 @@ flashinfer/cute_dsl/benchmark_gated_delta_rule.py
 
 # zed text editor
 .zed/
+
+# Claude Code workspace (scratch scripts, handoffs, agent state)
+.claude/
+.omc/
+compiled_cache.db
 .rules
 
 # Byte-compiled / optimized / DLL files
