@@ -56,11 +56,10 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2)
       << "kv_cache must be 2D [num_blocks, page_bytes] or 4D "
          "[num_blocks, page_block_size, 1, bpt]";
-  // indices may be 2D [T, topk] (microbench) or 3D [T, s_q=1, topk] (vLLM,
-  // which keeps the s_q singleton dim through the call stack). The kernel
-  // walks `indices + t_idx * stride_per_t`, where stride is captured below
-  // from .stride(0). For 3D with s_q=1, stride(0) == topk for contig layout
-  // — matches what the kernel expects.
+  // indices may be 2D [T, topk] or 3D [T, s_q=1, topk] (some callers keep
+  // the s_q singleton dim through the call stack). The kernel walks
+  // `indices + t_idx * stride_per_t`, where stride is captured below from
+  // .stride(0).
   TVM_FFI_ICHECK_GE(indices.ndim(), 2)
       << "indices must have at least 2 dims; got ndim=" << indices.ndim();
   if (indices.ndim() == 3) {
@@ -78,11 +77,12 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
       << "decode-dsv4 currently DSV4-only";
 
   // kv_cache may be:
-  //   2D: [num_blocks, page_bytes]              — flat layout (test scripts)
-  //   4D: [num_blocks, page_block_size, 1, bpt] — vLLM layout (may be padded)
+  //   2D: [num_blocks, page_bytes]              — flat layout
+  //   4D: [num_blocks, page_block_size, 1, bpt] — paged layout (may pad
+  //       the block stride for alignment)
   // For 4D the block stride in bytes = product of dims[1..ndim-1] when
-  // strictly contiguous; with vLLM's padding, the block stride may exceed
-  // the natural row size. Use stride(0) to capture the true block stride.
+  // strictly contiguous; with padding it may exceed the natural row size.
+  // Use stride(0) to capture the true block stride.
   size_t stride_kv_block;
   if (kv_cache.ndim() == 2) {
     stride_kv_block = static_cast<size_t>(kv_cache.size(1));
@@ -91,8 +91,8 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
     // For uint8 (1B element) this is identical numerically.
     stride_kv_block = static_cast<size_t>(kv_cache.stride(0));
   }
-  // page_block_size for v3 is fixed at 64 (DSV4). The dispatcher rejects
-  // any other value, and the orchestrator only routes 4D-pbs-64 here.
+  // decode-dsv4 only supports page_block_size=64 (DSv4 layout). The
+  // dispatcher rejects any other value.
   constexpr int page_block_size = 64;
 
   const int* topk_len_ptr =
@@ -122,8 +122,7 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
     extra_topk_arg = static_cast<int>(extra_indices.value().size(-1));
     if (ekv.ndim() >= 3) {
       pbs_extra_arg = static_cast<int>(ekv.size(-3));
-      // Use stride(0) to capture true block stride including any padding
-      // (matches v2's effective_stride_kv_row semantics).
+      // Use stride(0) to capture true block stride including any padding.
       stride_extra_kv_block = static_cast<size_t>(ekv.stride(0));
     } else {
       // 2D fallback: assume DSV4 bpt = 584. Infer pbs from row width.

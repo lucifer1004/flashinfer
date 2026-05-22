@@ -1129,11 +1129,11 @@ sparse_mla_sm120_paged_trace = TraceTemplate(
     op_type="sparse_mla_paged_sm120",
     name_prefix="sparse_mla_sm120_paged",
     description=(
-        "Sparse-MLA paged attention on SM120 (RTX PRO 6000 Blackwell). Single "
-        "byte-packed FP8 KV cache + per-token top-K paged slot IDs + optional "
-        "attn_sink (per-head pre-softmax bias). Auto-dispatches decode-dsv3_2 "
-        "(num_tokens <= 64) vs prefill internally. Wraps "
-        "BatchSparseMLAPagedAttentionWrapper.run() / sparse_mla_sm120_paged_attention()."
+        "Sparse-MLA paged attention on SM120. Single byte-packed FP8 KV cache "
+        "+ per-token top-K paged slot IDs + optional attn_sink (per-head "
+        "pre-softmax bias). Auto-dispatches decode (num_tokens <= 64) vs "
+        "prefill internally. Wraps BatchSparseMLAPagedAttentionWrapper.run() "
+        "/ sparse_mla_sm120_paged_attention()."
     ),
     axes={
         "num_tokens": Var(description="Number of query tokens (batch * s_q)."),

@@ -86,10 +86,10 @@ inline ModelType infer_model_type(int d_qk) {
 }
 
 // Convert padded-block KV strides to a per-row override matching the kernel's
-// `page_block_size * stride_kv_row` block stride. When vLLM pads block stride
-// for alignment, the natural per-token stride times page_block_size doesn't
-// equal the actual block-to-block stride; encode the padding via this row
-// override. Mirrors the upstream `effective_stride_kv_row` helper.
+// `page_block_size * stride_kv_row` block stride. When the caller pads block
+// stride for alignment, the natural per-token stride times page_block_size
+// doesn't equal the actual block-to-block stride; encode the padding via this
+// row override. Mirrors the upstream `effective_stride_kv_row` helper.
 inline int effective_stride_kv_row(const TensorView& kv) {
   const int natural_row_bytes = static_cast<int>(kv.stride(-2) * (kv.dtype().bits / 8));
   const int block_stride_bytes = static_cast<int>(kv.stride(0) * (kv.dtype().bits / 8));
@@ -125,7 +125,7 @@ void SparseMlaSm120PagedAttention(
   // ── Input validation ───────────────────────────────────────────────
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
   // kv_cache: CUDA + last-dim contiguous only. The block stride may be
-  // padded for alignment (vLLM convention); the kernel handles that via
+  // padded for alignment; the kernel handles that via
   // `effective_stride_kv_row` below.
   CHECK_CUDA(kv_cache);
   CHECK_LAST_DIM_CONTIGUOUS(kv_cache);
@@ -211,7 +211,7 @@ void SparseMlaSm120PagedAttention(
     return;
   }
 
-  // ── Decode-v2 path (num_tokens <= 64) ──────────────────────────────
+  // ── Decode path (num_tokens <= 64) ──────────────────────────────────
   const int s_q = 1;
   const int num_batches = num_tokens;  // s_q == 1 ⇒ tokens == batches
   constexpr int BI = 64;
@@ -228,7 +228,7 @@ void SparseMlaSm120PagedAttention(
   launch_get_sched_meta(num_batches, topk, extra_topk, BI, FIXED_OVERHEAD,
                         static_cast<int>(num_sm_parts), tl_ptr, etl_ptr, meta_ptr, ns_ptr, stream);
 
-  // 2) Decode-v2 dispatch.
+  // 2) Decode dispatch.
   auto* oa_ptr = static_cast<float*>(o_accum.data_ptr());
   auto* la_ptr = static_cast<float*>(lse_accum.data_ptr());
   const bool ok = sparse_mla_decode_dsv3_2_dispatch(

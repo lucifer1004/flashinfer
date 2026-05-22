@@ -31,7 +31,7 @@ from .core import JitSpec, current_compilation_context, gen_jit_spec
 
 
 def gen_sparse_mla_sm120_module() -> JitSpec:
-    """Sparse-MLA paged attention for SM120 family (RTX PRO 6000 Blackwell).
+    """Sparse-MLA paged attention for SM120.
 
     Monolithic module — runtime dispatch on (model_type, num_heads, topk,
     page_block_size, extra_page_block_size) happens inside the orchestrator.

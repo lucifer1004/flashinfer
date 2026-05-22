@@ -50,7 +50,7 @@ from flashinfer.utils import is_sm120a_supported
 
 pytestmark = pytest.mark.skipif(
     not is_sm120a_supported(torch.device("cuda")),
-    reason="Sparse-MLA SM120 requires sm120a (RTX PRO 6000 Blackwell).",
+    reason="Sparse-MLA SM120 requires sm120a.",
 )
 
 

@@ -17,25 +17,19 @@
 
 namespace flashinfer::sparse_mla_sm120 {
 
-// Decode-v3 (A1.5): warp-specialized TMA gather + doubled math-warp count.
-// IO warp drives cp.async.bulk into double-buffered KV smem; 8 math warps
-// consume. With 8 warps each warp covers V3_BI/8 = 8 cands and V_CHUNK/8 =
-// 8 V-dims (was 16/16 at 4 warps), halving the per-thread persistent
-// acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] from 56 to 28 floats. Goal: cut
-// register spill (A1.4 NCU: 15,488 spill insts → 25.6% of L1TEX sectors
-// local) and push the scheduler past its 1.17 active-warps ceiling.
+// Sparse MLA decode (DSv4): warp-specialized TMA gather, 8 math warps,
+// double-buffered KV. IO warp drives cp.async.bulk into the two KV
+// buffers; math warps consume. Each warp covers V3_BI/8 candidates and
+// V_CHUNK/8 V-dims so per-thread acc_nope stays in registers.
 //
 // Per-buf mbarrier pairs: mbar_full[s] for IO→math (leader arrives with
-// expect_tx, bulk completion decrements tx; phase flips when arrival count
-// AND tx both met), mbar_empty[s] for math→IO drain (one math signaling
-// thread arrives at end-of-iter).
+// expect_tx, bulk completion decrements tx), mbar_empty[s] for math→IO
+// drain (one math signaling thread arrives at end-of-iter).
 //
-// CRITICAL: mbarrier.try_wait.parity has NO implicit memory fence — the
+// IMPORTANT: mbarrier.try_wait.parity has no implicit memory fence — the
 // consumer must follow it with a CTA-wide acq-rel sync before reading
-// smem (otherwise writes by non-leader IO lanes can be stale). Canonical
-// pattern: see mla_hopper.cuh:789 (__syncthreads after consumer_wait) and
-// hopper/mainloop. Here we use bar_sync<3, MATH_THREADS> since only math
-// warps participate; the IO warp doesn't touch bar:3.
+// smem, otherwise non-leader IO writes can be stale. We use
+// bar_sync<3, MATH_THREADS> since only math warps participate.
 
 constexpr int V3_N_WARPS = 8;                                    // math warps
 constexpr int V3_IO_WARPS = 1;
@@ -388,16 +382,13 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_dsv4_kerne
       }
     }
     {
-      // K-rope B-operand loaded per-lane via scalar reads (mirrors decode-dsv3_2's
-      // prefetch_kv_rope pattern). The prior ldmatrix.x2.trans path produced a
-      // wrong register layout against this N-outer smem (sm_kv_rope[entry][k]):
-      // with .trans, thread T's b0 ends up holding two *different entries' same
-      // K-position* instead of one entry's consecutive K-rows. mma m16n8k16
-      // expects b0 = K-rows {tid*2, tid*2+1} of N-col gid; b1 = K-rows
-      // {tid*2+8, tid*2+9} of N-col gid; gid = lane>>2, tid = lane&3.
-      // Symptom: DSv4-Flash GSM8K accuracy collapsed to 0.05 (vs v2's 0.89) at
-      // realistic q magnitudes; restored to within bf16 noise by this load.
-      // Perf impact ≤1.7% on the contested h=128/k=1024 shapes, in-noise elsewhere.
+      // K-rope B-operand loaded per-lane via scalar reads. mma.m16n8k16
+      // expects each thread's b0 = K-rows {tid*2, tid*2+1} of N-col gid and
+      // b1 = K-rows {tid*2+8, tid*2+9} of N-col gid (gid = lane>>2, tid =
+      // lane&3). ldmatrix.x2.trans on the N-outer smem here cannot produce
+      // that layout — adjacent lanes within a quad end up holding the same
+      // K-position of different entries instead of consecutive K-rows of
+      // one entry.
       const int warp_first_cand = warp_id * V3_ENTRIES_PER_WARP;
 #pragma unroll
       for (int ks = 0; ks < D_ROPE_C / 16; ks++) {
@@ -788,21 +779,12 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_dsv4_kerne
 
 // Merge kernel: collapse splits → final output + LSE.
 //
-// One block per (t, h) covering the full D_V via uint4 (8 bf16) vec loads —
-// no D_V_PARTS axis. BLOCK_THREADS * DIMS_PER_THREAD must equal D_V_VAL.
-//
-// Layout choice for D_V=512: BLOCK_THREADS=64, DIMS_PER_THREAD=8 (1 uint4 per
-// thread per split). 64 threads = 2 warps; warp 0 computes the per-(t,h) LSE
-// max/sum and broadcasts via smem.
-//
-// Compared to the prior 32-thread×D_V_PARTS=4 design this:
-// - drops 4 small launches per (t,h) -> 1 launch (1/4 the grid)
-// - replaces 4 scalar bf16 loads/lane/split with one uint4 (8 bf16)
-// - caches mid_lse in smem so the inner accumulate loop reads each split's
-//   LSE from smem rather than re-fetching from L1/L2.
-//
-// Measured: cuts merge wall time ~50% on h=128/k=512/T=16 (NSys), restoring
-// the wall-time budget for the contested shapes vs jasl.
+// One block per (t, h) covering the full D_V via uint4 (8 bf16) vec loads.
+// BLOCK_THREADS * DIMS_PER_THREAD must equal D_V_VAL. For D_V=512 the
+// canonical instantiation is BLOCK_THREADS=64, DIMS_PER_THREAD=8 (one uint4
+// per thread per split). Warp 0 computes the per-(t,h) LSE max/sum and
+// broadcasts via smem so the inner accumulate loop reads each split's LSE
+// from smem rather than re-fetching from L1/L2.
 template <int NUM_HEADS, int D_V_VAL, int BLOCK_THREADS, int DIMS_PER_THREAD>
 __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge_kernel(
     const bf16* __restrict__ mid_out,

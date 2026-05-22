@@ -26,11 +26,10 @@
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Sparse-MLA SM120 combine kernel (v2): per-batch split indexing via
-// num_splits_ptr. Merges decode-dsv3_2 partial outputs into final bf16 output
-// and float32 LSE. Vectorized float4 loads with split-level prefetch.
-//
-// Raw-pointer interface; framework-agnostic.
+// Sparse-MLA SM120 combine kernel for the DSv3.2 split-KV decode path.
+// Per-batch split indexing via num_splits_ptr; merges per-split partial
+// outputs into the final bf16 output + float32 LSE with vectorized float4
+// loads. Raw-pointer interface; framework-agnostic.
 
 #include <cuda_runtime.h>
 
@@ -192,9 +191,10 @@ __global__ void __launch_bounds__(COMBINE_THREADS)
 }  // namespace
 
 // Launch combine-dsv3_2.
-// MAX_SPLITS=256 covers the maximum num_sm_parts the sm120 scheduler emits
-// (RTX PRO 6000 Blackwell = 188 SMs). Returns true on dispatch, false if
-// max_nsplits exceeds the compiled ceiling (caller should error out).
+// MAX_SPLITS=256 is the compiled ceiling and comfortably covers the
+// per-block split counts the SM120 scheduler emits in practice. Returns
+// true on dispatch, false if max_nsplits exceeds the ceiling (caller
+// should error out).
 bool launch_combine_dsv3_2(const float* o_accum, const float* lse_accum, bf16* output, float* out_lse,
                        const int* num_splits_ptr, int batch, int s_q, int num_heads,
                        int max_nsplits, const float* attn_sink, cudaStream_t stream) {

@@ -26,15 +26,14 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Microbenchmark for sparse-MLA paged attention on SM120 family.
+"""Microbenchmark for sparse-MLA paged attention on SM120.
 
-Sweeps representative DSv4-Flash DSV4 (d_qk=512) shapes across both the
-decode-dsv3_2 path (num_tokens ≤ 64) and the prefill path (num_tokens > 64).
-Reports median latency, KV-cache memory bandwidth, and analytical attention
-FLOPs. The wrapper auto-dispatches between the two paths internally on
-``num_tokens``.
+Sweeps representative DSv4 (d_qk=512) shapes across both the decode path
+(num_tokens ≤ 64) and the prefill path (num_tokens > 64). Reports median
+latency, KV-cache memory bandwidth, and analytical attention FLOPs. The
+wrapper auto-dispatches between the two paths internally on ``num_tokens``.
 
-Requires sm120a / sm121a (RTX PRO 6000 Blackwell or consumer Blackwell variants).
+Requires sm120a / sm121a.
 """
 
 import numpy as np
@@ -156,18 +155,16 @@ def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0)
 
 if __name__ == "__main__":
     if not is_sm120a_supported(torch.device("cuda")):
-        raise SystemExit("Sparse-MLA SM120 requires sm120a (RTX PRO 6000 Blackwell).")
+        raise SystemExit("Sparse-MLA SM120 requires sm120a.")
 
-    # DSv4-Flash DSV4 representative shapes.
-    # (num_heads, topk, num_tokens):
+    # Representative DSv4 shapes. (num_heads, topk, num_tokens):
     #   topk=128  → SWA window
-    #   topk=512  → C4A indexer top-k
+    #   topk=512  → indexer top-k
     #   topk=1024 → larger-window MTP
     #
-    # Decode-v2 path (num_tokens ≤ 64):
-    #   num_tokens=1/16/32 covers single-stream + small-batch decode
-    # Prefill path (num_tokens > 64):
-    #   num_tokens=128/512/1024 covers typical vLLM chunked-prefill chunk sizes
+    # Decode path (num_tokens ≤ 64) covers single-stream + small-batch
+    # decode. Prefill path (num_tokens > 64) covers typical chunked-prefill
+    # chunk sizes.
     decode_configs = [
         (16, 128, 1),
         (16, 128, 16),

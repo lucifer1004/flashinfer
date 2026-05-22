@@ -45,16 +45,12 @@
 #include "model/scale_convert.cuh"
 
 // ============================================================================
-// Sparse MLA Decode V2 — scheduler-driven split-KV decode
+// Sparse MLA Decode (DSv3.2) — scheduler-driven split-KV decode
 //
-// Replaces v1's fixed (token × REPLICATE_H, NSPLITS) grid with
-// scheduler-driven (REPLICATE_H, s_q, num_sm_parts) grid.
-//
-// Key differences from v1:
-//   - TILES_PER_SPLIT removed (runtime from scheduler metadata)
-//   - One CTA may process blocks from multiple batch elements
-//   - Supports is_no_split direct bf16 output (skip combine)
-//   - Per-batch split indexing via num_splits_ptr prefix sum
+// Scheduler emits per-CTA work: a (REPLICATE_H, s_q, num_sm_parts) grid
+// where one CTA may cover blocks from multiple batch elements. Per-batch
+// split indexing is via a num_splits_ptr prefix sum. Supports the
+// is_no_split direct-bf16 output fast path (skips the combine kernel).
 // ============================================================================
 
 struct DecodeV2ColdParams {
@@ -77,9 +73,10 @@ struct DecodeV2ColdParams {
   size_t stride_extra_kv_block;  // extra cache block stride
 };
 
-// PAGE_BLOCK_SIZE_EXTRA defaults to PAGE_BLOCK_SIZE so existing v2 instantiations
-// remain a strict subset. When extra cache uses a different block size (DSv4
-// C128A: PAGE_BLOCK_SIZE=64 + PAGE_BLOCK_SIZE_EXTRA=2), set it explicitly.
+// PAGE_BLOCK_SIZE_EXTRA defaults to PAGE_BLOCK_SIZE so single-cache callers
+// keep a strict subset. When the extra cache uses a different block size
+// (e.g. DSv4 C128A: PAGE_BLOCK_SIZE=64, PAGE_BLOCK_SIZE_EXTRA=2), set it
+// explicitly.
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
           int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)

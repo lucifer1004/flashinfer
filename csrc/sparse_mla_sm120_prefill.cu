@@ -214,9 +214,9 @@ inline bool dispatch_model1_dual(int num_heads, int topk, int topk_extra, int ex
                                  float sm_scale, int num_tokens, size_t stride_kv_block,
                                  size_t stride_kv_block_extra, const int* topk_length_ptr,
                                  const int* topk_length_extra_ptr, cudaStream_t stream) {
-// NH=16 dispatches through MG with MG_N_HG_T=1 (HEADS_PER_CTA=16) so vllm
-// can pad TP=4 / TP=8 (real heads 16 / 8) without going through SG (SG
-// has no dual-cache support).
+// NH=16 dispatches through MG with MG_N_HG_T=1 (HEADS_PER_CTA=16) so callers
+// can pad TP=4 / TP=8 (real heads 16 / 8) without going through SG (SG has
+// no dual-cache support).
 #define DISPATCH_DUAL_MG(NH, TK, TK_EX, PBSX, NHG)                                           \
   launch_prefill_mg<ModelType::DSV4, ComputeMode::FP8, NH, TK, 64, TK_EX, PBSX, NHG>(      \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, \
@@ -240,7 +240,7 @@ inline bool dispatch_model1_dual(int num_heads, int topk, int topk_extra, int ex
         return false;
     }
   } else if (topk == 128 && topk_extra == 512 && extra_page_block_size == 64) {
-    // DSv4-Flash C4A: SWA window=128, indexer top_k=512, compress_ratio=4.
+    // Dual-cache C4A: SWA window=128, indexer top_k=512, compress_ratio=4.
     switch (num_heads) {
       case 16:
         DISPATCH_DUAL_MG(16, 128, 512, 64, 1);
@@ -258,7 +258,7 @@ inline bool dispatch_model1_dual(int num_heads, int topk, int topk_extra, int ex
         return false;
     }
   } else if (topk == 128 && topk_extra == 512 && extra_page_block_size == 2) {
-    // DSv4-Flash C128A: SWA window=128, indexer top_k=512, compress_ratio=128.
+    // Dual-cache C128A: SWA window=128, indexer top_k=512, compress_ratio=128.
     switch (num_heads) {
       case 16:
         DISPATCH_DUAL_MG(16, 128, 512, 2, 1);

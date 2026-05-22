@@ -26,9 +26,10 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Sparse-MLA paged attention for SM120 family (RTX PRO 6000 Blackwell).
+"""Sparse-MLA paged attention for SM120.
 
-Auto-dispatches decode-dsv3_2 (num_tokens <= 64) vs prefill (larger) internally.
+Auto-dispatches between decode (num_tokens <= 64) and prefill (larger) and,
+within decode, between the DSv4 fast path and the DSv3.2 / fallback path.
 
 Two public surfaces, mirroring the b12x_fused_moe + B12xMoEWrapper convention:
 
@@ -75,12 +76,11 @@ _BI = 64  # KV partition tile size in candidates (BLOCK_SIZE_N)
 _MAX_OCCUPANCY = 2  # max additional waves of split-K parallelism beyond baseline
 _FIXED_OVERHEAD = 64  # scheduler tile-overhead constant
 
-# Decode-v2 cutoff: num_tokens > _DECODE_MAX_TOKENS routes to the prefill
-# kernel, which writes output / out_lse directly and does NOT use o_accum /
-# lse_accum / sched_meta / num_splits. The wrapper's workspace_buffer is
-# therefore sized for decode only — independent of prefill's token bound,
-# which would otherwise blow up workspace to GB scale for vLLM-style
-# max_num_batched_tokens.
+# Decode/prefill cutoff: num_tokens > _DECODE_MAX_TOKENS routes to the
+# prefill kernel, which writes output / out_lse directly and does NOT use
+# the o_accum / lse_accum / sched_meta / num_splits workspace sections.
+# The wrapper's workspace_buffer is therefore sized for decode only,
+# independent of the (much larger) prefill token bound.
 _DECODE_MAX_TOKENS = 64
 
 # decode-dsv4 supports a fixed (num_heads, topk) dispatch table. Outside of
@@ -109,10 +109,8 @@ def _decode_dsv4_dispatchable(num_tokens: int, num_heads: int, topk: int, d_qk: 
     instantiation set and PAGE_BLOCK_SIZE=64. Outside this envelope the
     orchestrator routes to decode-dsv3_2 / prefill.
     """
-    # decode-dsv4 is the default fast path. The historical FLASHINFER_ENABLE_DECODE_V3
-    # opt-in gate was removed once the QK RoPE B-load layout bug (commit 99a5741e)
-    # was fixed and verified end-to-end on DSv4-Flash GSM8K. The DISABLE kill switch
-    # is retained for production fallback.
+    # FLASHINFER_DISABLE_DECODE_DSV4=1 routes everything through the
+    # decode-dsv3_2 fallback path; useful as an in-production kill switch.
     if os.getenv("FLASHINFER_DISABLE_DECODE_DSV4") == "1":
         return False
     return (
@@ -295,16 +293,15 @@ def get_sparse_mla_sm120_module():
         topk = indices.shape[-1]
 
         # decode-dsv4 fast path. Only dispatch when the (num_heads, topk) pair
-        # is in v3's instantiation table and the model matches DSV4's
-        # layout. Otherwise fall through to decode-dsv3_2 / prefill.
+        # is in DSv4's instantiation set and the model matches DSv4's layout;
+        # otherwise fall through to decode-dsv3_2 / prefill.
         # kv_cache layout: [num_blocks, page_block_size, 1, bytes_per_token].
         kv_pbs = int(kv_cache.size(-3)) if kv_cache.ndim >= 3 else 0
         if (kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
                 and _decode_dsv4_dispatchable(num_tokens, num_heads, topk, d_qk, kv_pbs)):
-            # v3 scratch (mid_out / mid_lse) is small enough to allocate
-            # per call — for h=128/T=64/k=1024 it's ~16 MB BF16 + 256 KB f32.
-            # Could be carved from workspace_buffer later for cudagraph
-            # alloc-free reuse if it shows up in profiling.
+            # mid_out / mid_lse scratch is small enough to allocate per call
+            # (could be carved from workspace_buffer later for cudagraph
+            # alloc-free reuse if it ever shows up in profiling).
             num_splits_main = (topk + _BI - 1) // _BI
             extra_topk = (
                 int(extra_indices.size(-1)) if extra_indices is not None else 0
@@ -321,9 +318,9 @@ def get_sparse_mla_sm120_module():
                 dtype=torch.float32,
                 device=q.device,
             )
-            # Pass kv_cache as-is (4D from vLLM or 2D from microbench). The
-            # FFI binding extracts the block stride from .stride(0), which
-            # correctly handles vLLM's padded-block-stride convention.
+            # Pass kv_cache as-is — both 4D paged layouts (with possibly
+            # padded block stride) and 2D microbench layouts are supported;
+            # the FFI binding extracts the true block stride from .stride(0).
             sparse_mla_sm120_decode_dsv4(
                 q,
                 kv_cache,
@@ -341,12 +338,12 @@ def get_sparse_mla_sm120_module():
             )
             return
 
-        # decode-dsv3_2 / prefill fallback (existing path).
+        # decode-dsv3_2 / prefill fallback path.
         num_sm_parts = _compute_num_sm_parts(num_heads, q.device, num_tokens, topk)
-        # Decode-v2 uses the workspace partitions; prefill writes output /
-        # out_lse directly and ignores them. Cap the partition request at
-        # the decode cutoff so the caller's workspace_buffer only needs to
-        # hold the decode-side scratch (independent of prefill's token bound).
+        # The decode-dsv3_2 path uses the workspace partitions; prefill writes
+        # output / out_lse directly and ignores them. Cap the partition
+        # request at the decode cutoff so the caller's workspace_buffer only
+        # needs to hold the decode-side scratch.
         partition_tokens = min(num_tokens, _DECODE_MAX_TOKENS)
         sched_meta, num_splits, o_accum, lse_accum = _partition_workspace(
             workspace_buffer,
@@ -399,9 +396,9 @@ def sparse_mla_sm120_paged_attention(
     extra_indices: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
 ) -> None:
-    r"""Sparse-MLA paged attention on SM120 (RTX PRO 6000 Blackwell).
+    r"""Sparse-MLA paged attention on SM120.
 
-    Auto-dispatches decode-dsv3_2 (``num_tokens <= 64``) vs prefill (larger).
+    Auto-dispatches decode (``num_tokens <= 64``) vs prefill (larger).
     Mutates ``output``, ``out_lse``, and ``workspace_buffer`` in place.
 
     Parameters
@@ -564,8 +561,8 @@ class BatchSparseMLAPagedAttentionWrapper:
         the actual ``num_tokens``; otherwise returns ``None``.
 
         Accepts ``q``/``output`` either as 3-D ``[num_tokens, num_heads, head_dim]``
-        or as 4-D ``[num_tokens, 1, num_heads, head_dim]`` (with the inner s_q=1
-        dim used by some callers e.g. vLLM); the 4-D form is squeezed in place.
+        or as 4-D ``[num_tokens, 1, num_heads, head_dim]`` (some callers carry
+        a singleton s_q dim); the 4-D form is squeezed in place.
         """
         if q.dim() == 4:
             if q.size(1) != 1:
@@ -611,7 +608,7 @@ class BatchSparseMLAPagedAttentionWrapper:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Decode-v3: AutoTuner-driven chunks_per_block tuning
+# Decode-DSv4: AutoTuner-driven chunks_per_block tuning
 # ─────────────────────────────────────────────────────────────────────
 #
 # decode-dsv4 is the split-K decode kernel where each block handles
@@ -709,7 +706,7 @@ def _decode_dsv4_map_to_token_bucket(x):
 
 
 def _decode_dsv4_init_q(shapes, dtype, device):
-    """bf16 q ~N(0, 0.1) clamped to [-1, 1] — matches test_decode_dsv4 distribution."""
+    """bf16 q ~ N(0, 0.1) clamped to [-1, 1] — matches the unit test distribution."""
     return (torch.randn(shapes, device=device, dtype=torch.float32) / 10.0).clamp(-1, 1).to(dtype)
 
 
@@ -886,7 +883,7 @@ def sparse_mla_sm120_decode_dsv4(
     extra_topk_length: Optional[torch.Tensor] = None,
     chunks_per_block: Optional[int] = None,
 ) -> torch.Tensor:
-    r"""Sparse-MLA paged decode (v3 standalone kernel) on SM120.
+    r"""Sparse-MLA paged decode (DSv4 standalone kernel) on SM120.
 
     The decode-dsv4 path is the split-K decode variant where each block handles
     ``chunks_per_block`` chunks of 64 candidates each. The wall-time-optimal

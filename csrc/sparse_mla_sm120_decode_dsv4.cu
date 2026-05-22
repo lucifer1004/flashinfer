@@ -73,31 +73,12 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache,
   CUDA_CHECK_BOOL(cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
 
-  // Heuristic for chunks_per_block: among cpb candidates with at most
+  // chunks_per_block heuristic: among cpb candidates with at most
   // CEIL_WAVES_MAX integer waves, minimize the last-wave tail gap
-  // (ceil(waves) - waves). On ties, prefer the LARGEST cpb (fewer total
-  // launched blocks → less L2 contention).
-  //
-  // Why these two terms:
-  // - `ceil_w cap`: forbids cpb=1 type configurations where the fractional
-  //   gap looks small but the integer wave count is 6-11, paying a huge
-  //   wall-time penalty.
-  // - `min tail gap`: prefers cpb where the last wave is mostly full (e.g.,
-  //   active=512 on 188 SMs → waves=2.72, last wave 72% full) over cpb
-  //   where the last wave is essentially empty (e.g., active=384 → waves=
-  //   2.04, last wave 4% full — only 8 of 188 SMs working in that wave).
-  //
-  // Trade-offs observed empirically: net -1.4% across the 16-shape grid.
-  // - Big wins (-28%) on small-work shapes like (32,512,T=16) and
-  //   (128,128,T=16) where the prior 2*SMs heuristic picked cpb=1 with
-  //   active_grid > SMs but spread the work over 2-3 waves; the new
-  //   heuristic picks cpb=2 for these (1.36-0.68 waves, fewer launches,
-  //   better per-block amortization).
-  // - Some +5..+12% regressions on shapes like (64,512,T=16) where the
-  //   true optimum is cpb=3 (waves=1.02, gap=0.98 — near-perfect 1-wave
-  //   fit that the gap metric misses). These shapes were already winning
-  //   1.5-3x vs jasl, so the regression is acceptable.
-  // - Closes -8% on h=128/k=512/T=32 (was 0.94x jasl, now ~1.03x).
+  // (ceil(waves) - waves). On ties, prefer the largest cpb so fewer
+  // launched blocks contend on L2. The ceil_w cap rules out cpb values
+  // whose fractional gap looks small but require many integer waves.
+  // AutoTuner can override per-shape via chunks_per_block_override.
   int chunks_per_block;
   if (chunks_per_block_override >= 1 && chunks_per_block_override <= num_splits) {
     // AutoTuner / caller override path — used by SparseMlaDecodeRunner to
