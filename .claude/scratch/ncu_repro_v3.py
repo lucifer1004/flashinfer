@@ -39,7 +39,7 @@ def main() -> None:
 
     module = gen_sparse_mla_sm120_module().build_and_load()
 
-    V3_CW = 128  # S2: bumped from 64
+    V3_CW = 64  # A1.2: dropped to 64 for double-buffered KV smem
     num_splits = (topk + V3_CW - 1) // V3_CW  # 4 for topk=512
     mid = torch.empty(num_tokens, num_heads, num_splits, d_v, dtype=torch.bfloat16, device=device)
     mid_lse = torch.empty(num_tokens, num_heads, num_splits, dtype=torch.float32, device=device)

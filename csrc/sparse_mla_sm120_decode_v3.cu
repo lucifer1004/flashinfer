@@ -30,29 +30,29 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   using KV = KVCacheTraits<MT>;
   constexpr int H_BLOCKS = NUM_HEADS / HPB;
 
-  // Stage 1: decode-v3 partial-output kernel.
-  // Dynamic smem layout (S2.5 FP8 XV, MODEL1, V3_BI=128):
-  //   sm_q_rope    HPB * D_ROPE * 2B            =   2 KB
-  //   sm_q_fp8     HPB * Q_NOPE_STRIDE          = 7.25 KB
-  //   sm_q_sc      HPB * NUM_SCALES * 4B        = 0.44 KB
-  //   sm_kv_fp8    V3_BI * KV_SMEM_STRIDE       =  58 KB
-  //   sm_kv_sc     V3_BI * SCALE_BYTES_PER_TOKEN =  1 KB
-  //   sm_kv_rope   V3_BI * D_ROPE * 2B          =  16 KB
-  //   sm_reduce    2 * V3_N_WARPS * HPB * 4     =  512 B
-  //   sm_w_head_sc N_V_CHUNKS * HPB * 4         =  448 B
-  //   sm_w_fp8     HPB * (V3_BI + 16)           = 2.25 KB
-  //   Total                                     ~ 88 KB
+  // Stage 1: decode-v3 (A1.2) partial-output kernel.
+  // Dynamic smem layout (FP8 XV, MODEL1, V3_BI=64, double-buffered KV):
+  //   sm_q_rope    HPB * D_ROPE * 2B                      =  2 KB
+  //   sm_q_fp8     HPB * Q_NOPE_STRIDE                    = 7.25 KB
+  //   sm_q_sc      HPB * NUM_SCALES * 4B                  = 0.44 KB
+  //   sm_kv_fp8    2 * V3_BI * KV_SMEM_STRIDE             = 58 KB
+  //   sm_kv_sc     2 * V3_BI * SCALE_BYTES_PER_TOKEN      =  1 KB
+  //   sm_kv_rope   2 * V3_BI * D_ROPE * 2B                = 16 KB
+  //   sm_reduce    2 * V3_N_WARPS * HPB * 4               = 512 B
+  //   sm_w_head_sc N_V_CHUNKS * HPB * 4                   = 448 B
+  //   sm_w_fp8     HPB * (V3_BI + 16)                     = 1.25 KB
+  //   Total                                               ~ 87 KB
   // Static smem (kernel-side):
-  //   sm_p_full    HPB * V3_BI * 2B (bf16)      =   4 KB
-  // Grand total ~ 92 KB (under 100 KB SM120 carveout, 1 block/SM).
+  //   sm_p_full    HPB * V3_BI * 2B (bf16)                =  2 KB
+  // Grand total ~ 89 KB (under 100 KB SM120 carveout, 1 block/SM).
   constexpr int N_V_CHUNKS_LAUNCH = KV::D_NOPE / KV::QUANT_TILE;        // 7
   constexpr int DYN_SMEM_BYTES =
       HPB * KV::D_ROPE * (int)sizeof(bf16)                              // sm_q_rope
       + HPB * KV::Q_NOPE_STRIDE                                          // sm_q_fp8
       + HPB * KV::NUM_SCALES * (int)sizeof(float)                        // sm_q_sc
-      + V3_BI * KV::KV_SMEM_STRIDE                                       // sm_kv_fp8
-      + V3_BI * KV::SCALE_BYTES_PER_TOKEN                                // sm_kv_sc
-      + V3_BI * KV::D_ROPE * (int)sizeof(bf16)                           // sm_kv_rope
+      + V3_KV_BUF_COUNT * V3_BI * KV::KV_SMEM_STRIDE                     // sm_kv_fp8 ×2
+      + V3_KV_BUF_COUNT * V3_BI * KV::SCALE_BYTES_PER_TOKEN              // sm_kv_sc ×2
+      + V3_KV_BUF_COUNT * V3_BI * KV::D_ROPE * (int)sizeof(bf16)         // sm_kv_rope ×2
       + 2 * V3_N_WARPS * HPB * (int)sizeof(float)                        // sm_reduce
       + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                     // sm_w_head_sc
       + HPB * (V3_BI + 16);                                              // sm_w_fp8

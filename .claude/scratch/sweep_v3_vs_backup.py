@@ -48,9 +48,8 @@ def bench_one(num_heads, topk, num_tokens):
     out_ref = reference_attention(q, kv_deq, indices, sm_scale)
 
     module = gen_sparse_mla_sm120_module().build_and_load()
-    # Each kernel's CAND_WINDOW is now different: live v3 = 128 (S2),
-    # frozen backup = 64. Compute num_splits separately.
-    V3_CAND_WINDOW_LIVE = 128
+    # A1.2 dropped CW back to 64 to fit double-buffered KV smem; backup is also 64.
+    V3_CAND_WINDOW_LIVE = 64
     V3_CAND_WINDOW_BACKUP = 64
     num_splits_v3 = (topk + V3_CAND_WINDOW_LIVE - 1) // V3_CAND_WINDOW_LIVE
     num_splits_bk = (topk + V3_CAND_WINDOW_BACKUP - 1) // V3_CAND_WINDOW_BACKUP
