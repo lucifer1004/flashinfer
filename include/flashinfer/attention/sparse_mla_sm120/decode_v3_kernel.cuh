@@ -153,7 +153,12 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
     // For simplicity: 32 lanes split 16 entries → 2 lanes per entry.
     // Each lane handles half the FP8 NoPE (224 bytes) + half rope.
     const int warp_first_entry = warp_id * V3_ENTRIES_PER_WARP;
-#pragma unroll 1
+    // ILP across consecutive entries: ask nvcc to unroll a few iters so it
+    // can issue multiple loads in flight before any dequant completes.
+    // Hides the L2 latency that shows up as long_scoreboard (3.87 stalls/
+    // issue post-swizzle) — gmem loads can overlap across the 14 LDG.U8s
+    // of cand[eo] and cand[eo+1].
+#pragma unroll 16
     for (int eo = 0; eo < V3_ENTRIES_PER_WARP; eo++) {
       const int entry_idx = warp_first_entry + eo;
       const int cand_pos = split_cand_start + entry_idx;
