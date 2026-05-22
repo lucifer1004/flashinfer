@@ -59,6 +59,17 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
     bf16* __restrict__ mid_out,            // [num_tokens, num_heads, num_splits, d_v] bf16
     float* __restrict__ mid_lse,           // [num_tokens, num_heads, num_splits] f32
     const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
+    // Optional secondary KV cache (DSv4 C4A / C128A second-tier per-token cache).
+    // When extra_KV_cache != nullptr the kernel concatenates the extra candidate
+    // window after the main one; per-chunk dispatch in the IO warp + math mask
+    // routes each chunk to the correct source. Same PAGE_BLOCK_SIZE as main
+    // (task 20 — different page-size variant lands separately).
+    const uint8_t* __restrict__ extra_KV_cache,        // nullable; may use different pbs
+    const int32_t* __restrict__ extra_indices,         // [num_tokens, extra_topk]
+    const int* __restrict__ extra_topk_length_ptr,     // [num_tokens] or null
+    int extra_topk,                                    // 0 = no extra cache
+    int pbs_extra,                                     // page_block_size for extra cache (e.g. 2 for DSv4 C128A)
+    size_t stride_extra_kv_block,
     int num_tokens, int num_splits, int chunks_per_block,
     float sm_scale, size_t stride_kv_block) {
   using KV = KVCacheTraits<MT>;
@@ -82,9 +93,17 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
 
   const int h_start = h_block_idx * HPB;
   const int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : TOPK;
+  const int extra_topk_len =
+      (extra_KV_cache != nullptr)
+          ? (extra_topk_length_ptr ? __ldg(extra_topk_length_ptr + t_idx) : extra_topk)
+          : 0;
 
-  // Chunk range this block owns.
-  const int num_chunks_total = (topk_len + V3_CAND_WINDOW - 1) / V3_CAND_WINDOW;
+  // Chunk range this block owns. Total chunks = main + extra (extra layout
+  // is concatenated immediately after main; per-chunk dispatch in IO + math
+  // routes to the right source).
+  const int num_orig_chunks = (topk_len + V3_CAND_WINDOW - 1) / V3_CAND_WINDOW;
+  const int num_extra_chunks = (extra_topk_len + V3_CAND_WINDOW - 1) / V3_CAND_WINDOW;
+  const int num_chunks_total = num_orig_chunks + num_extra_chunks;
   const int chunk_lo = split_idx * chunks_per_block;
   const int chunk_hi = min(chunk_lo + chunks_per_block, num_chunks_total);
 
@@ -197,9 +216,25 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
       (uint32_t)V3_BI * (V3_BULK_NOPE_BYTES + V3_BULK_ROPE_BYTES);
 
   // IO gather: scalar scales → fence → expect_tx + bulks.
+  // Dispatch per-chunk: chunks [0, num_orig_chunks) read from main KV_cache +
+  // indices; chunks [num_orig_chunks, num_chunks_total) read from the
+  // extra_KV_cache + extra_indices. The smem layout is shared — math warps
+  // don't care which source the data came from.
   auto issue_gather = [&](int gather_chunk_idx, int buf) {
-    const int g_start = gather_chunk_idx * V3_CAND_WINDOW;
-    const int g_end = min(g_start + V3_CAND_WINDOW, topk_len);
+    const bool is_extra = (gather_chunk_idx >= num_orig_chunks);
+    const int chunk_in_section =
+        is_extra ? (gather_chunk_idx - num_orig_chunks) : gather_chunk_idx;
+    const int section_len = is_extra ? extra_topk_len : topk_len;
+    const int g_start = chunk_in_section * V3_CAND_WINDOW;
+    const int g_end = min(g_start + V3_CAND_WINDOW, section_len);
+    const int32_t* section_idx_base =
+        is_extra ? (extra_indices + (size_t)t_idx * extra_topk) : idx_base;
+    const uint8_t* section_kv = is_extra ? extra_KV_cache : KV_cache;
+    const size_t section_stride = is_extra ? stride_extra_kv_block : stride_kv_block;
+    // Page block size of THIS section. Main is compile-time constexpr (typ.
+    // 64); extra is runtime (DSv4 C128A passes 2). The 8-cycle runtime div
+    // is dwarfed by the cp.async.bulk that follows.
+    const int section_pbs = is_extra ? pbs_extra : pbs;
     uint8_t* kv_fp8_dst = sm_kv_fp8_buf[buf];
     bf16* kv_rope_dst = sm_kv_rope_buf[buf];
     uint8_t* kv_sc_dst = sm_kv_sc_buf[buf];
@@ -210,14 +245,14 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
       if (entry_idx >= V3_BI) break;
       const int cand_pos = g_start + entry_idx;
       const bool is_valid_cand = (cand_pos < g_end);
-      const int idx_raw = is_valid_cand ? idx_base[cand_pos] : -1;
+      const int idx_raw = is_valid_cand ? section_idx_base[cand_pos] : -1;
       uint64_t scale_word = 0;
       if (idx_raw >= 0) {
         const int idx = idx_raw;
-        const int block_idx_g = idx / pbs;
-        const int local_idx_g = idx - block_idx_g * pbs;
-        const uint8_t* scale_base = KV_cache + (size_t)block_idx_g * stride_kv_block +
-                                    (size_t)pbs * IO_STRIDE +
+        const int block_idx_g = idx / section_pbs;
+        const int local_idx_g = idx - block_idx_g * section_pbs;
+        const uint8_t* scale_base = section_kv + (size_t)block_idx_g * section_stride +
+                                    (size_t)section_pbs * IO_STRIDE +
                                     (size_t)local_idx_g * SCALE_BYTES_PER_TOKEN;
         scale_word = __ldg(reinterpret_cast<const uint64_t*>(scale_base));
       }
@@ -238,12 +273,12 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
       const int entry_idx = eo + lane;
       if (entry_idx >= V3_BI) break;
       const int cand_pos = g_start + entry_idx;
-      const int idx_raw = (cand_pos < g_end) ? idx_base[cand_pos] : -1;
+      const int idx_raw = (cand_pos < g_end) ? section_idx_base[cand_pos] : -1;
       const int idx = (idx_raw >= 0) ? idx_raw : 0;
-      const int block_idx_g = idx / pbs;
-      const int local_idx_g = idx - block_idx_g * pbs;
+      const int block_idx_g = idx / section_pbs;
+      const int local_idx_g = idx - block_idx_g * section_pbs;
       const uint8_t* data_base =
-          KV_cache + (size_t)block_idx_g * stride_kv_block + (size_t)local_idx_g * IO_STRIDE;
+          section_kv + (size_t)block_idx_g * section_stride + (size_t)local_idx_g * IO_STRIDE;
       cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE,
                         data_base, V3_BULK_NOPE_BYTES, mbar_full + buf);
       cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C,
@@ -294,8 +329,15 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
 
   for (int chunk_idx = chunk_lo; chunk_idx < chunk_hi; ++chunk_idx) {
     const int buf = (chunk_idx - chunk_lo) & 1;
-    const int split_cand_start = chunk_idx * V3_CAND_WINDOW;
-    const int split_cand_end = min(split_cand_start + V3_CAND_WINDOW, topk_len);
+    // Dispatch chunk to main vs extra section. The split_cand_{start,end}
+    // pair is used by the math-warp mask: any candidate slot whose absolute
+    // offset within its section ≥ section_len gets qk = -inf.
+    const bool is_extra_chunk = (chunk_idx >= num_orig_chunks);
+    const int chunk_in_section =
+        is_extra_chunk ? (chunk_idx - num_orig_chunks) : chunk_idx;
+    const int section_len = is_extra_chunk ? extra_topk_len : topk_len;
+    const int split_cand_start = chunk_in_section * V3_CAND_WINDOW;
+    const int split_cand_end = min(split_cand_start + V3_CAND_WINDOW, section_len);
 
     // Wait for IO to fill this buf (mbar_full tx + arrival both met).
     mbarrier_wait_parity(mbar_full + cons_idx, cons_phase);
@@ -740,6 +782,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_v3_merge_k
     const float* __restrict__ mid_lse,
     bf16* __restrict__ output,
     float* __restrict__ out_lse,
+    const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable. natural-log domain.
     int num_tokens, int num_splits) {
   static_assert(BLOCK_THREADS % 32 == 0, "BLOCK_THREADS must be multiple of 32");
   static_assert(DIMS_PER_THREAD % 8 == 0, "DIMS_PER_THREAD must be multiple of 8 (uint4)");
@@ -790,9 +833,21 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_v3_merge_k
       local_sum += __shfl_xor_sync(0xffffffff, local_sum, s);
     }
     if (tid == 0) {
+      // attn_sink (FlashMLA V4): the sink contributes a virtual logit at
+      // exp2(sink_log2). Fold it into the normalizer so output and final
+      // LSE both account for the sink's softmax mass.
+      //   sum_with_sink = sum_partials + exp2(sink_log2 - gmax)
+      //   glse           = log2(sum_with_sink) + gmax
+      //                  = log2(exp2(glse_raw) + exp2(sink_log2))
+      // Padded heads carry sink = -inf → exp2 = 0 → no-op (legacy semantics).
+      float total_sum = local_sum;
+      if (attn_sink != nullptr) {
+        float sink_log2 = __ldg(attn_sink + h) * LOG2E;
+        total_sum += exp2f(sink_log2 - gmax);
+      }
       sm_gmax = gmax;
-      sm_inv_gsum = (local_sum > 0.f) ? (1.f / local_sum) : 0.f;
-      sm_glse = (local_sum > 0.f) ? (log2f(local_sum) + gmax) : -1e30f;
+      sm_inv_gsum = (total_sum > 0.f) ? (1.f / total_sum) : 0.f;
+      sm_glse = (total_sum > 0.f) ? (log2f(total_sum) + gmax) : -1e30f;
     }
   }
   __syncthreads();

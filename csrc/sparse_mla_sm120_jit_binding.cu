@@ -30,6 +30,12 @@ bool launch_sparse_mla_decode_v3(ModelType mt, int num_heads, int topk,
                                  const uint8_t* KV_cache, const int32_t* indices,
                                  bf16* mid_out, float* mid_lse, bf16* output,
                                  float* out_lse, const int* topk_length,
+                                 const float* attn_sink,
+                                 const uint8_t* extra_KV_cache,
+                                 const int32_t* extra_indices,
+                                 const int* extra_topk_length,
+                                 int extra_topk, int pbs_extra,
+                                 size_t stride_extra_kv_block,
                                  int chunks_per_block_override,
                                  float sm_scale, size_t stride_kv_block,
                                  cudaStream_t stream);
@@ -50,6 +56,10 @@ void SparseMlaSm120DecodeV3(TensorView q, TensorView kv_cache, TensorView indice
                             TensorView mid_out, TensorView mid_lse, TensorView output,
                             TensorView out_lse, int64_t num_splits, double sm_scale,
                             Optional<TensorView> topk_length,
+                            Optional<TensorView> attn_sink,
+                            Optional<TensorView> extra_kv_cache,
+                            Optional<TensorView> extra_indices,
+                            Optional<TensorView> extra_topk_length,
                             int64_t chunks_per_block_override) {
   TVM_FFI_ICHECK_EQ(q.ndim(), 3) << "q must be [T, H, D_QK]";
   TVM_FFI_ICHECK_EQ(kv_cache.ndim(), 2) << "kv_cache must be [num_blocks, page_bytes]";
@@ -71,6 +81,42 @@ void SparseMlaSm120DecodeV3(TensorView q, TensorView kv_cache, TensorView indice
 
   const int* topk_len_ptr =
       topk_length.has_value() ? static_cast<const int*>(topk_length.value().data_ptr()) : nullptr;
+  const float* attn_sink_ptr =
+      attn_sink.has_value() ? static_cast<const float*>(attn_sink.value().data_ptr()) : nullptr;
+  const uint8_t* extra_kv_ptr = extra_kv_cache.has_value()
+                                    ? static_cast<const uint8_t*>(extra_kv_cache.value().data_ptr())
+                                    : nullptr;
+  const int32_t* extra_indices_ptr =
+      extra_indices.has_value()
+          ? static_cast<const int32_t*>(extra_indices.value().data_ptr())
+          : nullptr;
+  const int* extra_topk_len_ptr =
+      extra_topk_length.has_value()
+          ? static_cast<const int*>(extra_topk_length.value().data_ptr())
+          : nullptr;
+  // extra_topk and stride_extra_kv_block derived from the optional tensors.
+  // pbs_extra: when extra cache is 4D [num_blocks, pbs_extra, 1, bpt] take
+  // pbs_extra from dim -3; when caller passes 2D [num_blocks, pbs_extra * bpt]
+  // we infer from the total row width / BPT_MODEL1 (= 584).
+  int extra_topk_arg = 0;
+  int pbs_extra_arg = 0;
+  size_t stride_extra_kv_block = 0;
+  if (extra_kv_cache.has_value()) {
+    const auto& ekv = extra_kv_cache.value();
+    extra_topk_arg = static_cast<int>(extra_indices.value().size(1));
+    if (ekv.ndim() >= 3) {
+      pbs_extra_arg = static_cast<int>(ekv.size(-3));
+      // row stride = pbs * bpt, derive from total trailing size
+      size_t row_bytes = 1;
+      for (int d = 1; d < ekv.ndim(); ++d) row_bytes *= static_cast<size_t>(ekv.size(d));
+      stride_extra_kv_block = row_bytes;
+    } else {
+      // 2D fallback: assume MODEL1 bpt = 584. Infer pbs from row width.
+      constexpr int BPT_MODEL1 = 584;
+      stride_extra_kv_block = static_cast<size_t>(ekv.size(1));
+      pbs_extra_arg = static_cast<int>(stride_extra_kv_block / BPT_MODEL1);
+    }
+  }
 
   cudaStream_t stream = get_stream(q.device());
   bool ok = launch_sparse_mla_decode_v3(
@@ -80,7 +126,10 @@ void SparseMlaSm120DecodeV3(TensorView q, TensorView kv_cache, TensorView indice
       static_cast<const int32_t*>(indices.data_ptr()),
       static_cast<bf16*>(mid_out.data_ptr()), static_cast<float*>(mid_lse.data_ptr()),
       static_cast<bf16*>(output.data_ptr()), static_cast<float*>(out_lse.data_ptr()),
-      topk_len_ptr, static_cast<int>(chunks_per_block_override),
+      topk_len_ptr, attn_sink_ptr,
+      extra_kv_ptr, extra_indices_ptr, extra_topk_len_ptr,
+      extra_topk_arg, pbs_extra_arg, stride_extra_kv_block,
+      static_cast<int>(chunks_per_block_override),
       static_cast<float>(sm_scale), stride_kv_block, stream);
   TVM_FFI_ICHECK(ok) << "decode-v3 launch failed (unsupported shape or kernel error)";
 }

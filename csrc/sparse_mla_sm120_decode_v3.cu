@@ -24,6 +24,12 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
                                   const int32_t* indices, bf16* mid_out,
                                   float* mid_lse, const int* topk_length,
                                   bf16* output, float* out_lse,
+                                  const float* attn_sink,
+                                  const uint8_t* extra_KV_cache,
+                                  const int32_t* extra_indices,
+                                  const int* extra_topk_length,
+                                  int extra_topk, int pbs_extra,
+                                  size_t stride_extra_kv_block,
                                   int num_tokens, int num_splits,
                                   int chunks_per_block_override,
                                   float sm_scale, size_t stride_kv_block,
@@ -125,10 +131,11 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   (void)num_splits_eff;
   dim3 grid1(num_tokens, H_BLOCKS, num_splits);
   dim3 block1(V3_BLOCK_THREADS);
-  kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(Q, KV_cache, indices, mid_out,
-                                                   mid_lse, topk_length, num_tokens,
-                                                   num_splits, chunks_per_block, sm_scale,
-                                                   stride_kv_block);
+  kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
+      Q, KV_cache, indices, mid_out, mid_lse, topk_length,
+      extra_KV_cache, extra_indices, extra_topk_length, extra_topk,
+      pbs_extra, stride_extra_kv_block, num_tokens, num_splits,
+      chunks_per_block, sm_scale, stride_kv_block);
   CUDA_CHECK_BOOL(cudaGetLastError());
 
   // Stage 2: merge splits → final output + LSE.
@@ -142,7 +149,7 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   dim3 grid2(num_tokens, NUM_HEADS);
   dim3 block2(MERGE_BLOCK_THREADS);
   merge_kernel<<<grid2, block2, 0, stream>>>(mid_out, mid_lse, output, out_lse,
-                                             num_tokens, num_splits);
+                                             attn_sink, num_tokens, num_splits);
   CUDA_CHECK_BOOL(cudaGetLastError());
   return true;
 }
@@ -156,6 +163,12 @@ bool launch_sparse_mla_decode_v3(ModelType mt, int num_heads, int topk,
                                  const uint8_t* KV_cache, const int32_t* indices,
                                  bf16* mid_out, float* mid_lse, bf16* output,
                                  float* out_lse, const int* topk_length,
+                                 const float* attn_sink,
+                                 const uint8_t* extra_KV_cache,
+                                 const int32_t* extra_indices,
+                                 const int* extra_topk_length,
+                                 int extra_topk, int pbs_extra,
+                                 size_t stride_extra_kv_block,
                                  int chunks_per_block_override,
                                  float sm_scale, size_t stride_kv_block,
                                  cudaStream_t stream) {
@@ -164,8 +177,10 @@ bool launch_sparse_mla_decode_v3(ModelType mt, int num_heads, int topk,
   if (num_heads == (H) && topk == (K)) {                                 \
     return launch_decode_v3_impl<ModelType::MODEL1, (H), (K), 64>(       \
         Q, KV_cache, indices, mid_out, mid_lse, topk_length, output,     \
-        out_lse, num_tokens, num_splits, chunks_per_block_override,      \
-        sm_scale, stride_kv_block, stream);                              \
+        out_lse, attn_sink, extra_KV_cache, extra_indices,               \
+        extra_topk_length, extra_topk, pbs_extra,                        \
+        stride_extra_kv_block, num_tokens, num_splits,                   \
+        chunks_per_block_override, sm_scale, stride_kv_block, stream);   \
   }
   V3_DISPATCH(16, 128)
   V3_DISPATCH(16, 512)

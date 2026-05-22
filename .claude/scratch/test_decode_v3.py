@@ -83,7 +83,7 @@ def run_decode_v3(q, kv, indices, sm_scale, num_splits):
     out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=q.device)
     mid = torch.empty(num_tokens, num_heads, num_splits, d_v, dtype=torch.bfloat16, device=q.device)
     mid_lse = torch.empty(num_tokens, num_heads, num_splits, dtype=torch.float32, device=q.device)
-    module.sparse_mla_sm120_decode_v3(q, kv, indices, mid, mid_lse, output, out_lse, num_splits, sm_scale, None, -1)
+    module.sparse_mla_sm120_decode_v3(q, kv, indices, mid, mid_lse, output, out_lse, num_splits, sm_scale, None, None, None, None, None, -1)
     return output, out_lse
 
 
@@ -133,13 +133,13 @@ def main():
     output_v3 = torch.empty(num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device)
     out_lse_v3 = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
     for _ in range(5):
-        module.sparse_mla_sm120_decode_v3(q, kv_flat, indices, mid, mid_lse, output_v3, out_lse_v3, 8, sm_scale, None, -1)
+        module.sparse_mla_sm120_decode_v3(q, kv_flat, indices, mid, mid_lse, output_v3, out_lse_v3, 8, sm_scale, None, None, None, None, None, -1)
     torch.cuda.synchronize()
     start_evt = torch.cuda.Event(enable_timing=True)
     end_evt = torch.cuda.Event(enable_timing=True)
     start_evt.record()
     for _ in range(50):
-        module.sparse_mla_sm120_decode_v3(q, kv_flat, indices, mid, mid_lse, output_v3, out_lse_v3, 8, sm_scale, None, -1)
+        module.sparse_mla_sm120_decode_v3(q, kv_flat, indices, mid, mid_lse, output_v3, out_lse_v3, 8, sm_scale, None, None, None, None, None, -1)
     end_evt.record()
     torch.cuda.synchronize()
     v3_us = start_evt.elapsed_time(end_evt) / 50 * 1000

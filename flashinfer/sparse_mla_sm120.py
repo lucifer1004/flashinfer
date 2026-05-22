@@ -570,6 +570,10 @@ def _get_sparse_mla_decode_v3_module():
             q, kv_cache, indices, mid_out, mid_lse, output, out_lse = inputs
             sm_scale = kwargs["sm_scale"]
             topk_length = kwargs.get("topk_length")
+            attn_sink = kwargs.get("attn_sink")
+            extra_kv_cache = kwargs.get("extra_kv_cache")
+            extra_indices = kwargs.get("extra_indices")
+            extra_topk_length = kwargs.get("extra_topk_length")
             topk = indices.shape[1]
             num_splits = (topk + _BI - 1) // _BI
             # tactic ∈ [1, num_splits] → pass through; tactic == -1 (autotuner
@@ -586,6 +590,10 @@ def _get_sparse_mla_decode_v3_module():
                 num_splits,
                 sm_scale,
                 topk_length,
+                attn_sink,
+                extra_kv_cache,
+                extra_indices,
+                extra_topk_length,
                 cpb_override,
             )
             return output
@@ -779,6 +787,10 @@ def sparse_mla_sm120_decode_v3(
     sm_scale: float,
     *,
     topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_kv_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
     chunks_per_block: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Sparse-MLA paged decode (v3 standalone kernel) on SM120.
@@ -830,13 +842,21 @@ def sparse_mla_sm120_decode_v3(
     runner = _decode_v3_runner_singleton()
     inputs = [q, kv_cache, indices, mid_out, mid_lse, output, out_lse]
 
+    forward_kwargs = {
+        "sm_scale": sm_scale,
+        "topk_length": topk_length,
+        "attn_sink": attn_sink,
+        "extra_kv_cache": extra_kv_cache,
+        "extra_indices": extra_indices,
+        "extra_topk_length": extra_topk_length,
+    }
+
     if chunks_per_block is not None:
         # Explicit user override — skip AutoTuner entirely.
         runner(
             inputs=inputs,
             tactic=int(chunks_per_block),
-            sm_scale=sm_scale,
-            topk_length=topk_length,
+            **forward_kwargs,
         )
         return output
 
@@ -853,8 +873,7 @@ def sparse_mla_sm120_decode_v3(
             runner(
                 inputs=inputs,
                 tactic=cached_tactic,
-                sm_scale=sm_scale,
-                topk_length=topk_length,
+                **forward_kwargs,
             )
             return output
 
@@ -866,8 +885,7 @@ def sparse_mla_sm120_decode_v3(
         [runner],
         _decode_v3_tuning_config(),
         inputs,
-        sm_scale=sm_scale,
-        topk_length=topk_length,
+        **forward_kwargs,
     )
     # Only cache POSITIVE tactics (real tuning results). The autotuner uses
     # tactic=-1 as the "no tuning data, fall back to C++ heuristic" sentinel.
@@ -884,10 +902,5 @@ def sparse_mla_sm120_decode_v3(
         T_bucket = _decode_v3_map_to_token_bucket(q.shape[0])
         hot_key = (T_bucket, q.shape[1], indices.shape[1])
         _decode_v3_hot_cache[hot_key] = int(tactic)
-    chosen(
-        inputs=inputs,
-        tactic=tactic,
-        sm_scale=sm_scale,
-        topk_length=topk_length,
-    )
+    chosen(inputs=inputs, tactic=tactic, **forward_kwargs)
     return output
