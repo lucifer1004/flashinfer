@@ -634,20 +634,25 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
       ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V_C +
       (size_t)split_idx * D_V_C;
 
+  // Pack adjacent (d0, d0+1) bf16 pairs into __nv_bfloat162 so the compiler
+  // emits STG.E.64 instead of two STG.E.U16 — halves the global-store
+  // instruction count and ~doubles sector-byte utilization (NCU A1.3 reported
+  // 8.6 / 32 B/sector on these scalar stores, matching the unfused pattern).
+  // d0 = warp_id*(NT_PER_WARP_XV*8) + nt*8 + tid*2 is always even ⇒ the
+  // mid_out base+offset is 4-byte aligned, safe for __nv_bfloat162 access.
 #pragma unroll
   for (int vc = 0; vc < N_V_CHUNKS; vc++) {
 #pragma unroll
     for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
       const int d0 = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8 + tid * 2;
-      const int d1 = d0 + 1;
-      mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0] =
-          __float2bfloat16(acc_nope[vc][nt][0] * inv_g0);
-      mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d1] =
-          __float2bfloat16(acc_nope[vc][nt][1] * inv_g0);
-      mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0] =
-          __float2bfloat16(acc_nope[vc][nt][2] * inv_g1);
-      mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d1] =
-          __float2bfloat16(acc_nope[vc][nt][3] * inv_g1);
+      const __nv_bfloat162 pair_lo = __floats2bfloat162_rn(
+          acc_nope[vc][nt][0] * inv_g0, acc_nope[vc][nt][1] * inv_g0);
+      const __nv_bfloat162 pair_hi = __floats2bfloat162_rn(
+          acc_nope[vc][nt][2] * inv_g1, acc_nope[vc][nt][3] * inv_g1);
+      *reinterpret_cast<__nv_bfloat162*>(
+          &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
+      *reinterpret_cast<__nv_bfloat162*>(
+          &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
     }
   }
   {
@@ -655,15 +660,14 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
 #pragma unroll
     for (int nt = 0; nt < ROPE_N_TILES; nt++) {
       const int d0 = D_NOPE + rope_dim_base + nt * 8 + tid * 2;
-      const int d1 = d0 + 1;
-      mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0] =
-          __float2bfloat16(acc_rope[nt][0] * inv_g0);
-      mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d1] =
-          __float2bfloat16(acc_rope[nt][1] * inv_g0);
-      mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0] =
-          __float2bfloat16(acc_rope[nt][2] * inv_g1);
-      mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d1] =
-          __float2bfloat16(acc_rope[nt][3] * inv_g1);
+      const __nv_bfloat162 pair_lo = __floats2bfloat162_rn(
+          acc_rope[nt][0] * inv_g0, acc_rope[nt][1] * inv_g0);
+      const __nv_bfloat162 pair_hi = __floats2bfloat162_rn(
+          acc_rope[nt][2] * inv_g1, acc_rope[nt][3] * inv_g1);
+      *reinterpret_cast<__nv_bfloat162*>(
+          &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
+      *reinterpret_cast<__nv_bfloat162*>(
+          &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
     }
   }
   if (warp_id == 0 && tid == 0) {
