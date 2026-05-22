@@ -53,6 +53,8 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
       + V3_KV_BUF_COUNT * V3_BI * KV::KV_SMEM_STRIDE                     // sm_kv_fp8 ×2
       + V3_KV_BUF_COUNT * V3_BI * KV::SCALE_BYTES_PER_TOKEN              // sm_kv_sc ×2
       + V3_KV_BUF_COUNT * V3_BI * KV::D_ROPE * (int)sizeof(bf16)         // sm_kv_rope ×2
+      + 16                                                               // mbar align pad
+      + 4 * (int)sizeof(uint64_t)                                        // mbar_full+empty
       + 2 * V3_N_WARPS * HPB * (int)sizeof(float)                        // sm_reduce
       + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                     // sm_w_head_sc
       + HPB * (V3_BI + 16);                                              // sm_w_fp8

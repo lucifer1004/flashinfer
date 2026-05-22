@@ -17,27 +17,21 @@
 
 namespace flashinfer::sparse_mla_sm120 {
 
-// Decode-v3 (A1.2): warp-specialized async KV pipeline on top of A1.1's
-// multi-chunk-per-block online softmax. 1 IO warp (warp 4) cp.async-gathers
-// the next chunk while 4 math warps (warps 0-3) consume the current chunk
-// from a double-buffered sm_kv_fp8 / sm_kv_rope / sm_kv_sc.
+// Decode-v3 (A1.3): warp-specialized TMA gather. IO warp drives
+// cp.async.bulk into double-buffered KV smem; 4 math warps consume.
+// Per-buf mbarrier pairs: mbar_full[s] for IO→math (leader arrives with
+// expect_tx, bulk completion decrements tx; phase flips when arrival count
+// AND tx both met), mbar_empty[s] for math→IO drain (one math signaling
+// thread arrives at end-of-iter).
 //
-// Math layout (warps 0-3) is unchanged from A1.1 — V3_BI=64 keeps the same
-// per-warp QK / XV tile partitioning that A1.1 used at V3_BI=128 with twice
-// the chunks per block. Smem budget for the second KV buffer comes from
-// dropping CW from 128 to 64.
+// CRITICAL: mbarrier.try_wait.parity has NO implicit memory fence — the
+// consumer must follow it with a CTA-wide acq-rel sync before reading
+// smem (otherwise writes by non-leader IO lanes can be stale). Canonical
+// pattern: see mla_hopper.cuh:789 (__syncthreads after consumer_wait) and
+// hopper/mainloop. Here we use bar_sync<3, MATH_THREADS> since only math
+// warps participate; the IO warp doesn't touch bar:3.
 //
-// Barrier IDs (CTA-named barriers, 16 available):
-//   bar:1  IO↔math drain  count=BLOCK_THREADS (=160)
-//          math arrives at end-of-chunk; IO syncs at end-of-iter.
-//   bar:2  used by quantize_q_to_smem internally (count=MATH_THREADS=128)
-//   bar:3  math-only internal sync  count=MATH_THREADS (=128)
-//   bar:4  IO→math ready, buf[0]  count=BLOCK_THREADS (=160)
-//   bar:5  IO→math ready, buf[1]  count=BLOCK_THREADS (=160)
-//          IO arrives the per-buf ready bar after cp.async wait_group<0>;
-//          math syncs the matching per-buf bar at chunk start. Per-buf
-//          separation prevents back-to-back IO arrives from colliding in
-//          one phase (deadlocked at cpb≥2 with a shared ready bar).
+// Math layout (warps 0-3) unchanged from A1.1 / A1.2.
 
 constexpr int V3_N_WARPS = 4;                                    // math warps
 constexpr int V3_IO_WARPS = 1;
@@ -149,6 +143,12 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   off += (size_t)V3_BI * D_ROPE_C * sizeof(bf16);
   sm_kv_rope_buf[1] = reinterpret_cast<bf16*>(smem_raw + off);
   off += (size_t)V3_BI * D_ROPE_C * sizeof(bf16);
+  // mbarriers: 2 full + 2 empty = 4 × 8 B = 32 B. Align to 16.
+  off = (off + 15) & ~size_t{15};
+  uint64_t* mbar_full = reinterpret_cast<uint64_t*>(smem_raw + off);
+  off += 2 * sizeof(uint64_t);
+  uint64_t* mbar_empty = reinterpret_cast<uint64_t*>(smem_raw + off);
+  off += 2 * sizeof(uint64_t);
   float* sm_reduce = reinterpret_cast<float*>(smem_raw + off);
   off += (size_t)(2 * V3_N_WARPS * HPB) * sizeof(float);
   float* sm_w_head_sc = reinterpret_cast<float*>(smem_raw + off);
@@ -161,86 +161,96 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   __shared__ bf16 sm_p_full[HPB][V3_BI];  // 2 KB static
   const int32_t* idx_base = indices + (size_t)t_idx * TOPK;
 
-  // ──────────────────────────────────────────────────────────────
-  // IO warp branch — v2-style prologue + per-iter rendezvous.
-  // Per iter: 1 bar_arrive<4> (ready) + 1 bar_sync<1> (drain) — lockstep
-  // with math's 1 bar_sync<4> + 1 bar_arrive<1> per iter.
-  // ──────────────────────────────────────────────────────────────
-  auto io_gather_one = [&](int gather_chunk_idx, int buf) {
+  // ── Per-stage mbarrier init. mbar_full: 1 leader arrives + expect_tx;
+  // bulk completion drives tx. mbar_empty: 1 math signaling thread arrives.
+  // Visibility of all IO lanes' writes is handled by a math-side bar_sync
+  // after mbar_wait (canonical pattern, see mla_hopper.cuh:789 / hopper
+  // mainloop / sm100 TMA load — mbar.try_wait.parity has no implicit
+  // memory fence; consumer must acq-rel via __syncthreads or bar_sync).
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int s = 0; s < V3_KV_BUF_COUNT; ++s) {
+      mbarrier_init(mbar_full + s, 1);
+      mbarrier_init(mbar_empty + s, 1);
+    }
+  }
+  __syncthreads();
+
+  // ── TMA bulk constants ──
+  constexpr uint32_t V3_BULK_NOPE_BYTES = (uint32_t)D_NOPE;                  // 448
+  constexpr uint32_t V3_BULK_ROPE_BYTES = (uint32_t)D_ROPE_C * sizeof(bf16); // 128
+  constexpr uint32_t V3_BULK_TX_BYTES =
+      (uint32_t)V3_BI * (V3_BULK_NOPE_BYTES + V3_BULK_ROPE_BYTES);
+
+  // IO gather: scalar scales → fence → expect_tx + bulks.
+  auto issue_gather = [&](int gather_chunk_idx, int buf) {
     const int g_start = gather_chunk_idx * V3_CAND_WINDOW;
     const int g_end = min(g_start + V3_CAND_WINDOW, topk_len);
     uint8_t* kv_fp8_dst = sm_kv_fp8_buf[buf];
     bf16* kv_rope_dst = sm_kv_rope_buf[buf];
     uint8_t* kv_sc_dst = sm_kv_sc_buf[buf];
+
 #pragma unroll
     for (int eo = 0; eo < V3_BI; eo += V3_IO_THREADS) {
       const int entry_idx = eo + lane;
       if (entry_idx >= V3_BI) break;
       const int cand_pos = g_start + entry_idx;
       const bool is_valid_cand = (cand_pos < g_end);
-      int idx_raw = is_valid_cand ? idx_base[cand_pos] : -1;
-      const bool is_valid = is_valid_cand && (idx_raw >= 0);
+      const int idx_raw = is_valid_cand ? idx_base[cand_pos] : -1;
+      uint64_t scale_word = 0;
+      if (idx_raw >= 0) {
+        const int idx = idx_raw;
+        const int block_idx_g = idx / pbs;
+        const int local_idx_g = idx - block_idx_g * pbs;
+        const uint8_t* scale_base = KV_cache + (size_t)block_idx_g * stride_kv_block +
+                                    (size_t)pbs * IO_STRIDE +
+                                    (size_t)local_idx_g * SCALE_BYTES_PER_TOKEN;
+        scale_word = __ldg(reinterpret_cast<const uint64_t*>(scale_base));
+      }
+      *reinterpret_cast<uint64_t*>(kv_sc_dst + (size_t)entry_idx * SCALE_BYTES_PER_TOKEN) =
+          scale_word;
+    }
+    __threadfence_block();
+
+    if (lane == 0) {
+      mbarrier_arrive_expect_tx(mbar_full + buf, V3_BULK_TX_BYTES);
+    }
+
+    // Issue cp.async.bulk for NoPE (448 B/entry) + RoPE (128 B/entry).
+    // Bulk completion decrements mbar tx; phase flips when arrival count
+    // (1, by leader above) AND tx=0 both met.
+#pragma unroll
+    for (int eo = 0; eo < V3_BI; eo += V3_IO_THREADS) {
+      const int entry_idx = eo + lane;
+      if (entry_idx >= V3_BI) break;
+      const int cand_pos = g_start + entry_idx;
+      const int idx_raw = (cand_pos < g_end) ? idx_base[cand_pos] : -1;
       const int idx = (idx_raw >= 0) ? idx_raw : 0;
       const int block_idx_g = idx / pbs;
       const int local_idx_g = idx - block_idx_g * pbs;
       const uint8_t* data_base =
           KV_cache + (size_t)block_idx_g * stride_kv_block + (size_t)local_idx_g * IO_STRIDE;
-      const uint8_t* scale_base = KV_cache + (size_t)block_idx_g * stride_kv_block +
-                                  (size_t)pbs * IO_STRIDE +
-                                  (size_t)local_idx_g * SCALE_BYTES_PER_TOKEN;
-      if (is_valid) {
-#pragma unroll
-        for (int b = 0; b < D_NOPE / 16; b++) {
-          cp_async_16B(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE + b * 16,
-                       data_base + b * 16);
-        }
-#pragma unroll
-        for (int b = 0; b < (D_ROPE_C * (int)sizeof(bf16)) / 16; b++) {
-          cp_async_16B(kv_rope_dst + (size_t)entry_idx * D_ROPE_C + b * 8,
-                       data_base + D_NOPE + b * 16);
-        }
-        *reinterpret_cast<uint64_t*>(kv_sc_dst + (size_t)entry_idx * SCALE_BYTES_PER_TOKEN) =
-            *reinterpret_cast<const uint64_t*>(scale_base);
-      } else {
-#pragma unroll
-        for (int b = 0; b < D_NOPE / 16; b++) {
-          uint4 z = make_uint4(0, 0, 0, 0);
-          *reinterpret_cast<uint4*>(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE + b * 16) = z;
-        }
-#pragma unroll
-        for (int b = 0; b < (D_ROPE_C * (int)sizeof(bf16)) / 16; b++) {
-          uint4 z = make_uint4(0, 0, 0, 0);
-          *reinterpret_cast<uint4*>(kv_rope_dst + (size_t)entry_idx * D_ROPE_C + b * 8) = z;
-        }
-        *reinterpret_cast<uint64_t*>(kv_sc_dst + (size_t)entry_idx * SCALE_BYTES_PER_TOKEN) = 0;
-      }
+      cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE,
+                        data_base, V3_BULK_NOPE_BYTES, mbar_full + buf);
+      cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C,
+                        data_base + D_NOPE, V3_BULK_ROPE_BYTES, mbar_full + buf);
     }
-    cp_async_commit();
-    cp_async_wait_group<0>();
-    __threadfence_block();
   };
 
-  // Two ready barriers — one per double-buf slot (bar:4 for buf[0], bar:5
-  // for buf[1]). A single shared "ready" barrier deadlocked at cpb≥2 on
-  // SM120: IO would arrive bar:4 twice in close succession (prologue +
-  // first loop gather) before math syncs once, and the kernel never
-  // recovered. v2 sidesteps the same issue by using per-buf mbarriers.
   if (is_io) {
-    // Prologue: gather tile chunk_lo into buf[0].
-    io_gather_one(chunk_lo, 0);
-    bar_arrive_t<4, V3_BLOCK_THREADS>();  // buf[0] ready
-
+    // Producer state: index, phase. Phase starts at 1 so first empty.wait(1)
+    // on a freshly-initialized barrier (phase 0) returns immediately.
+    uint32_t prod_phase = 1;
+    int prod_idx = 0;
     for (int chunk_idx = chunk_lo; chunk_idx < chunk_hi; ++chunk_idx) {
-      if (chunk_idx + 1 < chunk_hi) {
-        const int buf_next = (chunk_idx + 1 - chunk_lo) & 1;
-        io_gather_one(chunk_idx + 1, buf_next);
-        if (buf_next == 0) {
-          bar_arrive_t<4, V3_BLOCK_THREADS>();
-        } else {
-          bar_arrive_t<5, V3_BLOCK_THREADS>();
-        }
+      const int buf = (chunk_idx - chunk_lo) & 1;
+      mbarrier_wait_parity(mbar_empty + prod_idx, prod_phase);
+      issue_gather(chunk_idx, buf);
+      ++prod_idx;
+      if (prod_idx == V3_KV_BUF_COUNT) {
+        prod_idx = 0;
+        prod_phase ^= 1;
       }
-      bar_sync_t<1, V3_BLOCK_THREADS>();  // math finished current tile
     }
     return;
   }
@@ -264,17 +274,21 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   float global_sum[2] = {0.f, 0.f};
 
   // ── Chunk loop ─────────────────────────────────────────────────
+  // Consumer state: starts at (idx=0, phase=0).
+  uint32_t cons_phase = 0;
+  int cons_idx = 0;
+
   for (int chunk_idx = chunk_lo; chunk_idx < chunk_hi; ++chunk_idx) {
     const int buf = (chunk_idx - chunk_lo) & 1;
     const int split_cand_start = chunk_idx * V3_CAND_WINDOW;
     const int split_cand_end = min(split_cand_start + V3_CAND_WINDOW, topk_len);
 
-    // Wait for IO to fill this buf — pick the per-buf ready barrier.
-    if (buf == 0) {
-      bar_sync_t<4, V3_BLOCK_THREADS>();
-    } else {
-      bar_sync_t<5, V3_BLOCK_THREADS>();
-    }
+    // Wait for IO to fill this buf (mbar_full tx + arrival both met).
+    mbarrier_wait_parity(mbar_full + cons_idx, cons_phase);
+    // CTA-wide acquire after mbar wake. Without this, math reads see only
+    // the view released by whichever IO thread triggered the phase flip —
+    // other IO lanes' writes (e.g., last-head RoPE bytes) may be stale.
+    bar_sync_t<3, V3_MATH_THREADS>();
 
     uint8_t* sm_kv_fp8 = sm_kv_fp8_buf[buf];
     uint8_t* sm_kv_sc = sm_kv_sc_buf[buf];
@@ -597,12 +611,19 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
       }
     }
 
-    // Signal "buf free" — IO's bar:1 sync at end of iter chunk_idx waits
-    // for this. Always emit (1:1 with IO's sync) to keep bar:1 in lockstep.
-    bar_arrive_t<1, V3_BLOCK_THREADS>();
     // sm_p_full + sm_w_fp8 reuse next iter — math-only sync ensures Stage 3
-    // is fully drained before next QK starts reading sm_p_full / sm_kv_*.
+    // is fully drained before consumer_release lets IO overwrite the slot.
     bar_sync_t<3, V3_MATH_THREADS>();
+
+    // Release the slot to IO (single signaling thread arrives mbar_empty).
+    if (threadIdx.x == 0) {
+      mbarrier_arrive(mbar_empty + cons_idx);
+    }
+    ++cons_idx;
+    if (cons_idx == V3_KV_BUF_COUNT) {
+      cons_idx = 0;
+      cons_phase ^= 1;
+    }
   }  // chunk loop
 
   // ── Write per-split partial output + LSE to mid_out / mid_lse ───

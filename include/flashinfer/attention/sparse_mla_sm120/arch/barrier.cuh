@@ -52,6 +52,14 @@ __device__ __forceinline__ void mbarrier_inval(uint64_t* mbar) {
   asm volatile("mbarrier.inval.shared::cta.b64 [%0];\n" ::"r"(addr));
 }
 
+__device__ __forceinline__ void mbarrier_arrive(uint64_t* mbar) {
+  uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
+  asm volatile(
+      "{\n .reg .b64 state;\n"
+      " mbarrier.arrive.shared::cta.b64 state, [%0];\n"
+      "}\n" ::"r"(addr));
+}
+
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar, uint32_t tx_bytes) {
   uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
   asm volatile(
