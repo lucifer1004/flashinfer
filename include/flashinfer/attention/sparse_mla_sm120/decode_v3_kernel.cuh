@@ -134,19 +134,28 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   // sm_kv; that would corrupt V midway through the loop.
   float* sm_head_buf = sm_warp_sum + V3_N_WARPS * HPB;  // [D_V] = 2 KB
 
-  // ── Stage 0: load Q for (t_idx, h_block) ─────────────────────────
+  // ── Stage 0: issue cp.async for Q (overlaps with Stage 1 KV gather) ──
   // Q layout: [num_tokens, num_heads, D_QK] bf16. We load HPB heads
   // worth = HPB * D_QK = 16 * 512 = 8192 bf16 = 16 KB.
+  //
+  // Smem-budget pivot experiment: instead of synchronously loading Q
+  // before Stage 1, issue cp.async and let it overlap with Stage 1's
+  // scalar dequant work. Stage 2 waits on the cp.async fence below.
   {
     const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
     constexpr int Q_ELEMS = HPB * D_QK;
-    // 128 threads, 8 elements per thread per chunk = 16 chunks total.
-    for (int i = threadIdx.x; i < Q_ELEMS / 8; i += V3_BLOCK_THREADS) {
-      uint4 v = *reinterpret_cast<const uint4*>(q_base + i * 8);
-      *reinterpret_cast<uint4*>(sm_q + i * 8) = v;
+    // 128 threads × 8 bf16/lane = 1024 bf16 per pass; Q_ELEMS/8 = 1024 16-byte chunks.
+    static_assert(Q_ELEMS / 8 == V3_BLOCK_THREADS * (Q_ELEMS / 8 / V3_BLOCK_THREADS),
+                  "Q load assumes Q_ELEMS / 8 divisible by V3_BLOCK_THREADS");
+    constexpr int Q_CHUNKS_PER_LANE = (Q_ELEMS / 8) / V3_BLOCK_THREADS;
+#pragma unroll
+    for (int i = 0; i < Q_CHUNKS_PER_LANE; i++) {
+      const int idx = threadIdx.x + i * V3_BLOCK_THREADS;
+      cp_async_16B(sm_q + idx * 8, q_base + idx * 8);
     }
+    cp_async_commit();
   }
-  __syncthreads();
+  // No syncthreads here — Stage 1 runs concurrently with the Q cp.async.
 
   // ── Stage 1: gather + dequantize CAND_WINDOW candidates ──────────
   // Per warp owns V3_ENTRIES_PER_WARP=16 entries. Within a warp, 32
@@ -239,6 +248,8 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
       }
     }
   }
+  // Wait for Stage 0's cp.async Q load to land before Stage 2 reads sm_q.
+  cp_async_wait_group<0>();
   __syncthreads();
 
   // ── Stage 2: QK = Q @ K^T, sm_scale, then warp-level softmax ────
