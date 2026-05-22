@@ -62,21 +62,46 @@ void SparseMlaSm120DecodeV3(TensorView q, TensorView kv_cache, TensorView indice
                             Optional<TensorView> extra_topk_length,
                             int64_t chunks_per_block_override) {
   TVM_FFI_ICHECK_EQ(q.ndim(), 3) << "q must be [T, H, D_QK]";
-  TVM_FFI_ICHECK_EQ(kv_cache.ndim(), 2) << "kv_cache must be [num_blocks, page_bytes]";
-  TVM_FFI_ICHECK_EQ(indices.ndim(), 2) << "indices must be [T, topk]";
+  TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2)
+      << "kv_cache must be 2D [num_blocks, page_bytes] or 4D "
+         "[num_blocks, page_block_size, 1, bpt]";
+  // indices may be 2D [T, topk] (microbench) or 3D [T, s_q=1, topk] (vLLM,
+  // which keeps the s_q singleton dim through the call stack). The kernel
+  // walks `indices + t_idx * stride_per_t`, where stride is captured below
+  // from .stride(0). For 3D with s_q=1, stride(0) == topk for contig layout
+  // — matches what the kernel expects.
+  TVM_FFI_ICHECK_GE(indices.ndim(), 2)
+      << "indices must have at least 2 dims; got ndim=" << indices.ndim();
+  if (indices.ndim() == 3) {
+    TVM_FFI_ICHECK_EQ(indices.size(1), 1)
+        << "indices 3D form requires size(1) == 1; got " << indices.size(1);
+  }
 
   const int num_tokens = static_cast<int>(q.size(0));
   const int num_heads = static_cast<int>(q.size(1));
-  const int topk = static_cast<int>(indices.size(1));
+  const int topk = static_cast<int>(indices.size(-1));
   const int d_qk = static_cast<int>(q.size(2));
   ModelType mt = (d_qk == 512) ? ModelType::MODEL1 : ModelType::V32;
   // Currently the kernel only supports MODEL1.
   TVM_FFI_ICHECK_EQ(static_cast<int>(mt), static_cast<int>(ModelType::MODEL1))
       << "decode-v3 currently MODEL1-only";
 
-  const size_t stride_kv_block = static_cast<size_t>(kv_cache.size(1));
-  // page_block_size is implicit: 36864 bytes data + 512 bytes scales / 584 per
-  // token = 64 tokens/block for MODEL1.
+  // kv_cache may be:
+  //   2D: [num_blocks, page_bytes]              — flat layout (test scripts)
+  //   4D: [num_blocks, page_block_size, 1, bpt] — vLLM layout (may be padded)
+  // For 4D the block stride in bytes = product of dims[1..ndim-1] when
+  // strictly contiguous; with vLLM's padding, the block stride may exceed
+  // the natural row size. Use stride(0) to capture the true block stride.
+  size_t stride_kv_block;
+  if (kv_cache.ndim() == 2) {
+    stride_kv_block = static_cast<size_t>(kv_cache.size(1));
+  } else {
+    // stride(0) reports elements; convert to bytes via the dtype size.
+    // For uint8 (1B element) this is identical numerically.
+    stride_kv_block = static_cast<size_t>(kv_cache.stride(0));
+  }
+  // page_block_size for v3 is fixed at 64 (MODEL1). The dispatcher rejects
+  // any other value, and the orchestrator only routes 4D-pbs-64 here.
   constexpr int page_block_size = 64;
 
   const int* topk_len_ptr =
@@ -103,13 +128,12 @@ void SparseMlaSm120DecodeV3(TensorView q, TensorView kv_cache, TensorView indice
   size_t stride_extra_kv_block = 0;
   if (extra_kv_cache.has_value()) {
     const auto& ekv = extra_kv_cache.value();
-    extra_topk_arg = static_cast<int>(extra_indices.value().size(1));
+    extra_topk_arg = static_cast<int>(extra_indices.value().size(-1));
     if (ekv.ndim() >= 3) {
       pbs_extra_arg = static_cast<int>(ekv.size(-3));
-      // row stride = pbs * bpt, derive from total trailing size
-      size_t row_bytes = 1;
-      for (int d = 1; d < ekv.ndim(); ++d) row_bytes *= static_cast<size_t>(ekv.size(d));
-      stride_extra_kv_block = row_bytes;
+      // Use stride(0) to capture true block stride including any padding
+      // (matches v2's effective_stride_kv_row semantics).
+      stride_extra_kv_block = static_cast<size_t>(ekv.stride(0));
     } else {
       // 2D fallback: assume MODEL1 bpt = 584. Infer pbs from row width.
       constexpr int BPT_MODEL1 = 584;

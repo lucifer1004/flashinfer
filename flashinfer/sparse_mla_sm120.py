@@ -305,10 +305,12 @@ def get_sparse_mla_sm120_module():
                 dtype=torch.float32,
                 device=q.device,
             )
-            # Reuse the hot-cache + AutoTuner cpb resolution.
+            # Pass kv_cache as-is (4D from vLLM or 2D from microbench). The
+            # FFI binding extracts the block stride from .stride(0), which
+            # correctly handles vLLM's padded-block-stride convention.
             sparse_mla_sm120_decode_v3(
                 q,
-                kv_cache.view(kv_cache.size(0), -1) if kv_cache.ndim != 2 else kv_cache,
+                kv_cache,
                 indices,
                 mid_out,
                 mid_lse,
@@ -644,8 +646,13 @@ def _get_sparse_mla_decode_v3_module():
             extra_kv_cache = kwargs.get("extra_kv_cache")
             extra_indices = kwargs.get("extra_indices")
             extra_topk_length = kwargs.get("extra_topk_length")
-            topk = indices.shape[1]
-            num_splits = (topk + _BI - 1) // _BI
+            topk = indices.shape[-1]  # 2D [T, topk] or 3D [T, 1, topk]
+            # Total num_splits = main chunks + extra chunks. The kernel grid
+            # spans all of them; mid_out is sized for this combined total by
+            # the caller. Computing only main here would silently undersize
+            # the kernel launch and skip the extra section.
+            extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
+            num_splits = (topk + _BI - 1) // _BI + (extra_topk + _BI - 1) // _BI
             # tactic ∈ [1, num_splits] → pass through; tactic == -1 (autotuner
             # fallback) → pass -1 so the C++ heuristic picks cpb.
             cpb_override = tactic if tactic > 0 else -1
@@ -937,7 +944,7 @@ def sparse_mla_sm120_decode_v3(
     tuner = AutoTuner.get()
     if not tuner.is_tuning_mode:
         T_bucket = _decode_v3_map_to_token_bucket(q.shape[0])
-        hot_key = (T_bucket, q.shape[1], indices.shape[1])
+        hot_key = (T_bucket, q.shape[1], indices.shape[-1])
         cached_tactic = _decode_v3_hot_cache.get(hot_key)
         if cached_tactic is not None:
             runner(
@@ -970,7 +977,7 @@ def sparse_mla_sm120_decode_v3(
     # tuning data arriving via disk reload or in-process autotune().
     if int(tactic) > 0:
         T_bucket = _decode_v3_map_to_token_bucket(q.shape[0])
-        hot_key = (T_bucket, q.shape[1], indices.shape[1])
+        hot_key = (T_bucket, q.shape[1], indices.shape[-1])
         _decode_v3_hot_cache[hot_key] = int(tactic)
     chosen(inputs=inputs, tactic=tactic, **forward_kwargs)
     return output
