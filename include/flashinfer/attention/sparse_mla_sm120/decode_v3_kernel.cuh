@@ -40,6 +40,23 @@ constexpr int V3_CAND_WINDOW = 64;  // candidates handled by one block
 constexpr int V3_BI = V3_CAND_WINDOW;
 constexpr int V3_ENTRIES_PER_WARP = V3_BI / V3_N_WARPS;  // 16
 
+// sm_kv smem swizzle. Without swizzle, the m16n8k16 B-load pattern in
+// Stage 2 (QK) accesses sm_kv[cand][dim] with the same dim offset across
+// all 8 cand-rows in an N-tile, collapsing onto the same bank — 8-way
+// conflict, ~11M load wavefronts per kernel invocation measured via ncu.
+//
+// XORing the logical dim with ((cand & 7) << 3) (i.e. 16-byte offset
+// proportional to cand low-bits) shifts each cand-row's dim layout by a
+// distinct bank-group, giving full 32-bank distribution for Stage 2 reads
+// (no conflicts) and 2-way for Stage 3 XV reads (down from 4-way).
+//
+// The XOR stays within the row (max XOR mask = 56 bf16 < D_QK − epsilon)
+// and preserves the NoPE/RoPE boundary at logical dim D_NOPE=448 because
+// 448's bit-pattern has none of bits 3..5 set (the bits this XOR can flip).
+__device__ __forceinline__ int v3_swiz(int logical_dim, int cand) {
+  return logical_dim ^ ((cand & 7) << 3);
+}
+
 template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kernel(
     const bf16* __restrict__ Q,           // [num_tokens, num_heads, d_qk] bf16
@@ -186,15 +203,19 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
         __nv_fp8_e4m3 raw;
         raw.__x = static_cast<__nv_fp8_storage_t>(data_base[b]);
         const float v = static_cast<float>(static_cast<__half>(raw));
-        kv_dst[b] = __float2bfloat16(is_valid_cand ? (v * scale) : 0.0f);
+        // Swizzled store — see v3_swiz docstring above.
+        kv_dst[v3_swiz(b, entry_idx)] = __float2bfloat16(is_valid_cand ? (v * scale) : 0.0f);
       }
       // RoPE half: already bf16 in gmem, 128 bytes = 64 bf16, copy verbatim.
-      // 32 lanes × 2 bf16 each = 64 bf16.
+      // 32 lanes × 2 bf16 each = 64 bf16. Apply same row swizzle.
       const bf16* rope_src = reinterpret_cast<const bf16*>(data_base + D_NOPE);
-      bf16* rope_dst = kv_dst + D_NOPE;
       if (lane * 2 < D_ROPE) {
-        rope_dst[lane * 2] = is_valid_cand ? rope_src[lane * 2] : __float2bfloat16(0.0f);
-        rope_dst[lane * 2 + 1] = is_valid_cand ? rope_src[lane * 2 + 1] : __float2bfloat16(0.0f);
+        const int rope_dim0 = D_NOPE + lane * 2;
+        const int rope_dim1 = rope_dim0 + 1;
+        kv_dst[v3_swiz(rope_dim0, entry_idx)] =
+            is_valid_cand ? rope_src[lane * 2] : __float2bfloat16(0.0f);
+        kv_dst[v3_swiz(rope_dim1, entry_idx)] =
+            is_valid_cand ? rope_src[lane * 2 + 1] : __float2bfloat16(0.0f);
       }
     }
   }
@@ -210,11 +231,16 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   // across 32 lanes = 8 floats per thread (4 per N-tile).
   float qk[2][4] = {0};  // [N-tile][m16n8 fragment]
   {
-    const bf16* sm_kv_warp = sm_kv + (size_t)warp_id * V3_ENTRIES_PER_WARP * D_QK;
     // Per-thread B-operand for bf16 mma_m16n8k16 holds 4 bf16 values arranged
     // as K-rows {tid*2, tid*2+1, tid*2+8, tid*2+9} for the per-thread N-col.
     // Mirrors xv_rope_mma.cuh's manual scalar-load pattern; ldmatrix.x2.trans
     // produces a different layout we don't want.
+    //
+    // sm_kv is stored with per-row swizzle (see v3_swiz), so each read here
+    // resolves the swizzle by the row's *total* entry index in sm_kv (which
+    // equals warp_id * V3_ENTRIES_PER_WARP + cand_idx). With the swizzle,
+    // the 8 cand-rows in an N-tile hit 8 distinct bank groups, eliminating
+    // the prior 8-way load bank conflict.
 #pragma unroll
     for (int ks = 0; ks < D_QK / 16; ks++) {
       uint32_t a0, a1, a2, a3;
@@ -222,15 +248,13 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
 #pragma unroll
       for (int nt = 0; nt < 2; nt++) {
         const int cand_idx = nt * 8 + gid;  // N-col owned by this thread
-        const bf16* k_row_ptr = sm_kv_warp + (size_t)cand_idx * D_QK + ks * 16;
-        uint16_t v0 =
-            *reinterpret_cast<const uint16_t*>(k_row_ptr + tid * 2);
-        uint16_t v1 =
-            *reinterpret_cast<const uint16_t*>(k_row_ptr + tid * 2 + 1);
-        uint16_t v8 =
-            *reinterpret_cast<const uint16_t*>(k_row_ptr + tid * 2 + 8);
-        uint16_t v9 =
-            *reinterpret_cast<const uint16_t*>(k_row_ptr + tid * 2 + 9);
+        const int ent_total = warp_id * V3_ENTRIES_PER_WARP + cand_idx;
+        const bf16* row_base = sm_kv + (size_t)ent_total * D_QK;
+        const int d_log0 = ks * 16 + tid * 2;
+        uint16_t v0 = *reinterpret_cast<const uint16_t*>(row_base + v3_swiz(d_log0, ent_total));
+        uint16_t v1 = *reinterpret_cast<const uint16_t*>(row_base + v3_swiz(d_log0 + 1, ent_total));
+        uint16_t v8 = *reinterpret_cast<const uint16_t*>(row_base + v3_swiz(d_log0 + 8, ent_total));
+        uint16_t v9 = *reinterpret_cast<const uint16_t*>(row_base + v3_swiz(d_log0 + 9, ent_total));
         uint32_t b0 = static_cast<uint32_t>(v0) | (static_cast<uint32_t>(v1) << 16);
         uint32_t b1 = static_cast<uint32_t>(v8) | (static_cast<uint32_t>(v9) << 16);
         MmaBf16Result r =
@@ -442,16 +466,21 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
 
       // B operand: V[16k=cands ks*16+rows, 1n=n_col]. K-rows: ks*16+{tid*2,
       // tid*2+1, tid*2+8, tid*2+9}. K-row idx is the GLOBAL candidate
-      // index within this block.
+      // index within this block. Each row read resolves the v3_swiz by
+      // the row's own entry idx.
       const int k_base = ks * 16;
+      const int ent0 = k_base + tid * 2;
+      const int ent1 = ent0 + 1;
+      const int ent8 = ent0 + 8;
+      const int ent9 = ent0 + 9;
       uint16_t v0 = *reinterpret_cast<const uint16_t*>(
-          sm_kv + (size_t)(k_base + tid * 2) * D_QK + n_col);
+          sm_kv + (size_t)ent0 * D_QK + v3_swiz(n_col, ent0));
       uint16_t v1 = *reinterpret_cast<const uint16_t*>(
-          sm_kv + (size_t)(k_base + tid * 2 + 1) * D_QK + n_col);
+          sm_kv + (size_t)ent1 * D_QK + v3_swiz(n_col, ent1));
       uint16_t v8 = *reinterpret_cast<const uint16_t*>(
-          sm_kv + (size_t)(k_base + tid * 2 + 8) * D_QK + n_col);
+          sm_kv + (size_t)ent8 * D_QK + v3_swiz(n_col, ent8));
       uint16_t v9 = *reinterpret_cast<const uint16_t*>(
-          sm_kv + (size_t)(k_base + tid * 2 + 9) * D_QK + n_col);
+          sm_kv + (size_t)ent9 * D_QK + v3_swiz(n_col, ent9));
       uint32_t b0 = static_cast<uint32_t>(v0) | (static_cast<uint32_t>(v1) << 16);
       uint32_t b1 = static_cast<uint32_t>(v8) | (static_cast<uint32_t>(v9) << 16);
 
