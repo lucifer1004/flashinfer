@@ -61,11 +61,34 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   CUDA_CHECK_BOOL(cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
 
+  // Heuristic for chunks_per_block: target ~2 waves of GPU blocks so per-
+  // block work is amortized across the GPU without leaving SMs idle.
+  // chunks_per_block * num_splits_eff = num_chunks_total (= num_splits
+  // from caller; kept as the mid_out stride).
+  int sm_count = 0;
+  CUDA_CHECK_BOOL(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0));
+  const int target_blocks = 2 * (sm_count > 0 ? sm_count : 188);
+  const int per_token_head = num_tokens * H_BLOCKS;
+  // chunks_per_block = ceil(num_chunks_total * per_token_head / target_blocks)
+  // clamped to [1, num_chunks_total]. For grids that already saturate the
+  // GPU at cpb=1 (per_token_head >= target_blocks), this is 1 — no change
+  // from the prior single-chunk-per-block design.
+  int cpb_raw =
+      (num_splits * per_token_head + target_blocks - 1) / target_blocks;
+  int chunks_per_block = (cpb_raw < 1) ? 1 : (cpb_raw > num_splits ? num_splits : cpb_raw);
+  int num_splits_eff = (num_splits + chunks_per_block - 1) / chunks_per_block;
+
+  // Launch the FULL Python-allocated num_splits grid blocks; inactive splits
+  // (chunk_lo >= num_chunks_total) return early after marking LSE = -inf,
+  // which is cheap. This keeps the mid_out/mid_lse stride matching Python's
+  // allocation without extra coordination.
+  (void)num_splits_eff;
   dim3 grid1(num_tokens, H_BLOCKS, num_splits);
   dim3 block1(V3_BLOCK_THREADS);
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(Q, KV_cache, indices, mid_out,
                                                    mid_lse, topk_length, num_tokens,
-                                                   num_splits, sm_scale, stride_kv_block);
+                                                   num_splits, chunks_per_block, sm_scale,
+                                                   stride_kv_block);
   CUDA_CHECK_BOOL(cudaGetLastError());
 
   // Stage 2: merge splits → final output + LSE.
