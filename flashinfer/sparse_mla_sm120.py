@@ -83,6 +83,29 @@ _FIXED_OVERHEAD = 64  # scheduler tile-overhead constant
 # max_num_batched_tokens.
 _DECODE_MAX_TOKENS = 64
 
+# decode-v3 supports a fixed (num_heads, topk) dispatch table. Outside of
+# this set the orchestrator falls back to v2 / prefill. MODEL1 only.
+_DECODE_V3_NUM_HEADS = (16, 32, 64, 128)
+_DECODE_V3_TOPK = (128, 512, 1024)
+_DECODE_V3_PAGE_BLOCK_SIZE = 64
+
+
+def _decode_v3_dispatchable(num_tokens: int, num_heads: int, topk: int, d_qk: int,
+                            page_block_size: int) -> bool:
+    """Return True iff decode-v3 supports this shape configuration.
+
+    decode-v3 is MODEL1-only (d_qk=512) with a fixed (num_heads, topk)
+    instantiation table and PAGE_BLOCK_SIZE=64. Outside this envelope the
+    orchestrator routes to decode-v2 / prefill.
+    """
+    return (
+        num_tokens <= _DECODE_MAX_TOKENS
+        and d_qk == 512
+        and page_block_size == _DECODE_V3_PAGE_BLOCK_SIZE
+        and num_heads in _DECODE_V3_NUM_HEADS
+        and topk in _DECODE_V3_TOPK
+    )
+
 
 def _compute_num_sm_parts(
     num_heads: int,
@@ -252,8 +275,55 @@ def get_sparse_mla_sm120_module():
         extra_indices: Optional[torch.Tensor],
         extra_topk_length: Optional[torch.Tensor],
     ) -> None:
-        num_tokens, num_heads, _ = q.shape
+        num_tokens, num_heads, d_qk = q.shape
         topk = indices.shape[-1]
+
+        # decode-v3 fast path. Only dispatch when the (num_heads, topk) pair
+        # is in v3's instantiation table and the model matches MODEL1's
+        # layout. Otherwise fall through to decode-v2 / prefill.
+        # kv_cache layout: [num_blocks, page_block_size, 1, bytes_per_token].
+        kv_pbs = int(kv_cache.size(-3)) if kv_cache.ndim >= 3 else 0
+        if (kv_pbs == _DECODE_V3_PAGE_BLOCK_SIZE
+                and _decode_v3_dispatchable(num_tokens, num_heads, topk, d_qk, kv_pbs)):
+            # v3 scratch (mid_out / mid_lse) is small enough to allocate
+            # per call — for h=128/T=64/k=1024 it's ~16 MB BF16 + 256 KB f32.
+            # Could be carved from workspace_buffer later for cudagraph
+            # alloc-free reuse if it shows up in profiling.
+            num_splits_main = (topk + _BI - 1) // _BI
+            extra_topk = (
+                int(extra_indices.size(-1)) if extra_indices is not None else 0
+            )
+            num_splits_extra = (extra_topk + _BI - 1) // _BI
+            num_splits = num_splits_main + num_splits_extra
+            mid_out = torch.empty(
+                (num_tokens, num_heads, num_splits, d_v),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            mid_lse = torch.empty(
+                (num_tokens, num_heads, num_splits),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            # Reuse the hot-cache + AutoTuner cpb resolution.
+            sparse_mla_sm120_decode_v3(
+                q,
+                kv_cache.view(kv_cache.size(0), -1) if kv_cache.ndim != 2 else kv_cache,
+                indices,
+                mid_out,
+                mid_lse,
+                output,
+                out_lse,
+                sm_scale,
+                topk_length=topk_length,
+                attn_sink=attn_sink,
+                extra_kv_cache=extra_kv_cache,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_topk_length,
+            )
+            return
+
+        # decode-v2 / prefill fallback (existing path).
         num_sm_parts = _compute_num_sm_parts(num_heads, q.device, num_tokens, topk)
         # Decode-v2 uses the workspace partitions; prefill writes output /
         # out_lse directly and ignores them. Cap the partition request at
