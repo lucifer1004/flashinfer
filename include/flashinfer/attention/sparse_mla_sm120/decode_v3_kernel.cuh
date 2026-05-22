@@ -661,21 +661,40 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
 }
 
 // Merge kernel: collapse splits into final output and LSE.
-// (Unchanged from v3_backup — operates on mid_out/mid_lse, not smem layout.)
-template <int NUM_HEADS, int D_V_VAL>
-__global__ void __launch_bounds__(HPB * 32, 4) sparse_mla_decode_v3_merge_kernel(
+//
+// Grid: (num_tokens, num_heads, D_V_PARTS). Block: 32 threads (1 warp).
+// Each block handles ONE head × one D_V-partition (= D_V / D_V_PARTS dims).
+// This matches jasl's grid-8192 fan-out (T=16, H=128, D_V_PARTS=4 →
+// 8192 blocks) and replaces v3_backup's (T, head_block) grid that used
+// HPB*32 threads per block.
+//
+// LSE reduction (per (t, h)) is computed redundantly across the D_V_PARTS
+// blocks that share (t, h). For D_V_PARTS=4, that's 4× redundant LSE
+// reads. Acceptable because the per-block LSE work is tiny vs the D_V
+// output reduction, and removing the redundancy would require a two-
+// kernel pipeline (LSE-precompute + merge) that costs more in launch
+// overhead than it saves.
+template <int NUM_HEADS, int D_V_VAL, int D_V_PARTS>
+__global__ void __launch_bounds__(32, 16) sparse_mla_decode_v3_merge_kernel(
     const bf16* __restrict__ mid_out,   // [num_tokens, num_heads, num_splits, D_V] bf16
     const float* __restrict__ mid_lse,  // [num_tokens, num_heads, num_splits] f32
     bf16* __restrict__ output,          // [num_tokens, num_heads, D_V] bf16
     float* __restrict__ out_lse,        // [num_tokens, num_heads] f32, nullable
     int num_tokens, int num_splits) {
-  const int t_idx = blockIdx.x;
-  const int h_block_idx = blockIdx.y;
-  if (t_idx >= num_tokens) return;
-  const int h = h_block_idx * HPB + (threadIdx.x / 32);
-  if (h >= NUM_HEADS) return;
-  const int lane = threadIdx.x & 31;
+  static_assert(D_V_VAL % D_V_PARTS == 0, "D_V must divide evenly by D_V_PARTS");
+  constexpr int DIMS_PER_PART = D_V_VAL / D_V_PARTS;
+  static_assert(DIMS_PER_PART % 32 == 0, "DIMS_PER_PART must be a multiple of 32");
+  constexpr int DIMS_PER_LANE = DIMS_PER_PART / 32;
 
+  const int t_idx = blockIdx.x;
+  const int h = blockIdx.y;
+  const int dim_part = blockIdx.z;
+  if (t_idx >= num_tokens) return;
+  if (h >= NUM_HEADS) return;
+  const int lane = threadIdx.x;
+  const int part_base = dim_part * DIMS_PER_PART;
+
+  // LSE reduction (redundant across the D_V_PARTS blocks of this (t, h)).
   float my_lse[16];
   const float* lse_ptr = mid_lse + (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h * num_splits;
   const int splits_per_thread = (num_splits + 31) / 32;
@@ -709,11 +728,11 @@ __global__ void __launch_bounds__(HPB * 32, 4) sparse_mla_decode_v3_merge_kernel
       (global_sum > 0.f) ? (log2f(global_sum) + global_max) : -1e30f;
   const float inv_global_sum = (global_sum > 0.f) ? (1.f / global_sum) : 0.f;
 
+  // Per-block D_V slice [part_base, part_base + DIMS_PER_PART).
   const bf16* mid_base =
       mid_out + (size_t)t_idx * NUM_HEADS * num_splits * D_V_VAL + (size_t)h * num_splits * D_V_VAL;
   bf16* out_ptr = output + (size_t)t_idx * NUM_HEADS * D_V_VAL + (size_t)h * D_V_VAL;
 
-  constexpr int DIMS_PER_LANE = D_V_VAL / 32;
   float acc[DIMS_PER_LANE];
 #pragma unroll
   for (int d = 0; d < DIMS_PER_LANE; d++) acc[d] = 0.f;
@@ -724,16 +743,19 @@ __global__ void __launch_bounds__(HPB * 32, 4) sparse_mla_decode_v3_merge_kernel
     float weight = exp2f(lse_sp - global_max);
 #pragma unroll
     for (int d = 0; d < DIMS_PER_LANE; d++) {
-      float v = __bfloat162float(mid_base[(size_t)sp * D_V_VAL + lane * DIMS_PER_LANE + d]);
+      int local_d = lane * DIMS_PER_LANE + d;
+      float v = __bfloat162float(mid_base[(size_t)sp * D_V_VAL + part_base + local_d]);
       acc[d] += weight * v;
     }
   }
 
 #pragma unroll
   for (int d = 0; d < DIMS_PER_LANE; d++) {
-    out_ptr[lane * DIMS_PER_LANE + d] = __float2bfloat16(acc[d] * inv_global_sum);
+    int local_d = lane * DIMS_PER_LANE + d;
+    out_ptr[part_base + local_d] = __float2bfloat16(acc[d] * inv_global_sum);
   }
-  if (out_lse != nullptr && lane == 0) {
+  // Only the first dim_part writes the LSE per (t, h).
+  if (out_lse != nullptr && lane == 0 && dim_part == 0) {
     out_lse[(size_t)t_idx * NUM_HEADS + h] = global_lse;
   }
 }

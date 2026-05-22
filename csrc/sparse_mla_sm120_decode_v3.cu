@@ -69,10 +69,14 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   CUDA_CHECK_BOOL(cudaGetLastError());
 
   // Stage 2: merge splits → final output + LSE.
-  // Grid: (num_tokens, H_BLOCKS). Block: HPB warps × 32 lanes = 512 threads.
-  auto merge_kernel = sparse_mla_decode_v3_merge_kernel<NUM_HEADS, KV::D_V>;
-  dim3 grid2(num_tokens, H_BLOCKS);
-  dim3 block2(HPB * 32);
+  // Grid: (num_tokens, NUM_HEADS, D_V_PARTS). Block: 32 threads (1 warp).
+  // D_V_PARTS = 4 partitions of D_V=512 (= 128 dims per block). Matches
+  // jasl's grid-8192 fan-out at T=16/H=128: 16 * 128 * 4 = 8192.
+  constexpr int D_V_PARTS = 4;
+  auto merge_kernel =
+      sparse_mla_decode_v3_merge_kernel<NUM_HEADS, KV::D_V, D_V_PARTS>;
+  dim3 grid2(num_tokens, NUM_HEADS, D_V_PARTS);
+  dim3 block2(32);
   merge_kernel<<<grid2, block2, 0, stream>>>(mid_out, mid_lse, output, out_lse,
                                              num_tokens, num_splits);
   CUDA_CHECK_BOOL(cudaGetLastError());
