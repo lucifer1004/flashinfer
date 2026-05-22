@@ -44,6 +44,7 @@ Two public surfaces, mirroring the b12x_fused_moe + B12xMoEWrapper convention:
 from __future__ import annotations
 
 import functools
+import os
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -620,6 +621,151 @@ def _decode_v3_init_indices(shapes, dtype, device):
     return torch.randint(0, 256, shapes, dtype=dtype, device=device)
 
 
+@functools.cache
+def _decode_v3_tuning_config() -> TuningConfig:
+    """Build + cache the static TuningConfig once per process.
+
+    Avoids dataclass instantiation + Spec construction on every call into
+    sparse_mla_sm120_decode_v3 — the config is shape-independent (depends
+    only on tactic semantics + bucket scheme).
+    """
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 2),
+                dim_idx=(0, 0),
+                gen_tuning_buckets=_decode_v3_num_token_buckets,
+                map_to_tuning_buckets=_decode_v3_map_to_token_bucket,
+                tensor_initializers=[_decode_v3_init_q, _decode_v3_init_indices],
+            ),
+        ),
+        # Constrain T (dim 0) of all output/scratch tensors to q's T so the
+        # autotuner's synthesised q propagates to mid_out (3), mid_lse (4),
+        # output (5), out_lse (6). Without these constraints, the kernel
+        # writes past the real tensors' T dim → IMA.
+        constraint_specs=(
+            ConstraintSpec(3, 0, lambda shapes: shapes[0][0]),  # mid_out
+            ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),  # mid_lse
+            ConstraintSpec(5, 0, lambda shapes: shapes[0][0]),  # output
+            ConstraintSpec(6, 0, lambda shapes: shapes[0][0]),  # out_lse
+        ),
+    )
+
+
+@functools.cache
+def _decode_v3_runner_singleton():
+    """Cache one runner instance per process — avoids re-instantiating on
+    every call. The runner is stateless modulo `_module`."""
+    return _get_sparse_mla_decode_v3_module().runner_cls()
+
+
+def _decode_v3_default_cache_path():
+    """Default disk path for the decode-v3 AutoTuner cache.
+
+    Pattern mirrors flashinfer's JIT cache: ``$FLASHINFER_WORKSPACE_DIR/
+    autotune/sparse_mla_sm120_decode_v3.json``. Per-version + per-arch
+    (different GPUs / SM counts pick different optimal cpb), invalidated
+    when ``flashinfer_version`` changes.
+
+    Override via ``FLASHINFER_AUTOTUNE_DIR`` env var or call
+    :func:`sparse_mla_sm120_decode_v3_autotune` with an explicit path.
+    """
+    import pathlib
+
+    override = os.getenv("FLASHINFER_AUTOTUNE_DIR")
+    if override:
+        base = pathlib.Path(override)
+    else:
+        from .jit.env import FLASHINFER_WORKSPACE_DIR
+
+        base = FLASHINFER_WORKSPACE_DIR / "autotune"
+    return base / "sparse_mla_sm120_decode_v3.json"
+
+
+_decode_v3_cache_mtime: float = -1.0
+
+# Per-process hot cache mapping shape signature → cpb tactic. Bypasses
+# AutoTuner.choose_one on the steady-state path: dict lookup is ~1 µs vs
+# ~3 µs through AutoTuner (lock + tensor-shape extract + cache-key build +
+# hash + metadata check). Populated lazily on cold misses + invalidated
+# implicitly when a `with autotune(True):` session re-tunes (since the
+# tuning-mode branch routes through choose_one and refreshes the entry).
+_decode_v3_hot_cache: dict = {}
+
+
+def _decode_v3_maybe_load_cache() -> None:
+    """Mtime-gated lazy load of the default disk cache.
+
+    Loads the cache if the file is newer than what we've loaded before (or
+    never loaded). This is multi-rank safe: a rank that started serving
+    BEFORE another rank finished tuning will pick up the updated cache the
+    first time it calls into a still-untuned shape (which triggers
+    choose_one's cold path that wraps this function). One stat() per cold
+    call is cheap; the steady-state hot-cache path skips this entirely.
+
+    Silent on missing file (fresh install) and on load failure (version
+    mismatch, corrupt JSON): falls back to C++ heuristic via AutoTuner's
+    normal fallback path. Surfacing these as errors would break serving
+    for a cache problem.
+    """
+    global _decode_v3_cache_mtime
+    path = _decode_v3_default_cache_path()
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        # File doesn't exist yet — nothing to load. Keep mtime = -1 so we
+        # re-stat on the next cold call (cheap) until the file appears.
+        return
+    if mtime <= _decode_v3_cache_mtime:
+        return
+    try:
+        AutoTuner.get().load_configs(str(path))
+        _decode_v3_cache_mtime = mtime
+    except Exception:
+        # Load failed; don't update mtime so we try again next cold call.
+        # (If the file is truly broken, we keep retrying — harmless since
+        # cold calls are rare in steady state.)
+        pass
+
+
+def sparse_mla_sm120_decode_v3_autotune(cache_path: Optional[str] = None):
+    """Context manager that opens an autotuning session for decode-v3 with
+    persistent disk caching.
+
+    Usage::
+
+        with sparse_mla_sm120_decode_v3_autotune():
+            # First call on each (T_bucket, h, k) shape profiles all cpb
+            # tactics and caches the best. Subsequent calls (in this session
+            # OR a future fresh process) hit the cache.
+            for T in (1, 4, 16, 32):
+                sparse_mla_sm120_decode_v3(q[:T], ...)
+
+    On exit, the cache is saved to disk at
+    :func:`_decode_v3_default_cache_path` (or ``cache_path`` if supplied).
+
+    For one-off tuning without a session (e.g. when warming up at server
+    startup), simply call this once and let the context manager handle
+    load/save.
+
+    Parameters
+    ----------
+    cache_path : Optional[str]
+        Override the default disk cache location. If ``None``, uses
+        ``$FLASHINFER_WORKSPACE_DIR/autotune/sparse_mla_sm120_decode_v3.json``.
+    """
+    import pathlib
+
+    from .autotuner import autotune
+
+    if cache_path is None:
+        path = _decode_v3_default_cache_path()
+    else:
+        path = pathlib.Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return autotune(True, cache=str(path))
+
+
 @supported_compute_capability([120, 121])
 @flashinfer_api
 def sparse_mla_sm120_decode_v3(
@@ -681,12 +827,12 @@ def sparse_mla_sm120_decode_v3(
     output : torch.Tensor
         The mutated output tensor (for chaining).
     """
-    impl = _get_sparse_mla_decode_v3_module()
+    runner = _decode_v3_runner_singleton()
     inputs = [q, kv_cache, indices, mid_out, mid_lse, output, out_lse]
 
     if chunks_per_block is not None:
         # Explicit user override — skip AutoTuner entirely.
-        impl.runner_cls()(
+        runner(
             inputs=inputs,
             tactic=int(chunks_per_block),
             sm_scale=sm_scale,
@@ -694,39 +840,51 @@ def sparse_mla_sm120_decode_v3(
         )
         return output
 
-    # Constrain the T (dim 0) of all output / scratch tensors to match q's T
-    # so the autotuner's synthesised q (shape (T_bucket, h, d_qk)) propagates
-    # to mid_out (3), mid_lse (4), output (5), out_lse (6). Without these
-    # constraints, the kernel writes past the real tensors' T dim → IMA.
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=(0, 2),
-                dim_idx=(0, 0),
-                gen_tuning_buckets=_decode_v3_num_token_buckets,
-                map_to_tuning_buckets=_decode_v3_map_to_token_bucket,
-                tensor_initializers=[_decode_v3_init_q, _decode_v3_init_indices],
-            ),
-        ),
-        constraint_specs=(
-            ConstraintSpec(3, 0, lambda shapes: shapes[0][0]),  # mid_out
-            ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),  # mid_lse
-            ConstraintSpec(5, 0, lambda shapes: shapes[0][0]),  # output
-            ConstraintSpec(6, 0, lambda shapes: shapes[0][0]),  # out_lse
-        ),
-    )
-
+    # Hot-cache fast path: tactic is fully determined by (T_bucket, num_heads,
+    # topk); skip AutoTuner.choose_one entirely once we've resolved a shape.
+    # Only fires outside an active tuning session — inside `with autotune(True):`
+    # we route through choose_one so the autotuner gets the data it needs.
     tuner = AutoTuner.get()
-    runners = [impl.runner_cls()]
-    runner, tactic = tuner.choose_one(
+    if not tuner.is_tuning_mode:
+        T_bucket = _decode_v3_map_to_token_bucket(q.shape[0])
+        hot_key = (T_bucket, q.shape[1], indices.shape[1])
+        cached_tactic = _decode_v3_hot_cache.get(hot_key)
+        if cached_tactic is not None:
+            runner(
+                inputs=inputs,
+                tactic=cached_tactic,
+                sm_scale=sm_scale,
+                topk_length=topk_length,
+            )
+            return output
+
+    # Cold path (first call on this shape OR active tuning session). Lazy-load
+    # the persistent disk cache once per process, then resolve via AutoTuner.
+    _decode_v3_maybe_load_cache()
+    chosen, tactic = tuner.choose_one(
         "sparse_mla_sm120_decode_v3",
-        runners,
-        tuning_config,
+        [runner],
+        _decode_v3_tuning_config(),
         inputs,
         sm_scale=sm_scale,
         topk_length=topk_length,
     )
-    runner(
+    # Only cache POSITIVE tactics (real tuning results). The autotuner uses
+    # tactic=-1 as the "no tuning data, fall back to C++ heuristic" sentinel.
+    # Caching -1 would pin every subsequent call to the heuristic, even if
+    # a later tuning session (on this rank OR another rank that wrote the
+    # shared disk cache) provides a real result — the disk reload would be
+    # silently shadowed by the stale -1 in this process's hot dict.
+    #
+    # By skipping the cache on tactic=-1, untuned shapes pay the ~3 µs
+    # choose_one overhead on every call (acceptable since the kernel itself
+    # is also running the slower heuristic path), and stay agile to later
+    # tuning data arriving via disk reload or in-process autotune().
+    if int(tactic) > 0:
+        T_bucket = _decode_v3_map_to_token_bucket(q.shape[0])
+        hot_key = (T_bucket, q.shape[1], indices.shape[1])
+        _decode_v3_hot_cache[hot_key] = int(tactic)
+    chosen(
         inputs=inputs,
         tactic=tactic,
         sm_scale=sm_scale,
