@@ -31,17 +31,25 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   constexpr int H_BLOCKS = NUM_HEADS / HPB;
 
   // Stage 1: decode-v3 partial-output kernel.
-  // Dynamic smem layout (matches kernel allocation):
-  //   sm_q          [HPB, D_QK]            bf16  = 16 KB
-  //   sm_kv         [V3_BI, D_QK]          bf16  = 64 KB
-  //   sm_warp_max   [V3_N_WARPS * HPB]     float = 0.25 KB
-  //   sm_warp_sum   [V3_N_WARPS * HPB]     float = 0.25 KB
-  //   sm_head_buf   [D_V]                   float = 2 KB
-  // Static smem:
-  //   sm_p_storage  [N_WARPS, HPB, ENTRIES_PER_WARP] float = 4 KB
+  // Dynamic smem layout (matches kernel allocation; S1 FP8 path, MODEL1):
+  //   sm_q_rope    HPB * D_ROPE * 2B            =   2 KB
+  //   sm_q_fp8     HPB * Q_NOPE_STRIDE          = 7.25 KB
+  //   sm_q_sc      HPB * NUM_SCALES * 4B        = 0.44 KB
+  //   sm_kv_fp8    V3_BI * KV_SMEM_STRIDE       = 29 KB
+  //   sm_kv_sc     V3_BI * SCALE_BYTES_PER_TOKEN = 0.5 KB
+  //   sm_kv_rope   V3_BI * D_ROPE * 2B          =   8 KB
+  //   sm_reduce    max(HPB*NUM_SCALES, 2*N_WARPS*HPB) f32 = 512 B
+  //   Total                                     ~ 48 KB
+  // Static smem (kernel-side):
+  //   sm_p_full    HPB * V3_BI * 2B (bf16)      =   2 KB
   constexpr int DYN_SMEM_BYTES =
-      HPB * KV::D_QK * (int)sizeof(bf16) + V3_BI * KV::D_QK * (int)sizeof(bf16) +
-      2 * V3_N_WARPS * HPB * (int)sizeof(float) + KV::D_V * (int)sizeof(float);
+      HPB * KV::D_ROPE * (int)sizeof(bf16)                              // sm_q_rope
+      + HPB * KV::Q_NOPE_STRIDE                                          // sm_q_fp8
+      + HPB * KV::NUM_SCALES * (int)sizeof(float)                        // sm_q_sc
+      + V3_BI * KV::KV_SMEM_STRIDE                                       // sm_kv_fp8
+      + V3_BI * KV::SCALE_BYTES_PER_TOKEN                                // sm_kv_sc
+      + V3_BI * KV::D_ROPE * (int)sizeof(bf16)                           // sm_kv_rope
+      + 2 * V3_N_WARPS * HPB * (int)sizeof(float);                       // sm_reduce
 
   auto kernel = sparse_mla_decode_v3_kernel<MT, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
   CUDA_CHECK_BOOL(cudaFuncSetAttribute(
