@@ -85,6 +85,12 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_dsv4_kerne
   constexpr int SCALE_BYTES_PER_TOKEN = KV::SCALE_BYTES_PER_TOKEN;  // 8
   constexpr int IO_STRIDE = D_NOPE + D_ROPE_C * 2;                // 576
   constexpr int pbs = PAGE_BLOCK_SIZE;
+  // Heads actually populated per CTA tile. For the standard dispatch
+  // (NUM_HEADS ∈ {16, 32, 64, 128}) this is HPB=16. For NUM_HEADS=8 (small TP
+  // configs), only the first 8 head slots carry valid data; the kernel
+  // computes a full HPB×CAND tile internally (zero-padded Q rows on invalid
+  // heads) but only writes back NUM_HEADS heads to mid_out / mid_lse.
+  constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
 
   const int t_idx = blockIdx.x;
   const int h_block_idx = blockIdx.y;
@@ -113,7 +119,7 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_dsv4_kerne
 
   // Early-exit splits: only math threads write LSE; IO warp has nothing to do.
   if (chunk_lo >= num_chunks_total) {
-    if (!is_io && threadIdx.x < HPB) {
+    if (!is_io && threadIdx.x < VALID_HPB) {
       const int h = h_start + threadIdx.x;
       const size_t lse_off =
           (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h * num_splits + split_idx;
@@ -314,7 +320,8 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_dsv4_kerne
   // Stage 0: Q quantization (math threads only; the helper uses bar:2
   // internally with count=V3_MATH_THREADS).
   const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
-  quantize_q_to_smem<MT, V3_MATH_THREADS>(sm_q_fp8, sm_q_sc, sm_q_rope, q_base, sm_reduce);
+  quantize_q_to_smem<MT, V3_MATH_THREADS>(sm_q_fp8, sm_q_sc, sm_q_rope, q_base, sm_reduce,
+                                          VALID_HPB);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};
@@ -471,7 +478,7 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_dsv4_kerne
       sm_warp_sum[warp_id * HPB + gid + 8] = local_sum[1];
     }
     bar_sync_t<3, V3_MATH_THREADS>();
-    if (threadIdx.x < HPB) {
+    if (threadIdx.x < VALID_HPB) {
       const int h = threadIdx.x;
       float wmax[V3_N_WARPS], wsum[V3_N_WARPS];
 #pragma unroll
@@ -739,8 +746,13 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_dsv4_kerne
           acc_nope[vc][nt][2] * inv_g1, acc_nope[vc][nt][3] * inv_g1);
       *reinterpret_cast<__nv_bfloat162*>(
           &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
-      *reinterpret_cast<__nv_bfloat162*>(
-          &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
+      // gid + 8 slot exists only when the kernel tile holds > 8 heads. For
+      // NUM_HEADS=8 (small-TP configs) the second half is invalid and writing
+      // would overflow mid_out's head dim.
+      if constexpr (VALID_HPB > 8) {
+        *reinterpret_cast<__nv_bfloat162*>(
+            &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
+      }
     }
   }
   {
@@ -754,8 +766,10 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_dsv4_kerne
           acc_rope[nt][2] * inv_g1, acc_rope[nt][3] * inv_g1);
       *reinterpret_cast<__nv_bfloat162*>(
           &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
-      *reinterpret_cast<__nv_bfloat162*>(
-          &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
+      if constexpr (VALID_HPB > 8) {
+        *reinterpret_cast<__nv_bfloat162*>(
+            &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
+      }
     }
   }
   if (warp_id == 0 && tid == 0) {
@@ -766,7 +780,9 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_dsv4_kerne
     const size_t lse_base =
         (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
     mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
-    mid_lse[lse_base + (size_t)(gid + 8) * num_splits + split_idx] = lse1;
+    if constexpr (VALID_HPB > 8) {
+      mid_lse[lse_base + (size_t)(gid + 8) * num_splits + split_idx] = lse1;
+    }
   }
 }
 

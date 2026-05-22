@@ -84,9 +84,20 @@ _FIXED_OVERHEAD = 64  # scheduler tile-overhead constant
 _DECODE_MAX_TOKENS = 64
 
 # decode-dsv4 supports a fixed (num_heads, topk) dispatch table. Outside of
-# this set the orchestrator falls back to v2 / prefill. DSV4 only.
-_DECODE_DSV4_NUM_HEADS = (16, 32, 64, 128)
-_DECODE_DSV4_TOPK = (128, 512, 1024)
+# this set the orchestrator falls back to decode-dsv3_2 / prefill. DSV4 only.
+#
+# (num_heads=8, topk=512) is the small-TP corner case: the kernel internally
+# pads the head tile to HPB=16 with zero-Q rows and guards mid_out / mid_lse
+# writes to NUM_HEADS, so only the 8 valid heads land in the output. We only
+# wire it for topk=512 (the realistic DSv4 small-TP shape); other (h=8, k)
+# combos fall back to dsv3_2.
+_DECODE_DSV4_DISPATCH = frozenset({
+    (8, 512),
+    (16, 128), (16, 512), (16, 1024),
+    (32, 128), (32, 512), (32, 1024),
+    (64, 128), (64, 512), (64, 1024),
+    (128, 128), (128, 512), (128, 1024),
+})
 _DECODE_DSV4_PAGE_BLOCK_SIZE = 64
 
 
@@ -95,7 +106,7 @@ def _decode_dsv4_dispatchable(num_tokens: int, num_heads: int, topk: int, d_qk: 
     """Return True iff decode-dsv4 supports this shape configuration.
 
     decode-dsv4 is DSV4-only (d_qk=512) with a fixed (num_heads, topk)
-    instantiation table and PAGE_BLOCK_SIZE=64. Outside this envelope the
+    instantiation set and PAGE_BLOCK_SIZE=64. Outside this envelope the
     orchestrator routes to decode-dsv3_2 / prefill.
     """
     # decode-dsv4 is the default fast path. The historical FLASHINFER_ENABLE_DECODE_V3
@@ -108,8 +119,7 @@ def _decode_dsv4_dispatchable(num_tokens: int, num_heads: int, topk: int, d_qk: 
         num_tokens <= _DECODE_MAX_TOKENS
         and d_qk == 512
         and page_block_size == _DECODE_DSV4_PAGE_BLOCK_SIZE
-        and num_heads in _DECODE_DSV4_NUM_HEADS
-        and topk in _DECODE_DSV4_TOPK
+        and (num_heads, topk) in _DECODE_DSV4_DISPATCH
     )
 
 
