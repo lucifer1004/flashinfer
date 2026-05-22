@@ -9,6 +9,7 @@
 #include "arch/cp_async.cuh"
 #include "arch/ldmatrix_sm120.cuh"
 #include "arch/mma_sm120.cuh"
+#include "common/d2_load_b.cuh"
 #include "common/fp8_quant.cuh"
 #include "common/online_softmax.cuh"
 #include "model/kv_cache_traits.cuh"
@@ -102,19 +103,27 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   const int gid = lane >> 2;
   const int tid = lane & 3;
 
-  // ── Dynamic smem layout (S1; CW=64, MODEL1) ─────────────────────
-  //   sm_q_rope    HPB * D_ROPE * 2B    =   16 * 64 *  2 =   2048 B
-  //   sm_q_fp8     HPB * Q_NOPE_STRIDE  =   16 * 464     =   7424 B
-  //   sm_q_sc      HPB * NUM_SCALES * 4 =   16 *  7 *  4 =    448 B
-  //   sm_kv_fp8    V3_BI * KV_SMEM_STRIDE = 64 * 464     =  29696 B
-  //   sm_kv_sc     V3_BI * SCALE_BYTES_PER_TOKEN = 64 * 8 =   512 B
-  //   sm_kv_rope   V3_BI * D_ROPE * 2B  =   64 * 64 *  2 =   8192 B
-  //   sm_reduce    max(HPB*NUM_SCALES, 2*N_WARPS*HPB) f32
-  //                = max(112, 128) * 4 = 512 B
+  // V chunk constants for FP8 XV (v2 pattern).
+  constexpr int V_CHUNK = QUANT_TILE;                              // 64
+  constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;                     // 7
+  constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / V3_N_WARPS;         // 2
+  constexpr int XV_KSTEPS = V3_BI / 32;                            // 4 (FP8 k=32)
+  constexpr int W_FP8_STRIDE = V3_BI + 16;                         // 144
+
+  // ── Dynamic smem layout (S2.5; CW=128, MODEL1, FP8 XV) ──────────
+  //   sm_q_rope    HPB * D_ROPE * 2B            =   2 KB
+  //   sm_q_fp8     HPB * Q_NOPE_STRIDE          = 7.25 KB
+  //   sm_q_sc      HPB * NUM_SCALES * 4         = 0.44 KB
+  //   sm_kv_fp8    V3_BI * KV_SMEM_STRIDE       =  58 KB
+  //   sm_kv_sc     V3_BI * SCALE_BYTES_PER_TOKEN =  1 KB
+  //   sm_kv_rope   V3_BI * D_ROPE * 2B          =  16 KB
+  //   sm_reduce    max(HPB*NUM_SCALES, 2*N_WARPS*HPB) f32 =  512 B
+  //   sm_w_head_sc N_V_CHUNKS * HPB * 4         =  448 B
+  //   sm_w_fp8     HPB * W_FP8_STRIDE           = 2.25 KB (reused across 7 chunks)
   //   ----
-  //   Total dyn   = ~ 48832 B = 48 KB
-  //   Static sm_p_full = HPB * V3_BI * 2B = 2 KB
-  //   Grand total ~ 50 KB (room to grow CW to 128 in S2).
+  //   Total dyn   ~ 88 KB
+  //   Static sm_p_full = HPB * V3_BI * 2B = 4 KB (used by RoPE Stage 3)
+  //   Grand total  ~ 92 KB (under 100 KB SM120 carveout, 1 block/SM).
   extern __shared__ __align__(16) char smem_raw[];
   size_t off = 0;
   bf16* sm_q_rope = reinterpret_cast<bf16*>(smem_raw + off);
@@ -130,7 +139,11 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   bf16* sm_kv_rope = reinterpret_cast<bf16*>(smem_raw + off);
   off += (size_t)V3_BI * D_ROPE_C * sizeof(bf16);
   float* sm_reduce = reinterpret_cast<float*>(smem_raw + off);
-  // off += 2 * V3_N_WARPS * HPB * sizeof(float);  // = 512 B (terminator)
+  off += (size_t)(2 * V3_N_WARPS * HPB) * sizeof(float);
+  float* sm_w_head_sc = reinterpret_cast<float*>(smem_raw + off);
+  off += (size_t)N_V_CHUNKS * HPB * sizeof(float);
+  uint8_t* sm_w_fp8 = reinterpret_cast<uint8_t*>(smem_raw + off);
+  // off += (size_t)HPB * W_FP8_STRIDE;  // (terminator; reused across chunks)
 
   // Aliases over sm_reduce. Used in two non-overlapping phases:
   //   Phase 0 (Stage 0 quantize_q_to_smem): amax[HPB * NUM_SCALES = 112]
@@ -416,123 +429,225 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   }
   __syncthreads();
 
-  // ── Stage 3: XV via bf16 MMA — each warp owns D_V/N_WARPS slice ─
-  // For warps 0..2: all 16 N-tiles cover NoPE dims [warp_dim_base, +128).
-  // For warp 3: nt 0..7 cover NoPE dims [384, 448), nt 8..15 cover RoPE
-  //   dims [448, 512). RoPE half reads from sm_kv_rope directly (bf16).
+  // ── Stage 3: XV (v2-pattern FP8 NoPE + bf16 RoPE) ───────────────
   //
-  // B-operand load:
-  //   NoPE: each thread loads 4 FP8 bytes (cand rows ent0/1/8/9 at col n_col)
-  //         from sm_kv_fp8, looks up per-cand UE8M0 scale at scale tile
-  //         (n_col / QUANT_TILE), dequants to 4 bf16, packs as (b0, b1).
-  //   RoPE: each thread loads 4 bf16 values from sm_kv_rope at col
-  //         (n_col - D_NOPE), packs as (b0, b1).
-  constexpr int DIMS_PER_WARP = D_V_C / V3_N_WARPS;        // 128
-  constexpr int N_TILES_PER_WARP = DIMS_PER_WARP / 8;      // 16
-  constexpr int K_ITERS = V3_BI / 16;                      // 4
-
-  const int warp_dim_base = warp_id * DIMS_PER_WARP;
-  // Per-warp # of N-tiles that are pure NoPE (n_col < D_NOPE for all 8 dims
-  // in the tile, where gid ∈ [0..7]). Computed at runtime per warp, but
-  // uniform within each warp — branchless for the inner loop.
-  //   warps 0..2 (warp_dim_base ∈ {0, 128, 256}): all 16 tiles pure NoPE
-  //   warp 3    (warp_dim_base = 384):            tiles 0..7 NoPE, 8..15 RoPE
-  const int n_nope_tiles =
-      max(0, min(N_TILES_PER_WARP, (D_NOPE - warp_dim_base) / 8));
+  // NoPE (D_NOPE=448 dims = 7 V chunks of V_CHUNK=64):
+  //   Per chunk vc: amax(|p * vsc|) per (vc, head) → Q-scale → quantize
+  //   W = p*vsc/Q-scale → FP8 in sm_w_fp8; FP8 m16n8k32 MMA reads
+  //   sm_kv_fp8 straight into the B operand via d2_load_b_fp8.
+  //   Dim partitioning (matches v2 SmemLayout): warp w owns dims
+  //   [vc*V_CHUNK + w*16, vc*V_CHUNK + w*16 + 16) per chunk (16 dims, 2
+  //   N-tiles of 8 each). 7 chunks × 16 = 112 NoPE dims per warp.
+  //
+  // RoPE (D_ROPE=64 dims = 16 per warp, contiguous): bf16 m16n8k16 MMA
+  //   reads sm_p_full as A operand and sm_kv_rope as B operand.
+  //
+  // sm_w_fp8 buffer is reused across the 7 chunks via barrier syncs.
   const size_t mid_o_base_ll = ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V_C +
                                (size_t)split_idx * D_V_C;
   const size_t mid_lse_base_ll =
       (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
 
-  float acc[N_TILES_PER_WARP][4] = {0};
+  // Phase 1: atomicMax-based amax computation per (vc, head).
+  // Initialize sm_w_head_sc to 0.
+  for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += V3_BLOCK_THREADS) {
+    sm_w_head_sc[i] = 0.f;
+  }
+  __syncthreads();
 
+  // Each thread holds p[V3_QK_N_TILES][4] = its share of the global
+  // softmax weights, where p[nt][k] = (head h, cand c) maps to:
+  //   p[nt][0]: head gid,    cand warp_first_cand + nt*8 + tid*2
+  //   p[nt][1]: head gid,    cand warp_first_cand + nt*8 + tid*2 + 1
+  //   p[nt][2]: head gid+8,  cand warp_first_cand + nt*8 + tid*2
+  //   p[nt][3]: head gid+8,  cand warp_first_cand + nt*8 + tid*2 + 1
+  // (p was rescaled in Stage 2.75 by exp2(local_max - gmax) / gsum.)
+  {
+    const int warp_first_cand_xv = warp_id * V3_ENTRIES_PER_WARP;
 #pragma unroll
-  for (int ks = 0; ks < K_ITERS; ks++) {
-    // A-operand: P[16h, 16k=cands ks*16..ks*16+15]
-    uint32_t a0, a1, a2, a3;
-    ldmatrix_load_A_bf16(
-        a0, a1, a2, a3,
-        reinterpret_cast<const bf16*>(&sm_p_full[0][ks * 16]), V3_BI, lane);
-
-    const int k_base = ks * 16;
-    const int ent0 = k_base + tid * 2;
-    const int ent1 = ent0 + 1;
-    const int ent8 = ent0 + 8;
-    const int ent9 = ent0 + 9;
-
-    // NoPE N-tiles
-    for (int nt = 0; nt < n_nope_tiles; nt++) {
-      const int n_col = warp_dim_base + nt * 8 + gid;
-      const int tile_idx = n_col / QUANT_TILE;
-      // Per-cand UE8M0 scale → fp32 power-of-2
-      const float sc0 =
-          ue8m0_to_fp32(sm_kv_sc[(size_t)ent0 * SCALE_BYTES_PER_TOKEN + tile_idx]);
-      const float sc1 =
-          ue8m0_to_fp32(sm_kv_sc[(size_t)ent1 * SCALE_BYTES_PER_TOKEN + tile_idx]);
-      const float sc8 =
-          ue8m0_to_fp32(sm_kv_sc[(size_t)ent8 * SCALE_BYTES_PER_TOKEN + tile_idx]);
-      const float sc9 =
-          ue8m0_to_fp32(sm_kv_sc[(size_t)ent9 * SCALE_BYTES_PER_TOKEN + tile_idx]);
-      // FP8 bytes
-      __nv_fp8_e4m3 r0, r1, r8, r9;
-      r0.__x = sm_kv_fp8[(size_t)ent0 * KV_SMEM_STRIDE + n_col];
-      r1.__x = sm_kv_fp8[(size_t)ent1 * KV_SMEM_STRIDE + n_col];
-      r8.__x = sm_kv_fp8[(size_t)ent8 * KV_SMEM_STRIDE + n_col];
-      r9.__x = sm_kv_fp8[(size_t)ent9 * KV_SMEM_STRIDE + n_col];
-      // Dequant to bf16 via fp16 intermediate (matches v2 NoPE path).
-      const float v0 = static_cast<float>(static_cast<__half>(r0)) * sc0;
-      const float v1 = static_cast<float>(static_cast<__half>(r1)) * sc1;
-      const float v8 = static_cast<float>(static_cast<__half>(r8)) * sc8;
-      const float v9 = static_cast<float>(static_cast<__half>(r9)) * sc9;
-      const uint16_t b0v0 = __bfloat16_as_ushort(__float2bfloat16(v0));
-      const uint16_t b0v1 = __bfloat16_as_ushort(__float2bfloat16(v1));
-      const uint16_t b1v0 = __bfloat16_as_ushort(__float2bfloat16(v8));
-      const uint16_t b1v1 = __bfloat16_as_ushort(__float2bfloat16(v9));
-      uint32_t b0 = (uint32_t)b0v0 | ((uint32_t)b0v1 << 16);
-      uint32_t b1 = (uint32_t)b1v0 | ((uint32_t)b1v1 << 16);
-      MmaBf16Result r = mma_bf16_m16n8k16(
-          a0, a1, a2, a3, b0, b1, acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]);
-      acc[nt][0] = r.d0;
-      acc[nt][1] = r.d1;
-      acc[nt][2] = r.d2;
-      acc[nt][3] = r.d3;
+    for (int nt = 0; nt < V3_QK_N_TILES; nt++) {
+      const int cand_e0 = warp_first_cand_xv + nt * 8 + tid * 2;
+      const int cand_e1 = cand_e0 + 1;
+      const float w0 = p[nt][0] * resc_h0;  // head gid, cand e0
+      const float w1 = p[nt][1] * resc_h0;  // head gid, cand e1
+      const float w2 = p[nt][2] * resc_h1;  // head gid+8, cand e0
+      const float w3 = p[nt][3] * resc_h1;  // head gid+8, cand e1
+#pragma unroll
+      for (int vc = 0; vc < N_V_CHUNKS; vc++) {
+        const float vsc0 = ue8m0_to_fp32(
+            sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
+        const float vsc1 = ue8m0_to_fp32(
+            sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
+        const float ws00 = w0 * vsc0;
+        const float ws01 = w1 * vsc1;
+        const float ws10 = w2 * vsc0;
+        const float ws11 = w3 * vsc1;
+        atomicMax(reinterpret_cast<int*>(&sm_w_head_sc[vc * HPB + gid]),
+                  __float_as_int(fmaxf(fabsf(ws00), fabsf(ws01))));
+        atomicMax(reinterpret_cast<int*>(&sm_w_head_sc[vc * HPB + gid + 8]),
+                  __float_as_int(fmaxf(fabsf(ws10), fabsf(ws11))));
+      }
     }
+  }
+  __syncthreads();
 
-    // RoPE N-tiles (only present for warp 3 at the current D_V partition)
-    for (int nt = n_nope_tiles; nt < N_TILES_PER_WARP; nt++) {
-      const int n_col_rope = warp_dim_base + nt * 8 + gid - D_NOPE;
-      uint16_t v0 = *reinterpret_cast<const uint16_t*>(
-          sm_kv_rope + (size_t)ent0 * D_ROPE_C + n_col_rope);
-      uint16_t v1 = *reinterpret_cast<const uint16_t*>(
-          sm_kv_rope + (size_t)ent1 * D_ROPE_C + n_col_rope);
-      uint16_t v8 = *reinterpret_cast<const uint16_t*>(
-          sm_kv_rope + (size_t)ent8 * D_ROPE_C + n_col_rope);
-      uint16_t v9 = *reinterpret_cast<const uint16_t*>(
-          sm_kv_rope + (size_t)ent9 * D_ROPE_C + n_col_rope);
-      uint32_t b0 = (uint32_t)v0 | ((uint32_t)v1 << 16);
-      uint32_t b1 = (uint32_t)v8 | ((uint32_t)v9 << 16);
-      MmaBf16Result r = mma_bf16_m16n8k16(
-          a0, a1, a2, a3, b0, b1, acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]);
-      acc[nt][0] = r.d0;
-      acc[nt][1] = r.d1;
-      acc[nt][2] = r.d2;
-      acc[nt][3] = r.d3;
+  // Phase 2: convert amax → Q-scale = amax / FP8_MAX
+  for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += V3_BLOCK_THREADS) {
+    sm_w_head_sc[i] = fmaxf(sm_w_head_sc[i], 1e-10f) / FP8_MAX;
+  }
+  __syncthreads();
+
+  // NoPE accumulator: per warp, N_V_CHUNKS × NT_PER_WARP_XV × 4 floats.
+  // Each (vc, nt) covers 8 dims; warp's total NoPE dims = 7 × 2 × 8 = 112.
+  float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};
+
+  // Per-chunk FP8 quant + MMA. sm_w_fp8 is reused across chunks via the
+  // barrier at the top of each chunk iter (after the prior chunk's MMAs
+  // have read from it).
+#pragma unroll
+  for (int vc = 0; vc < N_V_CHUNKS; vc++) {
+    if (vc > 0) __syncthreads();  // prior chunk's MMAs done reading sm_w_fp8
+
+    // Phase 3: each thread quantizes its 4 ws values per nt → FP8 → sm_w_fp8.
+    {
+      const int warp_first_cand_xv = warp_id * V3_ENTRIES_PER_WARP;
+      const float si0 = 1.f / sm_w_head_sc[vc * HPB + gid];
+      const float si1 = 1.f / sm_w_head_sc[vc * HPB + gid + 8];
+#pragma unroll
+      for (int nt = 0; nt < V3_QK_N_TILES; nt++) {
+        const int cand_e0 = warp_first_cand_xv + nt * 8 + tid * 2;
+        const int cand_e1 = cand_e0 + 1;
+        const float w0 = p[nt][0] * resc_h0;
+        const float w1 = p[nt][1] * resc_h0;
+        const float w2 = p[nt][2] * resc_h1;
+        const float w3 = p[nt][3] * resc_h1;
+        const float vsc0 = ue8m0_to_fp32(
+            sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
+        const float vsc1 = ue8m0_to_fp32(
+            sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
+        const float ws00 = w0 * vsc0;
+        const float ws01 = w1 * vsc1;
+        const float ws10 = w2 * vsc0;
+        const float ws11 = w3 * vsc1;
+        __nv_fp8_e4m3 f00(fmaxf(FP8_MIN, fminf(FP8_MAX, ws00 * si0)));
+        __nv_fp8_e4m3 f01(fmaxf(FP8_MIN, fminf(FP8_MAX, ws01 * si0)));
+        __nv_fp8_e4m3 f10(fmaxf(FP8_MIN, fminf(FP8_MAX, ws10 * si1)));
+        __nv_fp8_e4m3 f11(fmaxf(FP8_MIN, fminf(FP8_MAX, ws11 * si1)));
+        sm_w_fp8[(size_t)gid * W_FP8_STRIDE + cand_e0] = f00.__x;
+        sm_w_fp8[(size_t)gid * W_FP8_STRIDE + cand_e1] = f01.__x;
+        sm_w_fp8[(size_t)(gid + 8) * W_FP8_STRIDE + cand_e0] = f10.__x;
+        sm_w_fp8[(size_t)(gid + 8) * W_FP8_STRIDE + cand_e1] = f11.__x;
+      }
+    }
+    __syncthreads();
+
+    // Phase 4: FP8 m16n8k32 MMA per warp for this chunk.
+    // Per warp: NT_PER_WARP_XV N-tiles × XV_KSTEPS K-iters.
+    // A from sm_w_fp8 (16h × 32k), B from sm_kv_fp8 via d2_load_b_fp8.
+#pragma unroll
+    for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
+      const int dim = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8;
+#pragma unroll
+      for (int kstep = 0; kstep < XV_KSTEPS; kstep++) {
+        const int ko = kstep * 32;
+        uint32_t a0, a1, a2, a3, b0, b1;
+        ldmatrix_load_A_fp8(a0, a1, a2, a3, sm_w_fp8 + ko, W_FP8_STRIDE, lane);
+        d2_load_b_fp8<KV_SMEM_STRIDE>(b0, b1, sm_kv_fp8, kstep * 32, dim, lane);
+        MmaFp8Result r =
+            mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, acc_nope[vc][nt][0],
+                             acc_nope[vc][nt][1], acc_nope[vc][nt][2],
+                             acc_nope[vc][nt][3]);
+        acc_nope[vc][nt][0] = r.d0;
+        acc_nope[vc][nt][1] = r.d1;
+        acc_nope[vc][nt][2] = r.d2;
+        acc_nope[vc][nt][3] = r.d3;
+      }
     }
   }
 
-  // Write directly to mid_out (each warp owns disjoint D_V slice).
+  // Apply per-(vc, head) Q-scale to NoPE acc, then write to mid_out.
 #pragma unroll
-  for (int nt = 0; nt < N_TILES_PER_WARP; nt++) {
-    const int d0 = warp_dim_base + nt * 8 + tid * 2;
-    const int d1 = d0 + 1;
-    mid_out[mid_o_base_ll + (size_t)gid * num_splits * D_V_C + d0] =
-        __float2bfloat16(acc[nt][0]);
-    mid_out[mid_o_base_ll + (size_t)gid * num_splits * D_V_C + d1] =
-        __float2bfloat16(acc[nt][1]);
-    mid_out[mid_o_base_ll + (size_t)(gid + 8) * num_splits * D_V_C + d0] =
-        __float2bfloat16(acc[nt][2]);
-    mid_out[mid_o_base_ll + (size_t)(gid + 8) * num_splits * D_V_C + d1] =
-        __float2bfloat16(acc[nt][3]);
+  for (int vc = 0; vc < N_V_CHUNKS; vc++) {
+    const float sc0 = sm_w_head_sc[vc * HPB + gid];
+    const float sc1 = sm_w_head_sc[vc * HPB + gid + 8];
+#pragma unroll
+    for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
+      const int d0 = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8 + tid * 2;
+      const int d1 = d0 + 1;
+      mid_out[mid_o_base_ll + (size_t)gid * num_splits * D_V_C + d0] =
+          __float2bfloat16(acc_nope[vc][nt][0] * sc0);
+      mid_out[mid_o_base_ll + (size_t)gid * num_splits * D_V_C + d1] =
+          __float2bfloat16(acc_nope[vc][nt][1] * sc0);
+      mid_out[mid_o_base_ll + (size_t)(gid + 8) * num_splits * D_V_C + d0] =
+          __float2bfloat16(acc_nope[vc][nt][2] * sc1);
+      mid_out[mid_o_base_ll + (size_t)(gid + 8) * num_splits * D_V_C + d1] =
+          __float2bfloat16(acc_nope[vc][nt][3] * sc1);
+    }
+  }
+
+  // ── Stage 3 RoPE: bf16 m16n8k16 over 16 RoPE dims per warp ──────
+  // Warp w owns RoPE dims [w*16, (w+1)*16) within the RoPE block of D_V.
+  // Output dim in mid_out: D_NOPE + warp_id*16 + nt*8 + (gid|gid+8 lane).
+  {
+    constexpr int ROPE_DIMS_PER_WARP = D_ROPE_C / V3_N_WARPS;     // 16
+    constexpr int ROPE_N_TILES = ROPE_DIMS_PER_WARP / 8;          // 2
+    constexpr int ROPE_K_ITERS = V3_BI / 16;                      // 8 (k=16 bf16)
+    const int rope_dim_base = warp_id * ROPE_DIMS_PER_WARP;
+
+    float acc_rope[ROPE_N_TILES][4] = {0};
+#pragma unroll
+    for (int ks = 0; ks < ROPE_K_ITERS; ks++) {
+      // A operand: bf16 W = sm_p_full[16h, 16k=cands ks*16..ks*16+15]
+      uint32_t a0, a1, a2, a3;
+      ldmatrix_load_A_bf16(a0, a1, a2, a3,
+                           reinterpret_cast<const bf16*>(&sm_p_full[0][ks * 16]),
+                           V3_BI, lane);
+#pragma unroll
+      for (int nt = 0; nt < ROPE_N_TILES; nt++) {
+        const int n_col = rope_dim_base + nt * 8;
+        // B operand: bf16 from sm_kv_rope, layout [V3_BI cands, D_ROPE dims].
+        // ldmatrix.x2.trans reads 8 rows × 8 cols, transposing per-tile so
+        // each thread sees K-rows in its register slots for one N-col.
+        const int k_base = ks * 16;
+        const int ent0 = k_base + tid * 2;
+        const int ent1 = ent0 + 1;
+        const int ent8 = ent0 + 8;
+        const int ent9 = ent0 + 9;
+        const int col = n_col + gid;
+        uint16_t v0 = *reinterpret_cast<const uint16_t*>(
+            sm_kv_rope + (size_t)ent0 * D_ROPE_C + col);
+        uint16_t v1 = *reinterpret_cast<const uint16_t*>(
+            sm_kv_rope + (size_t)ent1 * D_ROPE_C + col);
+        uint16_t v8 = *reinterpret_cast<const uint16_t*>(
+            sm_kv_rope + (size_t)ent8 * D_ROPE_C + col);
+        uint16_t v9 = *reinterpret_cast<const uint16_t*>(
+            sm_kv_rope + (size_t)ent9 * D_ROPE_C + col);
+        uint32_t b0 = (uint32_t)v0 | ((uint32_t)v1 << 16);
+        uint32_t b1 = (uint32_t)v8 | ((uint32_t)v9 << 16);
+        MmaBf16Result r = mma_bf16_m16n8k16(
+            a0, a1, a2, a3, b0, b1, acc_rope[nt][0], acc_rope[nt][1],
+            acc_rope[nt][2], acc_rope[nt][3]);
+        acc_rope[nt][0] = r.d0;
+        acc_rope[nt][1] = r.d1;
+        acc_rope[nt][2] = r.d2;
+        acc_rope[nt][3] = r.d3;
+      }
+    }
+
+    // Write RoPE acc to mid_out at offset D_NOPE + rope_dim_base + nt*8 + tid*2.
+#pragma unroll
+    for (int nt = 0; nt < ROPE_N_TILES; nt++) {
+      const int d0 = D_NOPE + rope_dim_base + nt * 8 + tid * 2;
+      const int d1 = d0 + 1;
+      mid_out[mid_o_base_ll + (size_t)gid * num_splits * D_V_C + d0] =
+          __float2bfloat16(acc_rope[nt][0]);
+      mid_out[mid_o_base_ll + (size_t)gid * num_splits * D_V_C + d1] =
+          __float2bfloat16(acc_rope[nt][1]);
+      mid_out[mid_o_base_ll + (size_t)(gid + 8) * num_splits * D_V_C + d0] =
+          __float2bfloat16(acc_rope[nt][2]);
+      mid_out[mid_o_base_ll + (size_t)(gid + 8) * num_splits * D_V_C + d1] =
+          __float2bfloat16(acc_rope[nt][3]);
+    }
   }
 
   // Phase D: write LSE per head.

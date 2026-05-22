@@ -31,18 +31,21 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   constexpr int H_BLOCKS = NUM_HEADS / HPB;
 
   // Stage 1: decode-v3 partial-output kernel.
-  // Dynamic smem layout (matches kernel allocation; S2 FP8 path, MODEL1,
-  // V3_BI=128):
+  // Dynamic smem layout (S2.5 FP8 XV, MODEL1, V3_BI=128):
   //   sm_q_rope    HPB * D_ROPE * 2B            =   2 KB
   //   sm_q_fp8     HPB * Q_NOPE_STRIDE          = 7.25 KB
   //   sm_q_sc      HPB * NUM_SCALES * 4B        = 0.44 KB
-  //   sm_kv_fp8    V3_BI * KV_SMEM_STRIDE       =  58 KB (2x of S1)
+  //   sm_kv_fp8    V3_BI * KV_SMEM_STRIDE       =  58 KB
   //   sm_kv_sc     V3_BI * SCALE_BYTES_PER_TOKEN =  1 KB
-  //   sm_kv_rope   V3_BI * D_ROPE * 2B          =  16 KB (2x)
-  //   sm_reduce    max(HPB*NUM_SCALES, 2*N_WARPS*HPB) f32 = 512 B
-  //   Total                                     ~ 85 KB
+  //   sm_kv_rope   V3_BI * D_ROPE * 2B          =  16 KB
+  //   sm_reduce    2 * V3_N_WARPS * HPB * 4     =  512 B
+  //   sm_w_head_sc N_V_CHUNKS * HPB * 4         =  448 B
+  //   sm_w_fp8     HPB * (V3_BI + 16)           = 2.25 KB
+  //   Total                                     ~ 88 KB
   // Static smem (kernel-side):
   //   sm_p_full    HPB * V3_BI * 2B (bf16)      =   4 KB
+  // Grand total ~ 92 KB (under 100 KB SM120 carveout, 1 block/SM).
+  constexpr int N_V_CHUNKS_LAUNCH = KV::D_NOPE / KV::QUANT_TILE;        // 7
   constexpr int DYN_SMEM_BYTES =
       HPB * KV::D_ROPE * (int)sizeof(bf16)                              // sm_q_rope
       + HPB * KV::Q_NOPE_STRIDE                                          // sm_q_fp8
@@ -50,7 +53,9 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
       + V3_BI * KV::KV_SMEM_STRIDE                                       // sm_kv_fp8
       + V3_BI * KV::SCALE_BYTES_PER_TOKEN                                // sm_kv_sc
       + V3_BI * KV::D_ROPE * (int)sizeof(bf16)                           // sm_kv_rope
-      + 2 * V3_N_WARPS * HPB * (int)sizeof(float);                       // sm_reduce
+      + 2 * V3_N_WARPS * HPB * (int)sizeof(float)                        // sm_reduce
+      + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                     // sm_w_head_sc
+      + HPB * (V3_BI + 16);                                              // sm_w_fp8
 
   auto kernel = sparse_mla_decode_v3_kernel<MT, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
   CUDA_CHECK_BOOL(cudaFuncSetAttribute(
