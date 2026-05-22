@@ -33,6 +33,15 @@ bool launch_sparse_mla_decode_v3(ModelType mt, int num_heads, int topk,
                                  float sm_scale, size_t stride_kv_block,
                                  cudaStream_t stream);
 
+bool launch_sparse_mla_decode_v3_backup(ModelType mt, int num_heads, int topk,
+                                        int page_block_size, int num_tokens,
+                                        int num_splits, const bf16* Q,
+                                        const uint8_t* KV_cache, const int32_t* indices,
+                                        bf16* mid_out, float* mid_lse, bf16* output,
+                                        float* out_lse, const int* topk_length,
+                                        float sm_scale, size_t stride_kv_block,
+                                        cudaStream_t stream);
+
 // Thin TVM-FFI wrapper for the decode-v3 standalone path. The caller passes
 // already-sized scratch tensors mid_out + mid_lse plus the output and lse.
 // Currently only handles MODEL1 h=128 topk=512 pbs=64.
@@ -73,9 +82,48 @@ void SparseMlaSm120DecodeV3(TensorView q, TensorView kv_cache, TensorView indice
   TVM_FFI_ICHECK(ok) << "decode-v3 launch failed (unsupported shape or kernel error)";
 }
 
+// Frozen snapshot of decode-v3 at commit 41ac1687 (16/16 vs v2, 12/16 vs jasl).
+// Same Python-facing surface as SparseMlaSm120DecodeV3, used as the regression
+// baseline for future decode-v3 tuning.
+void SparseMlaSm120DecodeV3Backup(TensorView q, TensorView kv_cache, TensorView indices,
+                                  TensorView mid_out, TensorView mid_lse, TensorView output,
+                                  TensorView out_lse, int64_t num_splits, double sm_scale,
+                                  Optional<TensorView> topk_length) {
+  TVM_FFI_ICHECK_EQ(q.ndim(), 3) << "q must be [T, H, D_QK]";
+  TVM_FFI_ICHECK_EQ(kv_cache.ndim(), 2) << "kv_cache must be [num_blocks, page_bytes]";
+  TVM_FFI_ICHECK_EQ(indices.ndim(), 2) << "indices must be [T, topk]";
+
+  const int num_tokens = static_cast<int>(q.size(0));
+  const int num_heads = static_cast<int>(q.size(1));
+  const int topk = static_cast<int>(indices.size(1));
+  const int d_qk = static_cast<int>(q.size(2));
+  ModelType mt = (d_qk == 512) ? ModelType::MODEL1 : ModelType::V32;
+  TVM_FFI_ICHECK_EQ(static_cast<int>(mt), static_cast<int>(ModelType::MODEL1))
+      << "decode-v3-backup currently MODEL1-only";
+
+  const size_t stride_kv_block = static_cast<size_t>(kv_cache.size(1));
+  constexpr int page_block_size = 64;
+
+  const int* topk_len_ptr =
+      topk_length.has_value() ? static_cast<const int*>(topk_length.value().data_ptr()) : nullptr;
+
+  cudaStream_t stream = get_stream(q.device());
+  bool ok = launch_sparse_mla_decode_v3_backup(
+      mt, num_heads, topk, page_block_size, num_tokens, static_cast<int>(num_splits),
+      static_cast<const bf16*>(q.data_ptr()),
+      static_cast<const uint8_t*>(kv_cache.data_ptr()),
+      static_cast<const int32_t*>(indices.data_ptr()),
+      static_cast<bf16*>(mid_out.data_ptr()), static_cast<float*>(mid_lse.data_ptr()),
+      static_cast<bf16*>(output.data_ptr()), static_cast<float*>(out_lse.data_ptr()),
+      topk_len_ptr, static_cast<float>(sm_scale), stride_kv_block, stream);
+  TVM_FFI_ICHECK(ok) << "decode-v3-backup launch failed (unsupported shape or kernel error)";
+}
+
 }  // namespace flashinfer::sparse_mla_sm120
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_paged_attention,
                               flashinfer::sparse_mla_sm120::SparseMlaSm120PagedAttention);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_decode_v3,
                               flashinfer::sparse_mla_sm120::SparseMlaSm120DecodeV3);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_decode_v3_backup,
+                              flashinfer::sparse_mla_sm120::SparseMlaSm120DecodeV3Backup);
