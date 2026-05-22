@@ -86,13 +86,12 @@ _DECODE_MAX_TOKENS = 64
 # decode-dsv4 supports a fixed (num_heads, topk) dispatch table. Outside of
 # this set the orchestrator falls back to decode-dsv3_2 / prefill. DSV4 only.
 #
-# (num_heads=8, topk=512) is the small-TP corner case: the kernel internally
-# pads the head tile to HPB=16 with zero-Q rows and guards mid_out / mid_lse
-# writes to NUM_HEADS, so only the 8 valid heads land in the output. We only
-# wire it for topk=512 (the realistic DSv4 small-TP shape); other (h=8, k)
-# combos fall back to dsv3_2.
+# num_heads=8 is the small-TP corner case (e.g. TP=16 on 128 KV heads): the
+# kernel internally pads the head tile to HPB=16 with zero-Q rows and guards
+# mid_out / mid_lse writes to NUM_HEADS, so only the 8 valid heads land in
+# the output.
 _DECODE_DSV4_DISPATCH = frozenset({
-    (8, 512),
+    (8, 128), (8, 512), (8, 1024),
     (16, 128), (16, 512), (16, 1024),
     (32, 128), (32, 512), (32, 1024),
     (64, 128), (64, 512), (64, 1024),

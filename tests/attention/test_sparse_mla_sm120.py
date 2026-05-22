@@ -205,8 +205,11 @@ def _ref_sparse_attn(
 
 _MODEL1_DECODE_CONFIGS = [
     # (num_heads, topk)
-    # h=8 topk=512 exercises the VALID_HPB < HPB code path (small-TP corner).
+    # h=8 cases exercise the VALID_HPB < HPB code path (small-TP corner);
+    # cover all three topk values to confirm the dispatch table.
+    (8, 128),
     (8, 512),
+    (8, 1024),
     (16, 128),
     (32, 512),
     (64, 1024),
