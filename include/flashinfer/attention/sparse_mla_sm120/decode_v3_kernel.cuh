@@ -122,10 +122,11 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
   //   sm_kv_rope   2 * V3_BI * D_ROPE * 2B      = 16 KB
   //   sm_reduce    2 * V3_N_WARPS * HPB * 4     = 1 KB  (8 warps)
   //   sm_w_head_sc N_V_CHUNKS * HPB * 4         = 448 B
-  //   sm_w_fp8     HPB * (V3_BI + 16)           = 1.25 KB
-  //   Total                                     ~ 87 KB
+  //   sm_w_fp8 ×2  2 * HPB * (V3_BI + 16)       = 2.5 KB  (double-buf
+  //                across vc iters to drop the if-vc>0 bar_sync)
+  //   Total                                     ~ 88 KB
   // Plus static sm_p_full HPB * V3_BI * 2B (bf16) = 2 KB.
-  // Grand total ~ 89 KB (under 100 KB SM120 carveout, 1 block/SM).
+  // Grand total ~ 90 KB (under 100 KB SM120 carveout, 1 block/SM).
   extern __shared__ __align__(16) char smem_raw[];
   size_t off = 0;
   bf16* sm_q_rope = reinterpret_cast<bf16*>(smem_raw + off);
@@ -159,7 +160,14 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
   off += (size_t)(2 * V3_N_WARPS * HPB) * sizeof(float);
   float* sm_w_head_sc = reinterpret_cast<float*>(smem_raw + off);
   off += (size_t)N_V_CHUNKS * HPB * sizeof(float);
-  uint8_t* sm_w_fp8 = reinterpret_cast<uint8_t*>(smem_raw + off);
+  // sm_w_fp8 is DOUBLE-BUFFERED: vc=N quants into buf[N&1], MMA reads buf[N&1].
+  // With separate buffers per parity, vc=N+1's quant writes (to the OTHER
+  // buffer) cannot race with vc=N's MMA read, eliminating the `if vc>0`
+  // barrier between iterations.
+  uint8_t* sm_w_fp8_buf[2];
+  sm_w_fp8_buf[0] = reinterpret_cast<uint8_t*>(smem_raw + off);
+  off += (size_t)HPB * (V3_BI + 16);
+  sm_w_fp8_buf[1] = reinterpret_cast<uint8_t*>(smem_raw + off);
 
   float* sm_warp_max = sm_reduce;
   float* sm_warp_sum = sm_reduce + V3_N_WARPS * HPB;
@@ -507,13 +515,14 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
       sm_p_full[gid + 8][cand_col_base + c0] = __float2bfloat16(w_pre[nt][2]);
       sm_p_full[gid + 8][cand_col_base + c1] = __float2bfloat16(w_pre[nt][3]);
     }
-    bar_sync_t<3, V3_MATH_THREADS>();
-
-    // ── Stage 3 NoPE FP8 ──────────────────────────────────────
+    // Zero-init sm_w_head_sc here (different smem buffer than sm_p_full above),
+    // so the single bar_sync below covers both write groups.
     for (int i = threadIdx.x; i < N_V_CHUNKS * HPB; i += V3_MATH_THREADS) {
       sm_w_head_sc[i] = 0.f;
     }
     bar_sync_t<3, V3_MATH_THREADS>();
+
+    // ── Stage 3 NoPE FP8 ──────────────────────────────────────
     {
       const int warp_first_cand_xv = warp_id * V3_ENTRIES_PER_WARP;
 #pragma unroll
@@ -543,7 +552,10 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
 
 #pragma unroll
     for (int vc = 0; vc < N_V_CHUNKS; vc++) {
-      if (vc > 0) bar_sync_t<3, V3_MATH_THREADS>();
+      // Double-buffered: vc=N quants into buf[N&1]; vc=N+1's quant targets the
+      // OTHER buffer, so it cannot race with vc=N's MMA read. The bar_sync
+      // after quant is the only sync needed within the vc loop.
+      uint8_t* sm_w_fp8 = sm_w_fp8_buf[vc & 1];
       // Phase 3 quant.
       {
         const int warp_first_cand_xv = warp_id * V3_ENTRIES_PER_WARP;

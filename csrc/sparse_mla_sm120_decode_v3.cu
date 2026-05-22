@@ -40,8 +40,8 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   //   sm_kv_rope   2 * V3_BI * D_ROPE * 2B                = 16 KB
   //   sm_reduce    2 * V3_N_WARPS * HPB * 4               = 1 KB
   //   sm_w_head_sc N_V_CHUNKS * HPB * 4                   = 448 B
-  //   sm_w_fp8     HPB * (V3_BI + 16)                     = 1.25 KB
-  //   Total                                               ~ 87 KB
+  //   sm_w_fp8 ×2  2 * HPB * (V3_BI + 16)                 = 2.5 KB
+  //   Total                                               ~ 88 KB
   // Static smem (kernel-side):
   //   sm_p_full    HPB * V3_BI * 2B (bf16)                =  2 KB
   // Grand total ~ 89 KB (under 100 KB SM120 carveout, 1 block/SM).
@@ -57,7 +57,7 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
       + 4 * (int)sizeof(uint64_t)                                        // mbar_full+empty
       + 2 * V3_N_WARPS * HPB * (int)sizeof(float)                        // sm_reduce
       + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                     // sm_w_head_sc
-      + HPB * (V3_BI + 16);                                              // sm_w_fp8
+      + 2 * HPB * (V3_BI + 16);                                          // sm_w_fp8 ×2 (vc parity)
 
   auto kernel = sparse_mla_decode_v3_kernel<MT, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
   CUDA_CHECK_BOOL(cudaFuncSetAttribute(
