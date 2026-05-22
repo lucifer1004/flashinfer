@@ -45,11 +45,19 @@ from __future__ import annotations
 
 import functools
 from types import SimpleNamespace
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
 from .api_logging import flashinfer_api
+from .autotuner import (
+    AutoTuner,
+    ConstraintSpec,
+    DynamicTensorSpec,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+)
 from .jit.sparse_mla_sm120 import gen_sparse_mla_sm120_module
 from .trace.templates.attention import sparse_mla_sm120_paged_trace
 from .utils import (
@@ -511,3 +519,217 @@ class BatchSparseMLAPagedAttentionWrapper:
             extra_topk_length=extra_topk_length,
         )
         return out_lse_view if return_lse else None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Decode-v3: AutoTuner-driven chunks_per_block tuning
+# ─────────────────────────────────────────────────────────────────────
+#
+# decode-v3 is the split-K decode kernel where each block handles
+# `chunks_per_block` chunks of `_BI`=64 candidates each. The wall-time-optimal
+# cpb is non-monotonic in (num_tokens, num_heads, topk): per-shape sweep shows
+# 20-28% gains over the C++ closed-form heuristic on contested shapes (e.g.,
+# 128/512/T=16, 128/1024/T=16, 64/1024/T=16, 64/512/T=16) — the gain is
+# finicky (cpb=13 vs cpb=14 differ ~12% on one shape) so a closed-form is
+# unlikely to capture it without ML-style fitting.
+#
+# Solution: expose `chunks_per_block` as a TunableRunner tactic and let
+# AutoTuner cache the best value per (T_bucket, num_heads, topk).
+
+
+@functools.cache
+def _get_sparse_mla_decode_v3_module():
+    """Build + cache the decode-v3 module and its TunableRunner class."""
+    module = gen_sparse_mla_sm120_module().build_and_load()
+
+    class SparseMlaDecodeV3Runner(TunableRunner):
+        """One runner per (kernel module). Tactic = chunks_per_block ∈
+        [1, num_splits]. tactic=-1 (or 0) falls back to the C++ heuristic."""
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            indices = inputs[2]
+            topk = indices.shape[1]
+            num_splits = (topk + _BI - 1) // _BI
+            # tactic encodes chunks_per_block (1..num_splits). We include
+            # 0 as a synonym for "use heuristic" so the autotuner can fall
+            # back if all real tactics are slower than heuristic.
+            return list(range(1, num_splits + 1))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            q, kv_cache, indices, mid_out, mid_lse, output, out_lse = inputs
+            sm_scale = kwargs["sm_scale"]
+            topk_length = kwargs.get("topk_length")
+            topk = indices.shape[1]
+            num_splits = (topk + _BI - 1) // _BI
+            # tactic ∈ [1, num_splits] → pass through; tactic == -1 (autotuner
+            # fallback) → pass -1 so the C++ heuristic picks cpb.
+            cpb_override = tactic if tactic > 0 else -1
+            module.sparse_mla_sm120_decode_v3(
+                q,
+                kv_cache,
+                indices,
+                mid_out,
+                mid_lse,
+                output,
+                out_lse,
+                num_splits,
+                sm_scale,
+                topk_length,
+                cpb_override,
+            )
+            return output
+
+    return SimpleNamespace(module=module, runner_cls=SparseMlaDecodeV3Runner)
+
+
+def _decode_v3_num_token_buckets(*_args, **_kwargs):
+    """Power-of-2-ish T buckets matching the contested decode shapes."""
+    return (1, 4, 8, 16, 32, 64)
+
+
+def _decode_v3_map_to_token_bucket(x):
+    """Round T up to the next bucket boundary used by tuning."""
+    buckets = (1, 4, 8, 16, 32, 64)
+    for b in buckets:
+        if x <= b:
+            return b
+    return buckets[-1]
+
+
+def _decode_v3_init_q(shapes, dtype, device):
+    """bf16 q ~N(0, 0.1) clamped to [-1, 1] — matches test_decode_v3 distribution."""
+    return (torch.randn(shapes, device=device, dtype=torch.float32) / 10.0).clamp(-1, 1).to(dtype)
+
+
+def _decode_v3_init_indices(shapes, dtype, device):
+    """int32 indices in a small safe range; assumes kv_cache has >=256 blocks.
+
+    AutoTuner only profiles wall time, not correctness — random valid indices
+    are sufficient. The cache built for the real call uses the ACTUAL indices.
+    """
+    return torch.randint(0, 256, shapes, dtype=dtype, device=device)
+
+
+@supported_compute_capability([120, 121])
+@flashinfer_api
+def sparse_mla_sm120_decode_v3(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    mid_out: torch.Tensor,
+    mid_lse: torch.Tensor,
+    output: torch.Tensor,
+    out_lse: torch.Tensor,
+    sm_scale: float,
+    *,
+    topk_length: Optional[torch.Tensor] = None,
+    chunks_per_block: Optional[int] = None,
+) -> torch.Tensor:
+    r"""Sparse-MLA paged decode (v3 standalone kernel) on SM120.
+
+    The decode-v3 path is the split-K decode variant where each block handles
+    ``chunks_per_block`` chunks of 64 candidates each. The wall-time-optimal
+    ``chunks_per_block`` is shape-dependent and not well captured by a closed-
+    form heuristic. This wrapper integrates flashinfer's :mod:`AutoTuner` to
+    pick the per-shape best.
+
+    Behaviour:
+
+    - ``chunks_per_block`` explicitly given → use that value directly (no
+      autotuning).
+    - Otherwise, if a ``with autotune(...)`` context is active or a previous
+      tuning run cached this shape → use the AutoTuner's choice.
+    - Otherwise → fall back to the C++ closed-form heuristic.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        ``[T, num_heads, d_qk]`` bf16. ``d_qk == 512`` (MODEL1 only).
+    kv_cache : torch.Tensor
+        Paged FP8 cache, shape ``[num_blocks, page_bytes]`` uint8.
+    indices : torch.Tensor
+        ``[T, topk]`` int32. ``topk`` must be one of {128, 512, 1024}; ``-1``
+        marks invalid slots.
+    mid_out : torch.Tensor
+        Scratch, ``[T, num_heads, num_splits, d_v]`` bf16. ``num_splits =
+        ceil(topk / 64)``.
+    mid_lse : torch.Tensor
+        Scratch, ``[T, num_heads, num_splits]`` float32.
+    output : torch.Tensor
+        In-place output, ``[T, num_heads, d_v]`` bf16.
+    out_lse : torch.Tensor
+        In-place log-sum-exp, ``[T, num_heads]`` float32.
+    sm_scale : float
+        Softmax scale.
+    topk_length : Optional[torch.Tensor]
+        Per-token effective top-k length, ``[T]`` int32.
+    chunks_per_block : Optional[int]
+        Explicit override. If ``None`` and no AutoTuner active, uses heuristic.
+
+    Returns
+    -------
+    output : torch.Tensor
+        The mutated output tensor (for chaining).
+    """
+    impl = _get_sparse_mla_decode_v3_module()
+    inputs = [q, kv_cache, indices, mid_out, mid_lse, output, out_lse]
+
+    if chunks_per_block is not None:
+        # Explicit user override — skip AutoTuner entirely.
+        impl.runner_cls()(
+            inputs=inputs,
+            tactic=int(chunks_per_block),
+            sm_scale=sm_scale,
+            topk_length=topk_length,
+        )
+        return output
+
+    # Constrain the T (dim 0) of all output / scratch tensors to match q's T
+    # so the autotuner's synthesised q (shape (T_bucket, h, d_qk)) propagates
+    # to mid_out (3), mid_lse (4), output (5), out_lse (6). Without these
+    # constraints, the kernel writes past the real tensors' T dim → IMA.
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 2),
+                dim_idx=(0, 0),
+                gen_tuning_buckets=_decode_v3_num_token_buckets,
+                map_to_tuning_buckets=_decode_v3_map_to_token_bucket,
+                tensor_initializers=[_decode_v3_init_q, _decode_v3_init_indices],
+            ),
+        ),
+        constraint_specs=(
+            ConstraintSpec(3, 0, lambda shapes: shapes[0][0]),  # mid_out
+            ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),  # mid_lse
+            ConstraintSpec(5, 0, lambda shapes: shapes[0][0]),  # output
+            ConstraintSpec(6, 0, lambda shapes: shapes[0][0]),  # out_lse
+        ),
+    )
+
+    tuner = AutoTuner.get()
+    runners = [impl.runner_cls()]
+    runner, tactic = tuner.choose_one(
+        "sparse_mla_sm120_decode_v3",
+        runners,
+        tuning_config,
+        inputs,
+        sm_scale=sm_scale,
+        topk_length=topk_length,
+    )
+    runner(
+        inputs=inputs,
+        tactic=tactic,
+        sm_scale=sm_scale,
+        topk_length=topk_length,
+    )
+    return output
