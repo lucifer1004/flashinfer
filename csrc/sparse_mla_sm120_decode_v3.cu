@@ -25,6 +25,7 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
                                   float* mid_lse, const int* topk_length,
                                   bf16* output, float* out_lse,
                                   int num_tokens, int num_splits,
+                                  int chunks_per_block_override,
                                   float sm_scale, size_t stride_kv_block,
                                   cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
@@ -88,24 +89,31 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   //   fit that the gap metric misses). These shapes were already winning
   //   1.5-3x vs jasl, so the regression is acceptable.
   // - Closes -8% on h=128/k=512/T=32 (was 0.94x jasl, now ~1.03x).
-  int sm_count = 0;
-  CUDA_CHECK_BOOL(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0));
-  if (sm_count <= 0) sm_count = 188;
-  constexpr int CEIL_WAVES_MAX = 3;
-  const int per_token_head = num_tokens * H_BLOCKS;
-  int chunks_per_block = 1;
-  float best_gap = 2.0f;
-  for (int cpb = 1; cpb <= num_splits; ++cpb) {
-    const int eff = (num_splits + cpb - 1) / cpb;
-    const int active = per_token_head * eff;
-    const int ceil_w = (active + sm_count - 1) / sm_count;
-    if (ceil_w > CEIL_WAVES_MAX) continue;
-    const float waves = (float)active / (float)sm_count;
-    const float gap = (float)ceil_w - waves;
-    if (gap < best_gap - 1e-6f ||
-        (gap < best_gap + 1e-6f && cpb > chunks_per_block)) {
-      best_gap = gap;
-      chunks_per_block = cpb;
+  int chunks_per_block;
+  if (chunks_per_block_override >= 1 && chunks_per_block_override <= num_splits) {
+    // AutoTuner / caller override path — used by SparseMlaDecodeRunner to
+    // sweep cpb tactics and pick per-shape best.
+    chunks_per_block = chunks_per_block_override;
+  } else {
+    int sm_count = 0;
+    CUDA_CHECK_BOOL(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0));
+    if (sm_count <= 0) sm_count = 188;
+    constexpr int CEIL_WAVES_MAX = 3;
+    const int per_token_head = num_tokens * H_BLOCKS;
+    chunks_per_block = 1;
+    float best_gap = 2.0f;
+    for (int cpb = 1; cpb <= num_splits; ++cpb) {
+      const int eff = (num_splits + cpb - 1) / cpb;
+      const int active = per_token_head * eff;
+      const int ceil_w = (active + sm_count - 1) / sm_count;
+      if (ceil_w > CEIL_WAVES_MAX) continue;
+      const float waves = (float)active / (float)sm_count;
+      const float gap = (float)ceil_w - waves;
+      if (gap < best_gap - 1e-6f ||
+          (gap < best_gap + 1e-6f && cpb > chunks_per_block)) {
+        best_gap = gap;
+        chunks_per_block = cpb;
+      }
     }
   }
   int num_splits_eff = (num_splits + chunks_per_block - 1) / chunks_per_block;
@@ -148,15 +156,16 @@ bool launch_sparse_mla_decode_v3(ModelType mt, int num_heads, int topk,
                                  const uint8_t* KV_cache, const int32_t* indices,
                                  bf16* mid_out, float* mid_lse, bf16* output,
                                  float* out_lse, const int* topk_length,
+                                 int chunks_per_block_override,
                                  float sm_scale, size_t stride_kv_block,
                                  cudaStream_t stream) {
   if (mt != ModelType::MODEL1 || page_block_size != 64) return false;
-#define V3_DISPATCH(H, K)                                              \
-  if (num_heads == (H) && topk == (K)) {                               \
-    return launch_decode_v3_impl<ModelType::MODEL1, (H), (K), 64>(     \
-        Q, KV_cache, indices, mid_out, mid_lse, topk_length, output,   \
-        out_lse, num_tokens, num_splits, sm_scale, stride_kv_block,    \
-        stream);                                                       \
+#define V3_DISPATCH(H, K)                                                \
+  if (num_heads == (H) && topk == (K)) {                                 \
+    return launch_decode_v3_impl<ModelType::MODEL1, (H), (K), 64>(       \
+        Q, KV_cache, indices, mid_out, mid_lse, topk_length, output,     \
+        out_lse, num_tokens, num_splits, chunks_per_block_override,      \
+        sm_scale, stride_kv_block, stream);                              \
   }
   V3_DISPATCH(16, 128)
   V3_DISPATCH(16, 512)

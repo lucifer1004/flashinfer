@@ -63,6 +63,7 @@ def bench_one(num_heads, topk, num_tokens):
     def call_v3():
         module.sparse_mla_sm120_decode_v3(
             q, kv_flat, indices, mid_v3, mid_lse_v3, out_v3, lse_v3, num_splits_v3, sm_scale, None,
+            -1,  # chunks_per_block override (-1 = heuristic)
         )
 
     # Frozen v3_backup
