@@ -38,7 +38,7 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   //   sm_kv_fp8    2 * V3_BI * KV_SMEM_STRIDE             = 58 KB
   //   sm_kv_sc     2 * V3_BI * SCALE_BYTES_PER_TOKEN      =  1 KB
   //   sm_kv_rope   2 * V3_BI * D_ROPE * 2B                = 16 KB
-  //   sm_reduce    2 * V3_N_WARPS * HPB * 4               = 512 B
+  //   sm_reduce    2 * V3_N_WARPS * HPB * 4               = 1 KB
   //   sm_w_head_sc N_V_CHUNKS * HPB * 4                   = 448 B
   //   sm_w_fp8     HPB * (V3_BI + 16)                     = 1.25 KB
   //   Total                                               ~ 87 KB

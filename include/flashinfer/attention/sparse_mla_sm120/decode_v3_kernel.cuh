@@ -17,8 +17,14 @@
 
 namespace flashinfer::sparse_mla_sm120 {
 
-// Decode-v3 (A1.3): warp-specialized TMA gather. IO warp drives
-// cp.async.bulk into double-buffered KV smem; 4 math warps consume.
+// Decode-v3 (A1.5): warp-specialized TMA gather + doubled math-warp count.
+// IO warp drives cp.async.bulk into double-buffered KV smem; 8 math warps
+// consume. With 8 warps each warp covers V3_BI/8 = 8 cands and V_CHUNK/8 =
+// 8 V-dims (was 16/16 at 4 warps), halving the per-thread persistent
+// acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] from 56 to 28 floats. Goal: cut
+// register spill (A1.4 NCU: 15,488 spill insts → 25.6% of L1TEX sectors
+// local) and push the scheduler past its 1.17 active-warps ceiling.
+//
 // Per-buf mbarrier pairs: mbar_full[s] for IO→math (leader arrives with
 // expect_tx, bulk completion decrements tx; phase flips when arrival count
 // AND tx both met), mbar_empty[s] for math→IO drain (one math signaling
@@ -30,20 +36,18 @@ namespace flashinfer::sparse_mla_sm120 {
 // pattern: see mla_hopper.cuh:789 (__syncthreads after consumer_wait) and
 // hopper/mainloop. Here we use bar_sync<3, MATH_THREADS> since only math
 // warps participate; the IO warp doesn't touch bar:3.
-//
-// Math layout (warps 0-3) unchanged from A1.1 / A1.2.
 
-constexpr int V3_N_WARPS = 4;                                    // math warps
+constexpr int V3_N_WARPS = 8;                                    // math warps
 constexpr int V3_IO_WARPS = 1;
-constexpr int V3_N_TOTAL_WARPS = V3_N_WARPS + V3_IO_WARPS;        // 5
-constexpr int V3_BLOCK_THREADS = V3_N_TOTAL_WARPS * 32;            // 160
-constexpr int V3_MATH_THREADS = V3_N_WARPS * 32;                   // 128
+constexpr int V3_N_TOTAL_WARPS = V3_N_WARPS + V3_IO_WARPS;        // 9
+constexpr int V3_BLOCK_THREADS = V3_N_TOTAL_WARPS * 32;            // 288
+constexpr int V3_MATH_THREADS = V3_N_WARPS * 32;                   // 256
 constexpr int V3_IO_THREADS = V3_IO_WARPS * 32;                    // 32
 constexpr int V3_CAND_WINDOW = 64;
 constexpr int V3_BI = V3_CAND_WINDOW;
 constexpr int V3_KV_BUF_COUNT = 2;
-constexpr int V3_ENTRIES_PER_WARP = V3_BI / V3_N_WARPS;            // 16
-constexpr int V3_QK_N_TILES = V3_ENTRIES_PER_WARP / 8;             // 2
+constexpr int V3_ENTRIES_PER_WARP = V3_BI / V3_N_WARPS;            // 8
+constexpr int V3_QK_N_TILES = V3_ENTRIES_PER_WARP / 8;             // 1
 
 template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kernel(
@@ -99,11 +103,11 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
 
   constexpr int V_CHUNK = QUANT_TILE;                              // 64
   constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;                     // 7
-  constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / V3_N_WARPS;         // 2
+  constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / V3_N_WARPS;         // 1
   constexpr int XV_KSTEPS = V3_BI / 32;                            // 2
   constexpr int W_FP8_STRIDE = V3_BI + 16;                         // 80
-  constexpr int ROPE_DIMS_PER_WARP = D_ROPE_C / V3_N_WARPS;        // 16
-  constexpr int ROPE_N_TILES = ROPE_DIMS_PER_WARP / 8;             // 2
+  constexpr int ROPE_DIMS_PER_WARP = D_ROPE_C / V3_N_WARPS;        // 8
+  constexpr int ROPE_N_TILES = ROPE_DIMS_PER_WARP / 8;             // 1
   constexpr int ROPE_K_ITERS = V3_BI / 16;                         // 4
 
   // ── Dynamic smem layout ────────────────────────────────────────
@@ -114,7 +118,7 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   //   sm_kv_fp8    2 * V3_BI * KV_SMEM_STRIDE   = 58 KB
   //   sm_kv_sc     2 * V3_BI * 8                = 1 KB
   //   sm_kv_rope   2 * V3_BI * D_ROPE * 2B      = 16 KB
-  //   sm_reduce    2 * V3_N_WARPS * HPB * 4     = 512 B
+  //   sm_reduce    2 * V3_N_WARPS * HPB * 4     = 1 KB  (8 warps)
   //   sm_w_head_sc N_V_CHUNKS * HPB * 4         = 448 B
   //   sm_w_fp8     HPB * (V3_BI + 16)           = 1.25 KB
   //   Total                                     ~ 87 KB
