@@ -267,19 +267,18 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
       ldmatrix_load_A_bf16(a0, a1, a2, a3, sm_q + ks * 16, D_QK, lane);
 #pragma unroll
       for (int nt = 0; nt < 2; nt++) {
-        const int cand_idx = nt * 8 + gid;  // N-col owned by this thread
-        const int ent_total = warp_id * V3_ENTRIES_PER_WARP + cand_idx;
-        const int d_log0 = ks * 16 + tid * 2;
-        uint16_t v0 = *reinterpret_cast<const uint16_t*>(
-            sm_kv + v3_swiz_offset<D_QK>(ent_total, d_log0));
-        uint16_t v1 = *reinterpret_cast<const uint16_t*>(
-            sm_kv + v3_swiz_offset<D_QK>(ent_total, d_log0 + 1));
-        uint16_t v8 = *reinterpret_cast<const uint16_t*>(
-            sm_kv + v3_swiz_offset<D_QK>(ent_total, d_log0 + 8));
-        uint16_t v9 = *reinterpret_cast<const uint16_t*>(
-            sm_kv + v3_swiz_offset<D_QK>(ent_total, d_log0 + 9));
-        uint32_t b0 = static_cast<uint32_t>(v0) | (static_cast<uint32_t>(v1) << 16);
-        uint32_t b1 = static_cast<uint32_t>(v8) | (static_cast<uint32_t>(v9) << 16);
+        // ldmatrix.x2.trans: input is 8 N-rows × 16 K-cols at sm_kv[cand][dim].
+        // Output is 16K × 8N register fragment, which is exactly the bf16
+        // m16n8k16 B-operand layout. Lanes 0..7 supply addresses for col=0
+        // half (cand_row, dim_chunk_start); lanes 8..15 supply col=8 half;
+        // lanes 16..31 redundant. The swizzle is applied to the per-thread
+        // smem address so the load is bank-conflict-free.
+        const int row_in_tile = lane & 7;      // 0..7 cand within this n-tile
+        const int col_half = (lane >> 3) & 1;  // 0 or 1
+        const int cand_total = warp_id * V3_ENTRIES_PER_WARP + nt * 8 + row_in_tile;
+        const int dim_chunk_start = ks * 16 + col_half * 8;
+        uint32_t b0, b1;
+        ldmatrix_x2_trans(b0, b1, sm_kv + v3_swiz_offset<D_QK>(cand_total, dim_chunk_start));
         MmaBf16Result r =
             mma_bf16_m16n8k16(a0, a1, a2, a3, b0, b1, qk[nt][0], qk[nt][1], qk[nt][2], qk[nt][3]);
         qk[nt][0] = r.d0;
