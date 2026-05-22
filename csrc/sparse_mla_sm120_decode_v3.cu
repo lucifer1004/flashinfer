@@ -63,21 +63,51 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   CUDA_CHECK_BOOL(cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
 
-  // Heuristic for chunks_per_block: target ~2 waves of GPU blocks so per-
-  // block work is amortized across the GPU without leaving SMs idle.
-  // chunks_per_block * num_splits_eff = num_chunks_total (= num_splits
-  // from caller; kept as the mid_out stride).
+  // Heuristic for chunks_per_block: among cpb candidates with at most
+  // CEIL_WAVES_MAX integer waves, minimize the last-wave tail gap
+  // (ceil(waves) - waves). On ties, prefer the LARGEST cpb (fewer total
+  // launched blocks → less L2 contention).
+  //
+  // Why these two terms:
+  // - `ceil_w cap`: forbids cpb=1 type configurations where the fractional
+  //   gap looks small but the integer wave count is 6-11, paying a huge
+  //   wall-time penalty.
+  // - `min tail gap`: prefers cpb where the last wave is mostly full (e.g.,
+  //   active=512 on 188 SMs → waves=2.72, last wave 72% full) over cpb
+  //   where the last wave is essentially empty (e.g., active=384 → waves=
+  //   2.04, last wave 4% full — only 8 of 188 SMs working in that wave).
+  //
+  // Trade-offs observed empirically: net -1.4% across the 16-shape grid.
+  // - Big wins (-28%) on small-work shapes like (32,512,T=16) and
+  //   (128,128,T=16) where the prior 2*SMs heuristic picked cpb=1 with
+  //   active_grid > SMs but spread the work over 2-3 waves; the new
+  //   heuristic picks cpb=2 for these (1.36-0.68 waves, fewer launches,
+  //   better per-block amortization).
+  // - Some +5..+12% regressions on shapes like (64,512,T=16) where the
+  //   true optimum is cpb=3 (waves=1.02, gap=0.98 — near-perfect 1-wave
+  //   fit that the gap metric misses). These shapes were already winning
+  //   1.5-3x vs jasl, so the regression is acceptable.
+  // - Closes -8% on h=128/k=512/T=32 (was 0.94x jasl, now ~1.03x).
   int sm_count = 0;
   CUDA_CHECK_BOOL(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0));
-  const int target_blocks = 2 * (sm_count > 0 ? sm_count : 188);
+  if (sm_count <= 0) sm_count = 188;
+  constexpr int CEIL_WAVES_MAX = 3;
   const int per_token_head = num_tokens * H_BLOCKS;
-  // chunks_per_block = ceil(num_chunks_total * per_token_head / target_blocks)
-  // clamped to [1, num_chunks_total]. For grids that already saturate the
-  // GPU at cpb=1 (per_token_head >= target_blocks), this is 1 — no change
-  // from the prior single-chunk-per-block design.
-  int cpb_raw =
-      (num_splits * per_token_head + target_blocks - 1) / target_blocks;
-  int chunks_per_block = (cpb_raw < 1) ? 1 : (cpb_raw > num_splits ? num_splits : cpb_raw);
+  int chunks_per_block = 1;
+  float best_gap = 2.0f;
+  for (int cpb = 1; cpb <= num_splits; ++cpb) {
+    const int eff = (num_splits + cpb - 1) / cpb;
+    const int active = per_token_head * eff;
+    const int ceil_w = (active + sm_count - 1) / sm_count;
+    if (ceil_w > CEIL_WAVES_MAX) continue;
+    const float waves = (float)active / (float)sm_count;
+    const float gap = (float)ceil_w - waves;
+    if (gap < best_gap - 1e-6f ||
+        (gap < best_gap + 1e-6f && cpb > chunks_per_block)) {
+      best_gap = gap;
+      chunks_per_block = cpb;
+    }
+  }
   int num_splits_eff = (num_splits + chunks_per_block - 1) / chunks_per_block;
 
   // Launch the FULL Python-allocated num_splits grid blocks; inactive splits
