@@ -372,136 +372,115 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   }
   __syncthreads();
 
-  // Stage 3 setup: stash per-thread p values into shared memory so the
-  // outer loop over heads (below) can read sm_p_storage[warp_id][h][c]
-  // for any h and c.
+  // ── Stage 2.75: globally-normalized softmax weights as BF16 ─────────
+  // To avoid an atomic-add cross-warp merge for XV, we partition the
+  // OUTPUT DIM across warps instead of partitioning candidates. Each
+  // warp will do MMA on ALL 64 candidates × its own D_V/N_WARPS=128-dim
+  // slice. For that to work each warp must see ALL candidates' softmax
+  // weights, so we stage them into a shared 2 KB buffer sm_p_full of
+  // shape [HPB=16 heads × V3_BI=64 candidates] in bf16.
   //
-  // Layout: sm_p_storage[warp][HPB heads][V3_ENTRIES_PER_WARP candidates].
-  // 4 × 16 × 16 × 4 = 4 KB static smem.
-  __shared__ float sm_p_storage[V3_N_WARPS][HPB][V3_ENTRIES_PER_WARP];
+  // We multiply local p (per-warp softmax) by the per-head global
+  // rescale exp(local_max - g_max) / g_sum so sm_p_full holds the
+  // FULLY normalized softmax weights; XV output is then the final
+  // output for this block, no further normalization needed.
+  __shared__ bf16 sm_p_full[HPB][V3_BI];  // 16 × 64 × 2 = 2 KB static
+
+  const float gmax0 = sm_warp_max[gid];
+  const float gmax1 = sm_warp_max[gid + 8];
+  const float gsum0 = sm_warp_sum[gid];
+  const float gsum1 = sm_warp_sum[gid + 8];
+  const float resc_h0 = (gsum0 > 0.f) ? (exp2f(local_max[0] - gmax0) / gsum0) : 0.f;
+  const float resc_h1 = (gsum1 > 0.f) ? (exp2f(local_max[1] - gmax1) / gsum1) : 0.f;
+
+  // Each warp writes its 16 candidates' contribution at column offset
+  // [warp_id * V3_ENTRIES_PER_WARP, (warp_id+1) * V3_ENTRIES_PER_WARP).
+  // Per thread writes 8 bf16 values into sm_p_full at the right (h, c).
+  const int cand_col_base = warp_id * V3_ENTRIES_PER_WARP;
 #pragma unroll
   for (int nt = 0; nt < 2; nt++) {
     const int c0 = nt * 8 + tid * 2;
     const int c1 = c0 + 1;
-    sm_p_storage[warp_id][gid][c0] = p[nt][0];
-    sm_p_storage[warp_id][gid][c1] = p[nt][1];
-    sm_p_storage[warp_id][gid + 8][c0] = p[nt][2];
-    sm_p_storage[warp_id][gid + 8][c1] = p[nt][3];
+    sm_p_full[gid][cand_col_base + c0] = __float2bfloat16(p[nt][0] * resc_h0);
+    sm_p_full[gid][cand_col_base + c1] = __float2bfloat16(p[nt][1] * resc_h0);
+    sm_p_full[gid + 8][cand_col_base + c0] = __float2bfloat16(p[nt][2] * resc_h1);
+    sm_p_full[gid + 8][cand_col_base + c1] = __float2bfloat16(p[nt][3] * resc_h1);
   }
-  __syncwarp();
+  __syncthreads();
 
-  // Cross-warp-merged g_max/g_sum already in sm_warp_max[0..HPB) and
-  // sm_warp_sum[0..HPB). Per-warp local_max also lives in sm_warp_max
-  // at slot [warp_id*HPB + h] for h < HPB — but the global-reduce step
-  // above overwrote the first HPB slots. We need the per-warp local_max
-  // for ALL heads to compute the rescale factor below, so we save it
-  // first BEFORE the global reduce in shared.
+  // ── Stage 3: XV via bf16 MMA — each warp owns a D_V/N_WARPS slice ──
+  // Per warp: 4 K-iter (covering all 64 cands) × N_TILES_PER_WARP N-tiles
+  // (covering D_V/N_WARPS=128 dims). No cross-warp merge.
   //
-  // The current code path has already done the reduction; we cannot
-  // recover the per-warp local_max without re-storing it. So we treat
-  // this as a known limitation: re-write sm_warp_max to hold per-warp
-  // local_max for the rescale step, then recompute g_max/g_sum where
-  // needed in the head loop.
-  //
-  // Simpler restructure: re-stash per-warp local_max into a separate
-  // scratch region of sm_warp_max[HPB .. V3_N_WARPS*HPB).
-  // Actually that region is still intact — the global reduce only
-  // overwrites [0, HPB). Use it.
+  // K-iter index ks ∈ [0, 4): A-cols are cands [ks*16, ks*16+16).
+  // For each ks, do N_TILES_PER_WARP MMAs (= 128/8 = 16) accumulating
+  // into per-lane acc[N_TILES_PER_WARP][4] = 64 floats.
+  constexpr int DIMS_PER_WARP = D_V / V3_N_WARPS;   // 128
+  constexpr int N_TILES_PER_WARP = DIMS_PER_WARP / 8;  // 16
+  constexpr int K_ITERS = V3_BI / 16;                // 4
 
-  // ── Stage 3: XV per head ────────────────────────────────────────────
-  // Outer loop over the HPB=16 heads owned by this block. For each head:
-  //   - Per-warp: compute warp_acc[16] = sum_c p[h,c] * V[c, lane*16+d]
-  //     across this warp's 16 candidates.
-  //   - Rescale by exp2(local_max_w_h - g_max_h) / g_sum_h.
-  //   - Atomic-add across warps into a 2 KB per-head buffer in sm_kv
-  //     (reused after the XV pass).
-  //   - Write the buffer to mid_out for this (token, head, split).
-  //
-  // Per-lane register state: warp_acc[16] = 64 bytes. Trivial.
-  // The cross-warp merge is via shared memory atomic-add.
-  const bf16* sm_kv_warp_x = sm_kv + (size_t)warp_id * V3_ENTRIES_PER_WARP * D_QK;
+  const int warp_dim_base = warp_id * DIMS_PER_WARP;
   const size_t mid_o_base_ll = ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V +
                                (size_t)split_idx * D_V;
   const size_t mid_lse_base_ll =
       (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
 
-#pragma unroll 1
-  for (int h_idx = 0; h_idx < HPB; h_idx++) {
-    // Per-warp local max for head h_idx. The global reduce overwrote
-    // sm_warp_max[0..HPB), so we need to read from per-warp slots
-    // [HPB, V3_N_WARPS*HPB). Wait — we ONLY overwrote [0..HPB). The
-    // remaining slots [HPB .. V3_N_WARPS*HPB) still hold warps 1..3's
-    // local max. Warp 0's local max for h_idx is now g_max — lost.
-    //
-    // To handle this cleanly, recompute local_max for h_idx by reading
-    // from this warp's per-thread `local_max` register. But that's
-    // per-thread state for h_idx=gid (when h_idx<8) or gid+8 (>=8).
-    //
-    // Simplest fix: have warp 0 not participate in the global reduce
-    // overwrite. Or pre-stash per-warp local_max into a fresh smem
-    // region before the global reduce.
-    //
-    // We do the latter: read from sm_kv_warp's footer area. Actually,
-    // just use the warp's per-thread local_max via shuffle:
-    //   - Lane (gid', tid') in warp w has local_max[0] for head gid'
-    //     and local_max[1] for head gid'+8.
-    //   - To get the warp's local_max for head h_idx, broadcast from
-    //     the lane that owns it.
-    int src_lane_for_h;
-    int which_local;  // 0 or 1
-    if (h_idx < 8) {
-      src_lane_for_h = h_idx * 4;  // gid = h_idx, tid = 0
-      which_local = 0;
-    } else {
-      src_lane_for_h = (h_idx - 8) * 4;  // gid = h_idx - 8, tid = 0
-      which_local = 1;
-    }
-    float local_max_h =
-        __shfl_sync(0xffffffff, which_local == 0 ? local_max[0] : local_max[1], src_lane_for_h);
+  float acc[N_TILES_PER_WARP][4] = {0};
 
-    // Read global max/sum for h_idx (broadcast from one read).
-    const float g_max_h = sm_warp_max[h_idx];
-    const float g_sum_h = sm_warp_sum[h_idx];
-    const float resc =
-        (g_sum_h > 0.f) ? (exp2f(local_max_h - g_max_h) / g_sum_h) : 0.f;
+#pragma unroll
+  for (int ks = 0; ks < K_ITERS; ks++) {
+    // A operand: P[16h, 16k=cands ks*16..ks*16+15]
+    uint32_t a0, a1, a2, a3;
+    ldmatrix_load_A_bf16(
+        a0, a1, a2, a3,
+        reinterpret_cast<const bf16*>(&sm_p_full[0][ks * 16]),
+        V3_BI, lane);
 
-    // Phase A: per-warp acc.
-    float warp_acc[DIM_PER_LANE];
 #pragma unroll
-    for (int d = 0; d < DIM_PER_LANE; d++) warp_acc[d] = 0.f;
-#pragma unroll
-    for (int c = 0; c < V3_ENTRIES_PER_WARP; c++) {
-      const float p_hc = sm_p_storage[warp_id][h_idx][c];
-      const bf16* v_row = sm_kv_warp_x + (size_t)c * D_QK + lane * DIM_PER_LANE;
-#pragma unroll
-      for (int d = 0; d < DIM_PER_LANE; d++) {
-        const float vf = __bfloat162float(v_row[d]);
-        warp_acc[d] += p_hc * vf;
-      }
-    }
-#pragma unroll
-    for (int d = 0; d < DIM_PER_LANE; d++) warp_acc[d] *= resc;
+    for (int nt = 0; nt < N_TILES_PER_WARP; nt++) {
+      const int n_col = warp_dim_base + nt * 8 + gid;  // per-lane N-col
 
-    // Phase B: cross-warp merge in sm_head_buf via atomic-add.
-    // Zero the buf first (only the D_V slots we use).
-    for (int i = threadIdx.x; i < D_V; i += V3_BLOCK_THREADS) sm_head_buf[i] = 0.f;
-    __syncthreads();
-#pragma unroll
-    for (int d = 0; d < DIM_PER_LANE; d++) {
-      atomicAdd(&sm_head_buf[lane * DIM_PER_LANE + d], warp_acc[d]);
-    }
-    __syncthreads();
+      // B operand: V[16k=cands ks*16+rows, 1n=n_col]. K-rows: ks*16+{tid*2,
+      // tid*2+1, tid*2+8, tid*2+9}. K-row idx is the GLOBAL candidate
+      // index within this block.
+      const int k_base = ks * 16;
+      uint16_t v0 = *reinterpret_cast<const uint16_t*>(
+          sm_kv + (size_t)(k_base + tid * 2) * D_QK + n_col);
+      uint16_t v1 = *reinterpret_cast<const uint16_t*>(
+          sm_kv + (size_t)(k_base + tid * 2 + 1) * D_QK + n_col);
+      uint16_t v8 = *reinterpret_cast<const uint16_t*>(
+          sm_kv + (size_t)(k_base + tid * 2 + 8) * D_QK + n_col);
+      uint16_t v9 = *reinterpret_cast<const uint16_t*>(
+          sm_kv + (size_t)(k_base + tid * 2 + 9) * D_QK + n_col);
+      uint32_t b0 = static_cast<uint32_t>(v0) | (static_cast<uint32_t>(v1) << 16);
+      uint32_t b1 = static_cast<uint32_t>(v8) | (static_cast<uint32_t>(v9) << 16);
 
-    // Phase C: write mid_out for this head.
-    if (warp_id == 0) {
-#pragma unroll
-      for (int d = 0; d < DIM_PER_LANE; d++) {
-        const int dim_idx = lane * DIM_PER_LANE + d;
-        bf16 bv = __float2bfloat16(sm_head_buf[dim_idx]);
-        mid_out[mid_o_base_ll + (size_t)h_idx * num_splits * D_V + dim_idx] = bv;
-      }
+      MmaBf16Result r = mma_bf16_m16n8k16(
+          a0, a1, a2, a3, b0, b1,
+          acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]);
+      acc[nt][0] = r.d0;
+      acc[nt][1] = r.d1;
+      acc[nt][2] = r.d2;
+      acc[nt][3] = r.d3;
     }
-    __syncthreads();
+  }
+
+  // Write directly to mid_out (no cross-warp merge needed — each warp
+  // owns disjoint D_V slice). Layout per lane:
+  //   acc[nt][0,1] = (head gid,   dim warp_dim_base+nt*8+tid*2, +1)
+  //   acc[nt][2,3] = (head gid+8, dim warp_dim_base+nt*8+tid*2, +1)
+#pragma unroll
+  for (int nt = 0; nt < N_TILES_PER_WARP; nt++) {
+    const int d0 = warp_dim_base + nt * 8 + tid * 2;
+    const int d1 = d0 + 1;
+    mid_out[mid_o_base_ll + (size_t)gid * num_splits * D_V + d0] =
+        __float2bfloat16(acc[nt][0]);
+    mid_out[mid_o_base_ll + (size_t)gid * num_splits * D_V + d1] =
+        __float2bfloat16(acc[nt][1]);
+    mid_out[mid_o_base_ll + (size_t)(gid + 8) * num_splits * D_V + d0] =
+        __float2bfloat16(acc[nt][2]);
+    mid_out[mid_o_base_ll + (size_t)(gid + 8) * num_splits * D_V + d1] =
+        __float2bfloat16(acc[nt][3]);
   }
 
   // Phase D: write LSE per head (HPB threads).
