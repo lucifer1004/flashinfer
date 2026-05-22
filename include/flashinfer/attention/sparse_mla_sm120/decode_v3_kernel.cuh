@@ -497,13 +497,15 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   }
   __syncthreads();
 
-  // NoPE accumulator: per warp, N_V_CHUNKS × NT_PER_WARP_XV × 4 floats.
-  // Each (vc, nt) covers 8 dims; warp's total NoPE dims = 7 × 2 × 8 = 112.
-  float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};
-
-  // Per-chunk FP8 quant + MMA. sm_w_fp8 is reused across chunks via the
-  // barrier at the top of each chunk iter (after the prior chunk's MMAs
-  // have read from it).
+  // Per-chunk FP8 quant + MMA + write. sm_w_fp8 is reused across the 7
+  // chunks via the barrier at the top of each iter (after the prior chunk's
+  // MMAs have finished reading it).
+  //
+  // The per-chunk acc lives ONLY inside the loop body — 8 floats per thread,
+  // not 7*8=56. NCU on the prior layout showed register pressure pegged at
+  // 255 (the cap) with significant local-memory spilling; streaming the
+  // per-chunk result to mid_out as it's computed drops the live acc to
+  // 8 floats and eliminates the spill.
 #pragma unroll
   for (int vc = 0; vc < N_V_CHUNKS; vc++) {
     if (vc > 0) __syncthreads();  // prior chunk's MMAs done reading sm_w_fp8
@@ -543,7 +545,7 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
 
     // Phase 4: FP8 m16n8k32 MMA per warp for this chunk.
     // Per warp: NT_PER_WARP_XV N-tiles × XV_KSTEPS K-iters.
-    // A from sm_w_fp8 (16h × 32k), B from sm_kv_fp8 via d2_load_b_fp8.
+    float acc_chunk[NT_PER_WARP_XV][4] = {0};
 #pragma unroll
     for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
       const int dim = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8;
@@ -554,20 +556,16 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
         ldmatrix_load_A_fp8(a0, a1, a2, a3, sm_w_fp8 + ko, W_FP8_STRIDE, lane);
         d2_load_b_fp8<KV_SMEM_STRIDE>(b0, b1, sm_kv_fp8, kstep * 32, dim, lane);
         MmaFp8Result r =
-            mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, acc_nope[vc][nt][0],
-                             acc_nope[vc][nt][1], acc_nope[vc][nt][2],
-                             acc_nope[vc][nt][3]);
-        acc_nope[vc][nt][0] = r.d0;
-        acc_nope[vc][nt][1] = r.d1;
-        acc_nope[vc][nt][2] = r.d2;
-        acc_nope[vc][nt][3] = r.d3;
+            mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, acc_chunk[nt][0],
+                             acc_chunk[nt][1], acc_chunk[nt][2], acc_chunk[nt][3]);
+        acc_chunk[nt][0] = r.d0;
+        acc_chunk[nt][1] = r.d1;
+        acc_chunk[nt][2] = r.d2;
+        acc_chunk[nt][3] = r.d3;
       }
     }
-  }
 
-  // Apply per-(vc, head) Q-scale to NoPE acc, then write to mid_out.
-#pragma unroll
-  for (int vc = 0; vc < N_V_CHUNKS; vc++) {
+    // Apply per-(vc, head) Q-scale and write this chunk's slice to mid_out.
     const float sc0 = sm_w_head_sc[vc * HPB + gid];
     const float sc1 = sm_w_head_sc[vc * HPB + gid + 8];
 #pragma unroll
@@ -575,13 +573,13 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
       const int d0 = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8 + tid * 2;
       const int d1 = d0 + 1;
       mid_out[mid_o_base_ll + (size_t)gid * num_splits * D_V_C + d0] =
-          __float2bfloat16(acc_nope[vc][nt][0] * sc0);
+          __float2bfloat16(acc_chunk[nt][0] * sc0);
       mid_out[mid_o_base_ll + (size_t)gid * num_splits * D_V_C + d1] =
-          __float2bfloat16(acc_nope[vc][nt][1] * sc0);
+          __float2bfloat16(acc_chunk[nt][1] * sc0);
       mid_out[mid_o_base_ll + (size_t)(gid + 8) * num_splits * D_V_C + d0] =
-          __float2bfloat16(acc_nope[vc][nt][2] * sc1);
+          __float2bfloat16(acc_chunk[nt][2] * sc1);
       mid_out[mid_o_base_ll + (size_t)(gid + 8) * num_splits * D_V_C + d1] =
-          __float2bfloat16(acc_nope[vc][nt][3] * sc1);
+          __float2bfloat16(acc_chunk[nt][3] * sc1);
     }
   }
 
