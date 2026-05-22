@@ -441,8 +441,24 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
         (global_max[0] > -1e29f) ? exp2f(global_max[0] - new_gmax0) : 0.f;
     const float alpha1 =
         (global_max[1] > -1e29f) ? exp2f(global_max[1] - new_gmax1) : 0.f;
-    const float local_rescale0 = exp2f(block_local_max0 - new_gmax0);
-    const float local_rescale1 = exp2f(block_local_max1 - new_gmax1);
+    // Two distinct rescale factors:
+    //   block_rescale = exp(block_local_max - new_gmax) — rescales the
+    //     block-wide sum (already weighted by per-warp local_max during
+    //     cross-warp reduction) into the new global frame. Used for the
+    //     global_sum update.
+    //   warp_rescale  = exp(local_max[w] - new_gmax) — rescales THIS
+    //     warp's p (computed in the warp's own local_max frame) into the
+    //     new global frame. CRITICAL for correctness when a warp covers
+    //     only invalid candidates: the post-mask qk == -1e30 * sm_scale *
+    //     LOG2E ≈ -6.38e28 becomes the warp's local_max[0], and softmax
+    //     gives p ≡ 1 (exp2(qk - local_max) = exp2(0)). Without the
+    //     per-warp factor, these spurious 1s would leak into sm_p_full
+    //     and corrupt the RoPE MMA. The exp(local_max - new_gmax) factor
+    //     drives them to ~0.
+    const float block_rescale0 = exp2f(block_local_max0 - new_gmax0);
+    const float block_rescale1 = exp2f(block_local_max1 - new_gmax1);
+    const float warp_rescale0 = exp2f(local_max[0] - new_gmax0);
+    const float warp_rescale1 = exp2f(local_max[1] - new_gmax1);
 
     if (chunk_idx > chunk_lo) {
 #pragma unroll
@@ -462,23 +478,24 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
         acc_rope[nt][2] *= alpha1;
         acc_rope[nt][3] *= alpha1;
       }
-      global_sum[0] = global_sum[0] * alpha0 + block_local_sum0 * local_rescale0;
-      global_sum[1] = global_sum[1] * alpha1 + block_local_sum1 * local_rescale1;
+      global_sum[0] = global_sum[0] * alpha0 + block_local_sum0 * block_rescale0;
+      global_sum[1] = global_sum[1] * alpha1 + block_local_sum1 * block_rescale1;
     } else {
-      global_sum[0] = block_local_sum0 * local_rescale0;
-      global_sum[1] = block_local_sum1 * local_rescale1;
+      global_sum[0] = block_local_sum0 * block_rescale0;
+      global_sum[1] = block_local_sum1 * block_rescale1;
     }
     global_max[0] = new_gmax0;
     global_max[1] = new_gmax1;
 
-    // Stage 2.75: sm_p_full = p * local_rescale.
+    // Stage 2.75: sm_p_full = p * warp_rescale. Each warp uses its OWN
+    // local_max-based rescale to kill all-invalid-warp contributions.
     float w_pre[V3_QK_N_TILES][4];
 #pragma unroll
     for (int nt = 0; nt < V3_QK_N_TILES; nt++) {
-      w_pre[nt][0] = p[nt][0] * local_rescale0;
-      w_pre[nt][1] = p[nt][1] * local_rescale0;
-      w_pre[nt][2] = p[nt][2] * local_rescale1;
-      w_pre[nt][3] = p[nt][3] * local_rescale1;
+      w_pre[nt][0] = p[nt][0] * warp_rescale0;
+      w_pre[nt][1] = p[nt][1] * warp_rescale0;
+      w_pre[nt][2] = p[nt][2] * warp_rescale1;
+      w_pre[nt][3] = p[nt][3] * warp_rescale1;
     }
     const int cand_col_base = warp_id * V3_ENTRIES_PER_WARP;
 #pragma unroll
