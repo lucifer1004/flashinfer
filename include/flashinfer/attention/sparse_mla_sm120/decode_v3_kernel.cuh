@@ -5,6 +5,10 @@
 
 #pragma once
 
+#include <cute/swizzle.hpp>
+#include <cute/layout.hpp>
+#include <cute/tensor.hpp>
+
 #include "arch/cp_async.cuh"
 #include "arch/ldmatrix_sm120.cuh"
 #include "arch/mma_sm120.cuh"
@@ -40,21 +44,31 @@ constexpr int V3_CAND_WINDOW = 64;  // candidates handled by one block
 constexpr int V3_BI = V3_CAND_WINDOW;
 constexpr int V3_ENTRIES_PER_WARP = V3_BI / V3_N_WARPS;  // 16
 
-// sm_kv smem swizzle. Without swizzle, the m16n8k16 B-load pattern in
-// Stage 2 (QK) accesses sm_kv[cand][dim] with the same dim offset across
-// all 8 cand-rows in an N-tile, collapsing onto the same bank — 8-way
-// conflict, ~11M load wavefronts per kernel invocation measured via ncu.
+// sm_kv smem swizzle, expressed as a cute::Swizzle so the swizzle is a
+// property of the layout rather than scattered through call sites.
 //
-// XORing the logical dim with ((cand & 7) << 3) (i.e. 16-byte offset
-// proportional to cand low-bits) shifts each cand-row's dim layout by a
-// distinct bank-group, giving full 32-bank distribution for Stage 2 reads
-// (no conflicts) and 2-way for Stage 3 XV reads (down from 4-way).
+// Swizzle<3, 3, 6> XORs bits [9, 12) of the linear bf16 offset (= low 3
+// bits of cand_idx for D_QK=512) onto bits [3, 6) (= bank-affecting bits
+// 3..5 of the bf16 offset, equivalently banks 2..4 after the /2 to
+// 4-byte units). This gives full 32-bank distribution for Stage 2 QK
+// reads (8-way → 0-way) and 2-way for Stage 3 XV reads (4-way → 2-way),
+// matching the perf characteristics of the prior hand-rolled `v3_swiz`.
 //
-// The XOR stays within the row (max XOR mask = 56 bf16 < D_QK − epsilon)
-// and preserves the NoPE/RoPE boundary at logical dim D_NOPE=448 because
-// 448's bit-pattern has none of bits 3..5 set (the bits this XOR can flip).
-__device__ __forceinline__ int v3_swiz(int logical_dim, int cand) {
-  return logical_dim ^ ((cand & 7) << 3);
+// Equivalent hand-rolled form:
+//     swiz(dim, cand) = dim ^ ((cand & 7) << 3)   (in bf16 units)
+//
+// The XOR stays within each cand row (max XOR mask = 56 bf16 < D_QK) and
+// preserves the NoPE/RoPE boundary at logical dim D_NOPE = 448 because
+// 448's bit-pattern has none of bits 3..5 set.
+using SmemKVSwizzle = cute::Swizzle<3, 3, 6>;
+
+// Apply the cute swizzle to a (cand, dim) pair in bf16 units → physical
+// linear offset within sm_kv (also in bf16). Templated on D_QK so the
+// stride is a compile-time constant.
+template <int D_QK_CONST>
+__device__ __forceinline__ int v3_swiz_offset(int cand, int dim) {
+  const int linear = cand * D_QK_CONST + dim;
+  return SmemKVSwizzle::apply(linear);
 }
 
 template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
@@ -173,8 +187,6 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
       const uint8_t* scale_base = KV_cache + (size_t)block_idx_g * stride_kv_block +
                                   (size_t)pbs * IO_STRIDE + (size_t)local_idx_g * SCALE_BYTES_PER_TOKEN;
 
-      bf16* kv_dst = sm_kv + (size_t)entry_idx * D_QK;
-
       // Load the 8 scale bytes (one per QUANT_TILE; only first 7 used).
       // Cooperative load via the first lane; broadcast via shuffle.
       uint64_t scale_packed;
@@ -208,8 +220,11 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
         __nv_fp8_e4m3 raw;
         raw.__x = static_cast<__nv_fp8_storage_t>(data_base[b]);
         const float v = static_cast<float>(static_cast<__half>(raw));
-        // Swizzled store — see v3_swiz docstring above.
-        kv_dst[v3_swiz(b, entry_idx)] = __float2bfloat16(is_valid_cand ? (v * scale) : 0.0f);
+        // Swizzled store — SmemKVSwizzle (cute::Swizzle<3,3,6>) puts each
+        // cand row's payload at a permuted dim offset, so Stage 2/3 reads
+        // are bank-conflict-free.
+        sm_kv[v3_swiz_offset<D_QK>(entry_idx, b)] =
+            __float2bfloat16(is_valid_cand ? (v * scale) : 0.0f);
       }
       // RoPE half: already bf16 in gmem, 128 bytes = 64 bf16, copy verbatim.
       // 32 lanes × 2 bf16 each = 64 bf16. Apply same row swizzle.
@@ -217,9 +232,9 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
       if (lane * 2 < D_ROPE) {
         const int rope_dim0 = D_NOPE + lane * 2;
         const int rope_dim1 = rope_dim0 + 1;
-        kv_dst[v3_swiz(rope_dim0, entry_idx)] =
+        sm_kv[v3_swiz_offset<D_QK>(entry_idx, rope_dim0)] =
             is_valid_cand ? rope_src[lane * 2] : __float2bfloat16(0.0f);
-        kv_dst[v3_swiz(rope_dim1, entry_idx)] =
+        sm_kv[v3_swiz_offset<D_QK>(entry_idx, rope_dim1)] =
             is_valid_cand ? rope_src[lane * 2 + 1] : __float2bfloat16(0.0f);
       }
     }
@@ -254,12 +269,15 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
       for (int nt = 0; nt < 2; nt++) {
         const int cand_idx = nt * 8 + gid;  // N-col owned by this thread
         const int ent_total = warp_id * V3_ENTRIES_PER_WARP + cand_idx;
-        const bf16* row_base = sm_kv + (size_t)ent_total * D_QK;
         const int d_log0 = ks * 16 + tid * 2;
-        uint16_t v0 = *reinterpret_cast<const uint16_t*>(row_base + v3_swiz(d_log0, ent_total));
-        uint16_t v1 = *reinterpret_cast<const uint16_t*>(row_base + v3_swiz(d_log0 + 1, ent_total));
-        uint16_t v8 = *reinterpret_cast<const uint16_t*>(row_base + v3_swiz(d_log0 + 8, ent_total));
-        uint16_t v9 = *reinterpret_cast<const uint16_t*>(row_base + v3_swiz(d_log0 + 9, ent_total));
+        uint16_t v0 = *reinterpret_cast<const uint16_t*>(
+            sm_kv + v3_swiz_offset<D_QK>(ent_total, d_log0));
+        uint16_t v1 = *reinterpret_cast<const uint16_t*>(
+            sm_kv + v3_swiz_offset<D_QK>(ent_total, d_log0 + 1));
+        uint16_t v8 = *reinterpret_cast<const uint16_t*>(
+            sm_kv + v3_swiz_offset<D_QK>(ent_total, d_log0 + 8));
+        uint16_t v9 = *reinterpret_cast<const uint16_t*>(
+            sm_kv + v3_swiz_offset<D_QK>(ent_total, d_log0 + 9));
         uint32_t b0 = static_cast<uint32_t>(v0) | (static_cast<uint32_t>(v1) << 16);
         uint32_t b1 = static_cast<uint32_t>(v8) | (static_cast<uint32_t>(v9) << 16);
         MmaBf16Result r =
@@ -478,14 +496,10 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
       const int ent1 = ent0 + 1;
       const int ent8 = ent0 + 8;
       const int ent9 = ent0 + 9;
-      uint16_t v0 = *reinterpret_cast<const uint16_t*>(
-          sm_kv + (size_t)ent0 * D_QK + v3_swiz(n_col, ent0));
-      uint16_t v1 = *reinterpret_cast<const uint16_t*>(
-          sm_kv + (size_t)ent1 * D_QK + v3_swiz(n_col, ent1));
-      uint16_t v8 = *reinterpret_cast<const uint16_t*>(
-          sm_kv + (size_t)ent8 * D_QK + v3_swiz(n_col, ent8));
-      uint16_t v9 = *reinterpret_cast<const uint16_t*>(
-          sm_kv + (size_t)ent9 * D_QK + v3_swiz(n_col, ent9));
+      uint16_t v0 = *reinterpret_cast<const uint16_t*>(sm_kv + v3_swiz_offset<D_QK>(ent0, n_col));
+      uint16_t v1 = *reinterpret_cast<const uint16_t*>(sm_kv + v3_swiz_offset<D_QK>(ent1, n_col));
+      uint16_t v8 = *reinterpret_cast<const uint16_t*>(sm_kv + v3_swiz_offset<D_QK>(ent8, n_col));
+      uint16_t v9 = *reinterpret_cast<const uint16_t*>(sm_kv + v3_swiz_offset<D_QK>(ent9, n_col));
       uint32_t b0 = static_cast<uint32_t>(v0) | (static_cast<uint32_t>(v1) << 16);
       uint32_t b1 = static_cast<uint32_t>(v8) | (static_cast<uint32_t>(v9) << 16);
 
