@@ -65,7 +65,9 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   return true;
 }
 
-// Public surface — explicit instantiation switch.
+// Public surface — explicit instantiation switch over the PR-body bench grid.
+// MODEL1 only, page_block_size=64 only. NUM_HEADS ∈ {16, 32, 64, 128},
+// TOPK ∈ {128, 512, 1024}.
 bool launch_sparse_mla_decode_v3(ModelType mt, int num_heads, int topk,
                                  int page_block_size, int num_tokens,
                                  int num_splits, const bf16* Q,
@@ -74,13 +76,27 @@ bool launch_sparse_mla_decode_v3(ModelType mt, int num_heads, int topk,
                                  float* out_lse, const int* topk_length,
                                  float sm_scale, size_t stride_kv_block,
                                  cudaStream_t stream) {
-  // Minimal instantiation surface — MODEL1, h=128, topk=512, pbs=64 only.
-  if (mt == ModelType::MODEL1 && num_heads == 128 && topk == 512 &&
-      page_block_size == 64) {
-    return launch_decode_v3_impl<ModelType::MODEL1, 128, 512, 64>(
-        Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse,
-        num_tokens, num_splits, sm_scale, stride_kv_block, stream);
+  if (mt != ModelType::MODEL1 || page_block_size != 64) return false;
+#define V3_DISPATCH(H, K)                                              \
+  if (num_heads == (H) && topk == (K)) {                               \
+    return launch_decode_v3_impl<ModelType::MODEL1, (H), (K), 64>(     \
+        Q, KV_cache, indices, mid_out, mid_lse, topk_length, output,   \
+        out_lse, num_tokens, num_splits, sm_scale, stride_kv_block,    \
+        stream);                                                       \
   }
+  V3_DISPATCH(16, 128)
+  V3_DISPATCH(16, 512)
+  V3_DISPATCH(16, 1024)
+  V3_DISPATCH(32, 128)
+  V3_DISPATCH(32, 512)
+  V3_DISPATCH(32, 1024)
+  V3_DISPATCH(64, 128)
+  V3_DISPATCH(64, 512)
+  V3_DISPATCH(64, 1024)
+  V3_DISPATCH(128, 128)
+  V3_DISPATCH(128, 512)
+  V3_DISPATCH(128, 1024)
+#undef V3_DISPATCH
   return false;
 }
 
