@@ -50,7 +50,9 @@ constexpr int V3_ENTRIES_PER_WARP = V3_BI / V3_N_WARPS;            // 8
 constexpr int V3_QK_N_TILES = V3_ENTRIES_PER_WARP / 8;             // 1
 
 template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
-__global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kernel(
+// EXPERIMENT: drop minBlocksPerSM=1 hint to let ptxas pick a higher
+// regs/thread cap (we are already smem-bound at 1 block/SM regardless).
+__global__ void __launch_bounds__(V3_BLOCK_THREADS) sparse_mla_decode_v3_kernel(
     const bf16* __restrict__ Q,            // [num_tokens, num_heads, d_qk] bf16
     const uint8_t* __restrict__ KV_cache,  // FP8 paged (MODEL1 footer layout)
     const int32_t* __restrict__ indices,   // [num_tokens, topk] int32
