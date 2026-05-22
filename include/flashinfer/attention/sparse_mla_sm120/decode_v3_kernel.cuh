@@ -48,9 +48,10 @@ namespace flashinfer::sparse_mla_sm120 {
 
 constexpr int V3_BLOCK_THREADS = 128;
 constexpr int V3_N_WARPS = 4;
-constexpr int V3_CAND_WINDOW = 64;
+constexpr int V3_CAND_WINDOW = 128;
 constexpr int V3_BI = V3_CAND_WINDOW;
-constexpr int V3_ENTRIES_PER_WARP = V3_BI / V3_N_WARPS;  // 16
+constexpr int V3_ENTRIES_PER_WARP = V3_BI / V3_N_WARPS;     // 32
+constexpr int V3_QK_N_TILES = V3_ENTRIES_PER_WARP / 8;      // 4 (m16n8 N-tiles per warp)
 
 template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kernel(
@@ -229,10 +230,10 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   __syncthreads();
 
   // ── Stage 2: QK = Q @ K^T, sm_scale, then warp-level softmax ────
-  // Per warp processes V3_ENTRIES_PER_WARP=16 candidates × HPB=16 heads.
-  // Output per warp: 2 N-tiles of 8 cands each (total 16 cands), each tile
+  // Per warp processes V3_ENTRIES_PER_WARP candidates × HPB=16 heads.
+  // Output per warp: V3_QK_N_TILES N-tiles of 8 cands each, each tile
   // produces a 16×8 fragment distributed across 32 lanes as 4 floats / lane.
-  float qk[2][4] = {0};
+  float qk[V3_QK_N_TILES][4] = {0};
 
   // NoPE FP8 MMA: 14 k-iters at k=32, organized as 7 scale tiles × 2 k-iters
   // each (QUANT_TILE=64 = 2 × k=32). A operand from sm_q_fp8 (16 heads × 32
@@ -259,7 +260,7 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
         ldmatrix_load_A_fp8(a0, a1, a2, a3, sm_q_fp8 + ko, Q_NOPE_STRIDE, lane);
 
 #pragma unroll
-        for (int nt = 0; nt < 2; nt++) {
+        for (int nt = 0; nt < V3_QK_N_TILES; nt++) {
           const int cand_row_base = warp_first_cand + nt * 8;
           // sfb: K-side UE8M0 scale for this N-tile's 8 cands. ldmatrix_load_B_fp8
           // maps lane's row index to cand within tile via (lane & 7). The
@@ -294,7 +295,7 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
       uint32_t a0, a1, a2, a3;
       ldmatrix_load_A_bf16(a0, a1, a2, a3, sm_q_rope + ks * 16, D_ROPE_C, lane);
 #pragma unroll
-      for (int nt = 0; nt < 2; nt++) {
+      for (int nt = 0; nt < V3_QK_N_TILES; nt++) {
         const int cand_row_base = warp_first_cand + nt * 8;
         uint32_t b0, b1;
         ldmatrix_load_B_bf16(b0, b1,
@@ -314,7 +315,7 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   // apply sm_scale × LOG2E.
   const int warp_first_cand = warp_id * V3_ENTRIES_PER_WARP;
 #pragma unroll
-  for (int nt = 0; nt < 2; nt++) {
+  for (int nt = 0; nt < V3_QK_N_TILES; nt++) {
     const int c0 = warp_first_cand + nt * 8 + tid * 2;
     const int c1 = c0 + 1;
     if (c0 + split_cand_start >= split_cand_end) {
@@ -334,7 +335,7 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   // Per-head max across this warp's candidates.
   float local_max[2] = {-1e30f, -1e30f};
 #pragma unroll
-  for (int nt = 0; nt < 2; nt++) {
+  for (int nt = 0; nt < V3_QK_N_TILES; nt++) {
     local_max[0] = fmaxf(local_max[0], fmaxf(qk[nt][0], qk[nt][1]));
     local_max[1] = fmaxf(local_max[1], fmaxf(qk[nt][2], qk[nt][3]));
   }
@@ -345,9 +346,9 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
   }
 
   float local_sum[2] = {0.f, 0.f};
-  float p[2][4];
+  float p[V3_QK_N_TILES][4];
 #pragma unroll
-  for (int nt = 0; nt < 2; nt++) {
+  for (int nt = 0; nt < V3_QK_N_TILES; nt++) {
     p[nt][0] = exp2f(qk[nt][0] - local_max[0]);
     p[nt][1] = exp2f(qk[nt][1] - local_max[0]);
     p[nt][2] = exp2f(qk[nt][2] - local_max[1]);
@@ -405,7 +406,7 @@ __global__ void __launch_bounds__(V3_BLOCK_THREADS, 1) sparse_mla_decode_v3_kern
 
   const int cand_col_base = warp_id * V3_ENTRIES_PER_WARP;
 #pragma unroll
-  for (int nt = 0; nt < 2; nt++) {
+  for (int nt = 0; nt < V3_QK_N_TILES; nt++) {
     const int c0 = nt * 8 + tid * 2;
     const int c1 = c0 + 1;
     sm_p_full[gid][cand_col_base + c0] = __float2bfloat16(p[nt][0] * resc_h0);

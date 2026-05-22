@@ -31,17 +31,18 @@ static bool launch_decode_v3_impl(const bf16* Q, const uint8_t* KV_cache,
   constexpr int H_BLOCKS = NUM_HEADS / HPB;
 
   // Stage 1: decode-v3 partial-output kernel.
-  // Dynamic smem layout (matches kernel allocation; S1 FP8 path, MODEL1):
+  // Dynamic smem layout (matches kernel allocation; S2 FP8 path, MODEL1,
+  // V3_BI=128):
   //   sm_q_rope    HPB * D_ROPE * 2B            =   2 KB
   //   sm_q_fp8     HPB * Q_NOPE_STRIDE          = 7.25 KB
   //   sm_q_sc      HPB * NUM_SCALES * 4B        = 0.44 KB
-  //   sm_kv_fp8    V3_BI * KV_SMEM_STRIDE       = 29 KB
-  //   sm_kv_sc     V3_BI * SCALE_BYTES_PER_TOKEN = 0.5 KB
-  //   sm_kv_rope   V3_BI * D_ROPE * 2B          =   8 KB
+  //   sm_kv_fp8    V3_BI * KV_SMEM_STRIDE       =  58 KB (2x of S1)
+  //   sm_kv_sc     V3_BI * SCALE_BYTES_PER_TOKEN =  1 KB
+  //   sm_kv_rope   V3_BI * D_ROPE * 2B          =  16 KB (2x)
   //   sm_reduce    max(HPB*NUM_SCALES, 2*N_WARPS*HPB) f32 = 512 B
-  //   Total                                     ~ 48 KB
+  //   Total                                     ~ 85 KB
   // Static smem (kernel-side):
-  //   sm_p_full    HPB * V3_BI * 2B (bf16)      =   2 KB
+  //   sm_p_full    HPB * V3_BI * 2B (bf16)      =   4 KB
   constexpr int DYN_SMEM_BYTES =
       HPB * KV::D_ROPE * (int)sizeof(bf16)                              // sm_q_rope
       + HPB * KV::Q_NOPE_STRIDE                                          // sm_q_fp8
