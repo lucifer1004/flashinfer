@@ -54,9 +54,9 @@
 // Template params (all constexpr):
 //   MT:              ModelType (DSV3_2 / DSV4)
 //   CM:              ComputeMode (FP8 / BF16) — currently FP8 only
-//   NUM_HEADS:       16, 64, 128
+//   NUM_HEADS:       8, 16, 64, 128 (NUM_HEADS < HPB=16 zero-pads + gates)
 //   TOPK:            512, 1024, 2048
-//   PAGE_BLOCK_SIZE: 1 (DSV3_2) or 64 (DSV4)
+//   PAGE_BLOCK_SIZE: 64 (DSV3_2 and DSV4 both use the 64-token page layout)
 // ============================================================================
 
 struct PrefillColdParams {
@@ -89,8 +89,14 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
   using IO = KVIOTraits<MT>;
 
   static constexpr int NI = TOPK / BI;
-  static constexpr int REPLICATE_H = NUM_HEADS / HPB;
+  // Ceil-div so NUM_HEADS < HPB (small-TP shards) still launches 1 CTA per token.
+  static constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
   static constexpr int QK_NOPE_KSTEPS = KV::QUANT_TILE / 32;
+  // Mirrors the decode-V2 pattern: smem layout always allocates HPB heads
+  // (zero-padded for invalid slots); Q load and the BF16 output / LSE
+  // write-back are gated by VALID_HPB so we don't read/write past the
+  // caller's [num_tokens, NUM_HEADS, ...] buffers.
+  constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
 
   const int s_i = blockIdx.x / REPLICATE_H;
   const int h_tile = blockIdx.x % REPLICATE_H;
@@ -153,7 +159,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     const int32_t* idx_base = indices + (size_t)s_i * TOPK;
 
     quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
-                                         sm.reduce_buf);
+                                         sm.reduce_buf, VALID_HPB);
     QRopeRegs q_rope_regs = preload_q_rope_regs(sm.q_rope, lane);
 
     for (int h = threadIdx.x; h < HPB; h += MATH_THREADS) sm.m_smem[h] = -1e30f;
@@ -476,7 +482,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       const size_t out_base = (size_t)s_i * token_stride + (size_t)h_start * h_stride;
       constexpr int BF16_PER_STORE = 8;
       constexpr int STORES_PER_HEAD = D_V / BF16_PER_STORE;  // 64
-      for (int idx = threadIdx.x; idx < HPB * STORES_PER_HEAD; idx += MATH_THREADS) {
+      for (int idx = threadIdx.x; idx < VALID_HPB * STORES_PER_HEAD; idx += MATH_THREADS) {
         int h = idx / STORES_PER_HEAD;
         int d8 = (idx - h * STORES_PER_HEAD) * BF16_PER_STORE;
         uint4 v = *reinterpret_cast<const uint4*>(&staging_bf16[h * BF16_STAGING_STRIDE + d8]);
@@ -485,7 +491,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     }
 
     // Write LSE (merged with attn_sink if present)
-    if (threadIdx.x < HPB) {
+    if (threadIdx.x < VALID_HPB) {
       int h = threadIdx.x;
       float lse = softmax_lse(sm.m_smem[h], sm.l_smem[h]);
       if (cold.attn_sink != nullptr) {

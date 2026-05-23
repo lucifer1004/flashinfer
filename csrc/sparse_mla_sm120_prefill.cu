@@ -52,7 +52,8 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
                        int num_tokens, size_t stride_kv_block, const int* topk_length_ptr,
                        cudaStream_t stream) {
   constexpr size_t smem_bytes = SmemLayout<MT, CM>::TOTAL;
-  constexpr int REPLICATE_H = NUM_HEADS / HPB;
+  // Ceil-div: NUM_HEADS < HPB (e.g. 8 on TP=8 GLM-5.1) still gets 1 CTA per token.
+  constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
   dim3 grid(num_tokens * REPLICATE_H);
   dim3 block(BLOCK_THREADS);
 
@@ -126,16 +127,27 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
                          const int* topk_length_ptr, cudaStream_t stream) {
   if (topk != 2048) return false;
 
+  // PBS=64 matches the V32 decode (`decode_dsv3_2_kernel.cuh`) and the
+  // vLLM SPARSE_MLA_SM120 backend, both of which standardize on the
+  // 64-token page layout. NH=8 covers small-TP shards (GLM-5.1 TP=8 has
+  // 64/8 = 8 heads/rank); the SG kernel zero-pads invalid head slots up
+  // to HPB=16 internally and gates write-back by VALID_HPB.
   if (num_heads <= HPB) {
+    if (num_heads == 8) {
+      launch_prefill_sg<ModelType::DSV3_2, ComputeMode::FP8, 8, 2048, 64>(
+          Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
+          topk_length_ptr, stream);
+      return true;
+    }
     if (num_heads != 16) return false;
-    launch_prefill_sg<ModelType::DSV3_2, ComputeMode::FP8, 16, 2048, 1>(
+    launch_prefill_sg<ModelType::DSV3_2, ComputeMode::FP8, 16, 2048, 64>(
         Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
         topk_length_ptr, stream);
     return true;
   }
 
-#define DISPATCH_DSV3_2_MG(NH)                                                                        \
-  launch_prefill_mg<ModelType::DSV3_2, ComputeMode::FP8, NH, 2048, 1>(                                \
+#define DISPATCH_DSV3_2_MG(NH)                                                                       \
+  launch_prefill_mg<ModelType::DSV3_2, ComputeMode::FP8, NH, 2048, 64>(                              \
       Q, KV, indices, /*KV_extra=*/nullptr, /*idx_extra=*/nullptr, attn_sink, output, out_lse,     \
       sm_scale, num_tokens, stride_kv_block, /*stride_kv_block_extra=*/(size_t)0, topk_length_ptr, \
       /*topk_length_extra=*/nullptr, stream)
