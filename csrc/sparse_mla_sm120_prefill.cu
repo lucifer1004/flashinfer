@@ -178,12 +178,15 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
                          /*stride_kv_block_extra=*/(size_t)0, topk_length_ptr,                   \
                          /*topk_length_extra=*/nullptr, stream)
 
-// NH=16 routes through MG with MG_N_HG_T=1 (HEADS_PER_CTA=16, identical
-// shape to SG) rather than the SG kernel. The SG-BF16-QK path has a
-// pre-existing race (smem hazard at multi-wave NH=16 launches; same
-// pattern in upstream's BF16_QK SG); MG-BF16 is racecheck-clean.
-// This mirrors the dual-cache dispatcher which already routes NH=16
-// through MG with NHG=1.
+// NH=16 routes through MG with MG_N_HG_T=1 (HEADS_PER_CTA=16, same shape
+// as SG) to side-step a SG-BF16-QK smem hazard at multi-wave launches:
+// q_nope_bf16 unions with w_fp8, so the next iter's BF16 Q-load races the
+// current iter's w_fp8 ldmatrix across warps. MG-BF16 is racecheck-clean
+// because it uses separate smem regions.
+// TODO(sparse-mla-sm120): fix the SG-BF16-QK race (e.g. break the
+// q_nope_bf16 / w_fp8 union or add a per-iter barrier) and drop the NH=16
+// MG fallback so SG can serve all NH ≤ HPB shapes without the smem-waste
+// MG_N_HG_T=1 layout incurs.
 #define DISPATCH_BY_NH_CM(CM, TK)       \
   do {                                  \
     switch (num_heads) {                \
@@ -229,8 +232,7 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
                                int num_tokens, size_t stride_kv_block, size_t stride_kv_block_extra,
                                const int* topk_length_ptr, const int* topk_length_extra_ptr,
                                cudaStream_t stream) {
-// NH=16 dispatches through MG with MG_N_HG_T=1 so callers can pad TP=4/TP=8
-// without falling into SG (SG has no dual-cache support).
+// NH=16 uses MG_N_HG_T=1 (HEADS_PER_CTA=16); SG has no dual-cache support.
 #define DISPATCH_DUAL_MG_CM(CM, NH, TK, TK_EX, PBSX, NHG)                                    \
   launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, TK_EX, PBSX, NHG>(         \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, \
@@ -296,13 +298,9 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
 
 }  // namespace
 
-// Public dispatcher. Returns false if no template variant matches
-// (model_type, num_heads, topk, [extra_*]). Caller raises with the
-// supported envelope.
-//
-// Dual-cache mode is triggered iff extra_KV_cache != nullptr.
-// Dual-cache is DSV4-only; passing extra_KV_cache != nullptr with mt=DSV3_2
-// returns false.
+// Public dispatcher. Returns false if no template variant matches; caller
+// is responsible for surfacing the supported envelope.
+// Dual-cache (extra_KV_cache != nullptr) is DSV4-only.
 bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page_block_size,
                                  int topk_extra, int extra_page_block_size, const bf16* Q,
                                  const uint8_t* KV_cache, const int32_t* indices,

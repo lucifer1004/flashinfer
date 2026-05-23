@@ -77,13 +77,9 @@ _BI = 64  # KV partition tile size in candidates (BLOCK_SIZE_N)
 # prefill orchestrator; otherwise to the standalone decode kernels.
 _DECODE_MAX_TOKENS = 64
 
-# decode-dsv4 supports a fixed (num_heads, topk) dispatch table. Outside of
-# this set the orchestrator falls back to decode-dsv3_2 / prefill. DSV4 only.
-#
-# num_heads=8 is the small-TP corner case (e.g. TP=16 on 128 KV heads): the
-# kernel internally pads the head tile to HPB=16 with zero-Q rows and guards
-# mid_out / mid_lse writes to NUM_HEADS, so only the 8 valid heads land in
-# the output.
+# decode-dsv4 instantiation set. Shapes outside this table fall through to
+# decode-dsv3_2 / prefill. NH=8 is the small-TP corner case; the kernel pads
+# the head tile to HPB=16 with zero-Q rows and gates writes by NUM_HEADS.
 _DECODE_DSV4_DISPATCH = frozenset(
     {
         (8, 128),
@@ -104,13 +100,11 @@ _DECODE_DSV4_DISPATCH = frozenset(
     }
 )
 _DECODE_DSV4_PAGE_BLOCK_SIZE = 64
-# Mirrors DSV4_MAX_SPLITS in include/.../decode_dsv4_kernel.cuh — the merge
-# kernel's sm_lse smem is statically sized to this. Callers must keep
-# main_splits + extra_splits below the bound.
+# Mirrors DSV4_MAX_SPLITS in include/.../decode_dsv4_kernel.cuh; the merge
+# kernel's sm_lse smem is statically sized to this bound.
 _DECODE_DSV4_MAX_SPLITS = 32
 
-# decode-dsv3_2 (V32 family, V4-style warp-spec): num_heads ∈ {8,16,32,
-# 64,128} × topk ∈ {128, 512, 1024, 2048}.
+# decode-dsv3_2 instantiation set.
 _DECODE_DSV3_2_DISPATCH = frozenset(
     {
         (8, 128),
@@ -158,13 +152,11 @@ def _decode_dsv4_dispatchable(
     page_block_size: int,
     extra_topk: int = 0,
 ) -> bool:
-    """Return True iff decode-dsv4 supports this shape configuration.
+    """True iff decode-dsv4 supports this shape configuration.
 
-    decode-dsv4 is DSv4-only (d_qk=512) with a fixed (num_heads, topk)
-    instantiation set and PAGE_BLOCK_SIZE=64. The merge kernel's per-split
-    LSE smem caps total num_splits at _DECODE_DSV4_MAX_SPLITS; if the dual-
-    cache sum (main_splits + extra_splits) would exceed that bound, fall
-    through to prefill instead of dispatching.
+    The merge kernel's per-split LSE smem caps total num_splits at
+    _DECODE_DSV4_MAX_SPLITS; if the dual-cache sum exceeds that, fall through
+    to prefill rather than dispatching.
     """
     num_splits = (topk + _BI - 1) // _BI + (extra_topk + _BI - 1) // _BI
     return (
@@ -202,16 +194,12 @@ def get_sparse_mla_sm120_module():
         num_tokens, num_heads, d_qk = q.shape
         topk = indices.shape[-1]
 
-        # decode-dsv4 fast path. Only dispatch when the (num_heads, topk) pair
-        # is in DSv4's instantiation set and the model matches DSv4's layout;
-        # otherwise fall through to decode-dsv3_2 / prefill.
         # kv_cache layout: [num_blocks, page_block_size, 1, bytes_per_token].
         kv_pbs = int(kv_cache.size(-3)) if kv_cache.ndim >= 3 else 0
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
         if kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE and _decode_dsv4_dispatchable(
             num_tokens, num_heads, topk, d_qk, kv_pbs, extra_topk
         ):
-            # mid_out / mid_lse scratch is small enough to allocate per call.
             num_splits_main = (topk + _BI - 1) // _BI
             num_splits_extra = (extra_topk + _BI - 1) // _BI
             num_splits = num_splits_main + num_splits_extra
@@ -225,9 +213,9 @@ def get_sparse_mla_sm120_module():
                 dtype=torch.float32,
                 device=q.device,
             )
-            # Pass kv_cache as-is — both 4D paged layouts (with possibly
-            # padded block stride) and 2D microbench layouts are supported;
-            # the FFI binding extracts the true block stride from .stride(0).
+            # FFI binding extracts the true block stride from kv_cache.stride(0),
+            # so paged layouts with padded strides and microbench 2-D layouts
+            # both work.
             sparse_mla_sm120_decode_dsv4(
                 q,
                 kv_cache,
@@ -245,8 +233,6 @@ def get_sparse_mla_sm120_module():
             )
             return
 
-        # decode-dsv3_2 fast path. V32 family (d_qk=576), V4-style warp-spec
-        # standalone kernel — the V32 decode path.
         if _decode_dsv3_2_dispatchable(num_tokens, num_heads, topk, d_qk, kv_pbs):
             num_splits = (topk + _BI - 1) // _BI
             mid_out = torch.empty(
@@ -275,9 +261,6 @@ def get_sparse_mla_sm120_module():
             )
             return
 
-        # Prefill fallback path (num_tokens > 64, or outside decode dispatch
-        # envelope). Orchestrator routes to the prefill kernel; both
-        # output / out_lse are written in place.
         module.sparse_mla_sm120_paged_attention(
             q,
             kv_cache,
@@ -436,9 +419,8 @@ class BatchSparseMLAPagedAttentionWrapper:
             device=self._device,
         )
 
-    # Trace fires on the inner sparse_mla_sm120_paged_attention call; no
-    # separate trace template here because wrapper.run owns out_lse internally
-    # and doesn't accept it as a parameter.
+    # Trace fires on the inner sparse_mla_sm120_paged_attention call;
+    # wrapper.run owns out_lse internally so no separate template is needed.
     @flashinfer_api
     def run(
         self,
@@ -507,22 +489,17 @@ class BatchSparseMLAPagedAttentionWrapper:
         return out_lse_view if return_lse else None
 
 
-# Decode-DSv4: AutoTuner-driven chunks_per_block tuning.
-# decode-dsv4 is the split-K decode kernel where each block handles
-# `chunks_per_block` chunks of `_BI`=64 candidates each. The wall-time-optimal
-# `cpb` is non-monotonic in (num_tokens, num_heads, topk) and not well captured
-# by a closed-form heuristic; expose it as a TunableRunner tactic and let
-# AutoTuner cache the best value per (T_bucket, num_heads, topk).
+# Decode-DSv4: AutoTuner-driven chunks_per_block tuning. Optimal cpb is
+# non-monotonic in (num_tokens, num_heads, topk), so expose it as a tactic
+# and let AutoTuner cache the best value per (T_bucket, num_heads, topk).
 
 
 @functools.cache
 def _get_sparse_mla_decode_dsv4_module():
-    """Build + cache the decode-dsv4 module and its TunableRunner class."""
     module = gen_sparse_mla_sm120_module().build_and_load()
 
     class SparseMlaDecodeV3Runner(TunableRunner):
-        """One runner per (kernel module). Tactic = chunks_per_block ∈
-        [1, num_splits]. tactic=-1 (or 0) falls back to the C++ heuristic."""
+        """Tactic = chunks_per_block ∈ [1, num_splits]; ≤0 → C++ heuristic."""
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             topk_length = inputs[6] if len(inputs) > 6 else None
@@ -574,11 +551,8 @@ def _get_sparse_mla_decode_dsv4_module():
                 extra_indices = kwargs.get("extra_indices")
                 extra_topk_length = kwargs.get("extra_topk_length")
             topk = indices.shape[-1]  # 2D [T, topk] or 3D [T, 1, topk]
-            # num_splits covers main + extra chunks; mid_out is sized for the
-            # combined total by the caller so both sections fit.
             extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
             num_splits = (topk + _BI - 1) // _BI + (extra_topk + _BI - 1) // _BI
-            # tactic > 0 → use that cpb; tactic == -1 → fall back to the C++ heuristic.
             cpb_override = tactic if tactic > 0 else -1
             module.sparse_mla_sm120_decode_dsv4(
                 q,
@@ -636,17 +610,14 @@ def _decode_dsv4_init_indices(shapes, dtype, device):
 
 def _decode_dsv4_init_topk_length(shapes, dtype, device):
     """Placeholder full-active topk_length; clamped to indices.shape[-1] by
-    _decode_dsv4_inputs_pre_hook before profiling. A large sentinel would let
-    the kernel index past the real indices tensor (OOB) when chunks_per_block>1.
+    the pre-hook before profiling so the kernel never indexes past indices.
     """
     return torch.full(shapes, 1 << 30, dtype=dtype, device=device)
 
 
 def _decode_dsv4_inputs_pre_hook(inputs):
-    """Clamp synthetic topk_length / extra_topk_length to the paired
-    indices.shape[-1]. Initializers see only their own tensor shape, so this
-    runs after synthesis and pairs (indices, topk_length) /
-    (extra_indices, extra_topk_length) before the per-tactic profile loop.
+    """Pair (indices, topk_length) and (extra_indices, extra_topk_length)
+    after per-tensor synthesis: clamp lengths to their paired indices' top-k.
     """
     inputs = list(inputs)
     indices = inputs[1] if len(inputs) > 1 else None
@@ -662,12 +633,6 @@ def _decode_dsv4_inputs_pre_hook(inputs):
 
 @functools.cache
 def _decode_dsv4_tuning_config() -> TuningConfig:
-    """Build + cache the static TuningConfig once per process.
-
-    Avoids dataclass instantiation + Spec construction on every call into
-    sparse_mla_sm120_decode_dsv4 — the config is shape-independent (depends
-    only on tactic semantics + bucket scheme).
-    """
     return TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
@@ -700,8 +665,6 @@ def _decode_dsv4_tuning_config() -> TuningConfig:
 
 @functools.cache
 def _decode_dsv4_runner_singleton():
-    """Cache one runner instance per process — avoids re-instantiating on
-    every call. The runner is stateless modulo `_module`."""
     return _get_sparse_mla_decode_dsv4_module().runner_cls()
 
 
@@ -886,10 +849,8 @@ def sparse_mla_sm120_decode_dsv4(
         )
         return output
 
-    # Hot-cache fast path: tactic is fully determined by (T_bucket, num_heads,
-    # topk), so skip AutoTuner.choose_one entirely once a shape is resolved.
-    # Only fires outside an active tuning session; tuning mode always routes
-    # through choose_one so the autotuner gets the data it needs.
+    # Hot-cache fast path: skip AutoTuner.choose_one once a shape is resolved.
+    # Tuning sessions always route through choose_one to collect data.
     tuner = AutoTuner.get()
     if not tuner.is_tuning_mode:
         T_bucket = _decode_dsv4_map_to_token_bucket(q.shape[0])
@@ -914,8 +875,7 @@ def sparse_mla_sm120_decode_dsv4(
             )
             return output
 
-    # Cold path (first call on this shape OR active tuning session). Lazy-load
-    # the persistent disk cache once per process, then resolve via AutoTuner.
+    # Cold path: lazy-load the disk cache once, then resolve via AutoTuner.
     _decode_dsv4_maybe_load_cache()
     chosen, tactic = tuner.choose_one(
         "sparse_mla_sm120_decode_dsv4",
@@ -924,8 +884,8 @@ def sparse_mla_sm120_decode_dsv4(
         inputs,
         **forward_kwargs,
     )
-    # Only cache positive tactics; tactic=-1 means "no tuning data, fall back
-    # to the C++ heuristic" and caching it would shadow a later disk reload.
+    # Don't cache tactic=-1 (C++ heuristic fallback) so a later disk reload
+    # can still take effect.
     if int(tactic) > 0:
         T_bucket = _decode_dsv4_map_to_token_bucket(q.shape[0])
         extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0

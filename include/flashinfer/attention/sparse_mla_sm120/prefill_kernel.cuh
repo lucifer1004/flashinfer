@@ -549,35 +549,23 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 }
 
 // ============================================================================
-// Multi-Group (MG) Prefill Kernel — 2 head groups per CTA
+// Multi-Group (MG) Prefill Kernel — 1 or 2 head groups per CTA
 //
-// Processes 2×HPB = 32 heads per CTA. KV loaded once, reused for both groups.
-// Key optimizations over SG:
-//   - 2x KV reuse (V transpose shared, smem KV shared)
-//   - Deferred row_sum (warp_l_partial in registers, reduce once at end)
-//   - Better compute/load ratio → higher MMA utilization
-//
-// Used for NUM_HEADS >= HPB. With MG_N_HG_T template:
-//   MG_N_HG_T=1 (HEADS_PER_CTA=16) → NUM_HEADS=16 dual-cache (replaces SG@16
-//                                    for swa+dual_cache layers where SG is
-//                                    single-cache only)
-//   MG_N_HG_T=2 (HEADS_PER_CTA=32) → NUM_HEADS in {32,64,128} (legacy path)
-// Single-cache NUM_HEADS=16 still uses the SG kernel above (no change).
+// MG_N_HG_T = 2 (HEADS_PER_CTA=32): NUM_HEADS in {32,64,128}, KV reused across
+//             both groups (2× reuse, deferred row_sum, higher MMA utilization).
+// MG_N_HG_T = 1 (HEADS_PER_CTA=16): NUM_HEADS=16, used wherever SG cannot
+//             apply (e.g. dual-cache, which SG doesn't support).
 // ============================================================================
 
-// Default MG_N_HG used by the SmemLayoutMG / SmemPtrsMG types (which are
-// shared across MG_N_HG_T=1 and MG_N_HG_T=2 — see the comment in the kernel
-// body). The non-default instantiation just wastes a bit of unused smem.
+// SmemLayoutMG / SmemPtrsMG are parameterised on the default MG_N_HG=2 layout;
+// MG_N_HG_T=1 instantiations reuse them and waste ~half the MG smem to avoid a
+// full retemplate (q_nope/q_sc/m_smem/l_smem/reduce_buf/w_smem).
 static constexpr int MG_N_HG_DEFAULT = 2;
 static constexpr int MG_HEADS_PER_CTA_DEFAULT = MG_N_HG_DEFAULT * HPB;  // 32
 
-// Dual-cache MG prefill (Design A: phase-within-block, online softmax persists
-// across phases). When TOPK_EXTRA == 0 the extra-phase branches dead-code-
-// elide and behavior is bit-identical to the prior single-cache kernel.
-// When TOPK_EXTRA > 0 the outer loop iterates over NI = TOPK/BI tiles from
-// KV_cache followed by NI_EXTRA = TOPK_EXTRA/BI tiles from KV_cache_extra,
-// sharing one set of online-softmax accumulators so the softmax denominator
-// is computed over the union of indices.
+// When TOPK_EXTRA > 0, the outer loop iterates over NI = TOPK/BI main tiles
+// followed by NI_EXTRA = TOPK_EXTRA/BI extra-cache tiles, sharing the same
+// online-softmax accumulators so the denominator covers the union of indices.
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
           int TOPK_EXTRA = 0, int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE,
           int MG_N_HG_T = MG_N_HG_DEFAULT>
@@ -589,13 +577,6 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1) sparse_mla_prefill_mg_kernel
     bf16* __restrict__ output, float* __restrict__ out_lse,
     const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
     __grid_constant__ const PrefillColdParams cold) {
-  // Per-instantiation MG_N_HG / MG_HEADS_PER_CTA. With MG_N_HG_T=1 the
-  // kernel processes one head group per CTA (HEADS_PER_CTA=16). The
-  // SmemLayoutMG / SmemPtrsMG types are still parameterised on the default
-  // N_HG=2 layout, so the MG_N_HG_T=1 instantiation wastes ~half the MG
-  // smem (one unused q_nope/q_sc slot + half of m_smem/l_smem/reduce_buf/
-  // w_smem) but it keeps the per-group loop `for (g = 0; g < MG_N_HG; ++g)`
-  // unchanged (g=0 only) and avoids a full SmemLayoutMG retemplate.
   constexpr int MG_N_HG = MG_N_HG_T;
   constexpr int MG_HEADS_PER_CTA = MG_N_HG_T * HPB;
 
@@ -668,18 +649,11 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1) sparse_mla_prefill_mg_kernel
       return indices_extra + (size_t)s_i * TOPK_EXTRA + (ti - NI) * BI;
     };
 
-    // Prologue: gather tile 0 (always main cache; idx_base + 0 == ptr).
-    // Scales first: io_gather_scales is synchronous (plain stores), no
-    // mbar signal. The math warps wake up on mbar_kv (signaled by the
-    // bulk gather's cp.async.bulk completion). If scales were gathered
-    // AFTER the bulk gather, the bulk could complete while scales are
-    // still in flight, and math would read partial / stale scales.
-    // Ordering scales-then-bulk + threadfence_block ensures scales are
-    // visible before bulk-completion (and thus before math wake-up).
-    // The MG_N_HG_T=1 dispatch (NUM_HEADS=16) has half the math work per
-    // iter, which narrows the natural race window and exposes the bug —
-    // caught by compute-sanitizer racecheck (write @ kv_cache_io.cuh:99
-    // vs read @ prefill_kernel.cuh:775).
+    // Prologue: gather tile 0. Scales first (plain stores, no mbar signal),
+    // then bulk gather (cp.async.bulk signals mbar_kv on completion). Math
+    // warps wake on mbar_kv, so reversing the order would race scales vs
+    // math reads. threadfence_block ensures scale stores are visible to all
+    // threads before the bulk completion event.
     io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid,
                                           stride_kv_block);
     __threadfence_block();
@@ -1124,13 +1098,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1) sparse_mla_prefill_mg_kernel
               acc_o[g][ti_acc][3] += xv[3] * sc1;
             }
           }
-          // Barrier guards vc=k's ldmatrix reads against vc=k+1's
-          // FP8-weight writes to the SAME w_fp8 region. With
-          // MG_N_HG_T=1 the per-vc read window is half the work
-          // (one group instead of two), narrowing the natural
-          // timing gap and exposing the race that the bar at the
-          // end of the loop alone doesn't cover. Caught by
-          // compute-sanitizer racecheck against ldmatrix.x4.
+          // Per-vc barrier: guards vc=k's ldmatrix reads against vc=k+1's
+          // FP8-weight writes to the same w_fp8 region. The end-of-loop
+          // barrier alone is insufficient when MG_N_HG_T=1 shrinks the
+          // natural timing gap between groups.
           bar_sync_t<2, MATH_THREADS>();
         }
       }

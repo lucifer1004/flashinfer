@@ -28,15 +28,14 @@
 
 """Microbenchmark for sparse-MLA paged attention on SM120.
 
-Sweeps representative shapes for both decode kernels:
+Sweeps representative shapes:
 
-* DSv4   (d_qk=512, page_block_size=64, 584 B/token) — decode-dsv4 path
-* DSv3.2 (d_qk=576, page_block_size=1,  656 B/token) — decode-dsv3_2 path
+* DSv4   (d_qk=512, page_block_size=64, 584 B/token)
+* DSv3.2 (d_qk=576, page_block_size=64, 656 B/token)
 
-Reports median latency, KV-cache memory bandwidth, and analytical attention
-FLOPs. The wrapper auto-dispatches on (model, num_heads, topk, num_tokens).
-
-Requires sm120a / sm121a.
+The KV pool is sized ≫ L2 so the analytical KV bandwidth reflects DRAM-bound
+production prefill. Reports median latency, KV bandwidth, and analytical
+attention TFLOPs. Requires sm120a / sm121a.
 """
 
 import numpy as np
@@ -47,7 +46,7 @@ from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import is_sm120a_supported
 
 
-# ── FP8 FOOTER pack (DSV4) — ported from tests/attention/test_sparse_mla_sm120.py ──
+# ── FP8 FOOTER pack (DSV4) ───────────────────────────────────────────────────
 
 
 def _cast_scale_inv_to_ue8m0(scales_inv: torch.Tensor) -> torch.Tensor:
@@ -95,7 +94,7 @@ def quantize_kv_model1(kv_bf16: torch.Tensor) -> torch.Tensor:
 
 
 def quantize_kv_dsv3_2(kv_bf16: torch.Tensor) -> torch.Tensor:
-    """Pack bf16 KV (nb, 1, 1, 576) into DSv3.2 FP8 INLINE format (656 B/token).
+    """Pack bf16 KV (nb, pbs, 1, 576) into DSv3.2 FP8 INLINE format (656 B/token).
 
     Per-token layout: [0:512) FP8 nope (4×128 tile), [512:528) 4×FP32
     power-of-2 scale, [528:656) BF16 rope (64 elems).
@@ -104,22 +103,22 @@ def quantize_kv_dsv3_2(kv_bf16: torch.Tensor) -> torch.Tensor:
     scale_bytes = num_tiles * 4
     bpt = d_nope + scale_bytes + d_rope * 2  # 656
     nb, bs, hk, d = kv_bf16.shape
-    assert d == d_nope + d_rope and hk == 1 and bs == 1
-    kv = kv_bf16.squeeze(2).squeeze(1)
+    assert d == d_nope + d_rope and hk == 1
+    kv = kv_bf16.squeeze(2)  # (nb, bs, 576)
 
-    result = torch.zeros(nb, bpt, dtype=torch.uint8, device=kv.device)
+    result = torch.zeros(nb, bs, bpt, dtype=torch.uint8, device=kv.device)
     for ti in range(num_tiles):
-        tile = kv[:, ti * tile_size : (ti + 1) * tile_size].float()
+        tile = kv[:, :, ti * tile_size : (ti + 1) * tile_size].float()
         amax = tile.abs().amax(dim=-1).clamp(min=1e-4)
         scale = _cast_scale_inv_to_ue8m0(amax / 448.0)
         fp8 = (tile / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
-        result[:, ti * tile_size : (ti + 1) * tile_size] = fp8.view(torch.uint8)
-        result[:, d_nope + ti * 4 : d_nope + (ti + 1) * 4] = (
-            scale.view(torch.float32).view(torch.uint8).view(nb, 4)
+        result[:, :, ti * tile_size : (ti + 1) * tile_size] = fp8.view(torch.uint8)
+        result[:, :, d_nope + ti * 4 : d_nope + (ti + 1) * 4] = (
+            scale.view(torch.float32).view(torch.uint8).view(nb, bs, 4)
         )
-    rope = kv[:, d_nope:].to(torch.bfloat16).contiguous().view(torch.uint8)
-    result[:, d_nope + scale_bytes :] = rope.view(nb, d_rope * 2)
-    return result.view(nb, 1, 1, bpt)
+    rope = kv[:, :, d_nope:].to(torch.bfloat16).contiguous().view(torch.uint8)
+    result[:, :, d_nope + scale_bytes :] = rope.view(nb, bs, d_rope * 2)
+    return result.view(nb, bs, 1, bpt)
 
 
 # ── Benchmark one config ─────────────────────────────────────────────────────
@@ -131,10 +130,10 @@ def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0)
     device = torch.device("cuda")
     d_qk, d_v = 512, 512
     page_block_size = 64
-    # Size kv-cache so that topk valid slot ids fit comfortably; 1024 blocks ×
-    # 64 page_block_size = 64K-token pool, large enough for any topk we sweep.
-    num_blocks = 1024
-    s_kv = num_blocks * page_block_size  # = 65536
+    # Pool ≫ L2 (~96 MB on SM120) so random topk indices land in DRAM, mirroring
+    # production prefill (multi-GB KV cache). 16384 × 64 × 584 B ≈ 612 MB.
+    num_blocks = 16384
+    s_kv = num_blocks * page_block_size  # = 1 M slots
 
     kv_bf16 = (
         torch.randn(
@@ -188,21 +187,19 @@ def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0)
 
 
 def bench_sparse_mla_sm120_dsv3_2(num_heads, num_tokens, with_sink=False, seed=0):
-    """Returns (median_us, kv_bw_gbps, attn_tflops) for DSv3.2 decode-dsv3_2.
+    """Returns (median_us, kv_bw_gbps, attn_tflops) for DSv3.2.
 
-    Fixed: topk=2048, page_block_size=64, d_qk=576, d_v=512.
-
-    page_block_size matches _DECODE_DSV3_2_PAGE_BLOCK_SIZE in
-    flashinfer/sparse_mla_sm120.py — the wrapper's decode dispatch only
-    activates at pbs=64, anything else falls through to prefill, which
-    rejects num_tokens <= 64.
+    Fixed: topk=2048, page_block_size=64 (= _DECODE_DSV3_2_PAGE_BLOCK_SIZE),
+    d_qk=576, d_v=512.
     """
     torch.manual_seed(seed)
     device = torch.device("cuda")
     d_qk, d_v = 576, 512
     topk = 2048
     page_block_size = 64
-    num_blocks = max(64, (topk + page_block_size - 1) // page_block_size * 2)
+    # Pool ≫ L2 (~96 MB on SM120) so random topk indices land in DRAM, mirroring
+    # production prefill (multi-GB KV cache). 16384 × 64 × 656 B ≈ 688 MB.
+    num_blocks = 16384
     s_kv = num_blocks * page_block_size
 
     kv_bf16 = (
@@ -257,14 +254,8 @@ if __name__ == "__main__":
     if not is_sm120a_supported(torch.device("cuda")):
         raise SystemExit("Sparse-MLA SM120 requires sm120a.")
 
-    # Representative DSv4 shapes. (num_heads, topk, num_tokens):
-    #   topk=128  → SWA window
-    #   topk=512  → indexer top-k
-    #   topk=1024 → larger-window MTP
-    #
-    # Decode path (num_tokens ≤ 64) covers single-stream + small-batch
-    # decode. Prefill path (num_tokens > 64) covers typical chunked-prefill
-    # chunk sizes.
+    # (num_heads, topk, num_tokens). topk: 128 = SWA window, 512 = indexer,
+    # 1024 = larger-window MTP. T ≤ 64 hits decode; T > 64 hits prefill.
     decode_configs = [
         (16, 128, 1),
         (16, 128, 16),

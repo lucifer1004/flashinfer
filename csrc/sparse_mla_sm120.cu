@@ -63,11 +63,9 @@ inline ModelType infer_model_type(int d_qk) {
   return ModelType::DSV4;
 }
 
-// Convert padded-block KV strides to a per-row override matching the kernel's
-// `page_block_size * stride_kv_row` block stride. When the caller pads block
-// stride for alignment, the natural per-token stride times page_block_size
-// doesn't equal the actual block-to-block stride; encode the padding via this
-// row override. Mirrors the upstream `effective_stride_kv_row` helper.
+// When the caller pads block stride for alignment, the natural per-token
+// stride × page_block_size differs from the actual block-to-block stride.
+// Encode the padding via this per-row override (= block_stride / pbs).
 inline int effective_stride_kv_row(const TensorView& kv) {
   const int natural_row_bytes = static_cast<int>(kv.stride(-2) * (kv.dtype().bits / 8));
   const int block_stride_bytes = static_cast<int>(kv.stride(0) * (kv.dtype().bits / 8));
@@ -98,9 +96,7 @@ void SparseMlaSm120PagedAttention(
 {
   // ── Input validation ───────────────────────────────────────────────
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
-  // kv_cache: CUDA + last-dim contiguous only. The block stride may be
-  // padded for alignment; the kernel handles that via
-  // `effective_stride_kv_row` below.
+  // kv_cache: CUDA + last-dim contiguous only; padded block stride is OK.
   CHECK_CUDA(kv_cache);
   CHECK_LAST_DIM_CONTIGUOUS(kv_cache);
   CHECK_INPUT_AND_TYPE(indices, dl_int32);

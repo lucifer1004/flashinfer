@@ -47,9 +47,6 @@
 // B operand: V rope bf16, loaded from global memory (L2 cached), scalar packing.
 // C output:  c0=C[gid][tid*2], c1=C[gid][tid*2+1],
 //            c2=C[gid+8][tid*2], c3=C[gid+8][tid*2+1]
-//
-// Replaces xv_rope_scalar which had a coverage bug (gid-d_base coupling,
-// each head got only 8/64 rope dims). Verified by micro benchmark M7.
 
 template <ModelType MT, int PAGE_BLOCK_SIZE>
 __device__ __forceinline__ void xv_rope_mma(float acc_rope[4], float w0, float w1, float w2,

@@ -46,9 +46,8 @@ constexpr int DSV4_MAX_SPLITS = 32;
 constexpr int DSV4_ENTRIES_PER_WARP = DSV4_BI / DSV4_N_WARPS;  // 8
 constexpr int DSV4_QK_N_TILES = DSV4_ENTRIES_PER_WARP / 8;     // 1
 
-// No minBlocksPerSM hint on launch_bounds: the kernel is smem-bound at
-// 1 block/SM regardless, and the unconstrained ptxas register budget
-// avoids the per-warp spill the hint would otherwise force.
+// No minBlocksPerSM on launch_bounds: kernel is smem-bound at 1 block/SM, and
+// the unconstrained register budget avoids the per-warp spill the hint forces.
 template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_kernel(
     const bf16* __restrict__ Q,               // [num_tokens, num_heads, d_qk] bf16
@@ -57,11 +56,9 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     bf16* __restrict__ mid_out,               // [num_tokens, num_heads, num_splits, d_v] bf16
     float* __restrict__ mid_lse,              // [num_tokens, num_heads, num_splits] f32
     const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
-    // Optional secondary KV cache (DSv4 C4A / C128A second-tier per-token cache).
-    // When extra_KV_cache != nullptr the kernel concatenates the extra candidate
-    // window after the main one; per-chunk dispatch in the IO warp + math mask
-    // routes each chunk to the correct source. pbs_extra is the page-block
-    // size of the extra cache, which may differ from the main pbs.
+    // Optional secondary KV cache (DSv4 C4A / C128A). When non-null, the extra
+    // candidate window is concatenated after the main one; per-chunk dispatch
+    // in IO + math routes each chunk to the correct source.
     const uint8_t* __restrict__ extra_KV_cache,     // nullable; may use different pbs
     const int32_t* __restrict__ extra_indices,      // [num_tokens, extra_topk]
     const int* __restrict__ extra_topk_length_ptr,  // [num_tokens] or null
@@ -82,11 +79,8 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   constexpr int SCALE_BYTES_PER_TOKEN = KV::SCALE_BYTES_PER_TOKEN;  // 8
   constexpr int IO_STRIDE = D_NOPE + D_ROPE_C * 2;                  // 576
   constexpr int pbs = PAGE_BLOCK_SIZE;
-  // Heads actually populated per CTA tile. For the standard dispatch
-  // (NUM_HEADS ∈ {16, 32, 64, 128}) this is HPB=16. For NUM_HEADS=8 (small TP
-  // configs), only the first 8 head slots carry valid data; the kernel
-  // computes a full HPB×CAND tile internally (zero-padded Q rows on invalid
-  // heads) but only writes back NUM_HEADS heads to mid_out / mid_lse.
+  // Kernel always computes a full HPB×CAND tile (zero-Q-padded for unused
+  // head slots); NUM_HEADS=8 small-TP shards write back only VALID_HPB rows.
   constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
 
   const int t_idx = blockIdx.x;
@@ -197,12 +191,9 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   __shared__ bf16 sm_p_full[HPB][DSV4_BI];  // 2 KB static
   const int32_t* idx_base = indices + (size_t)t_idx * TOPK;
 
-  // ── Per-stage mbarrier init. mbar_full: 1 leader arrives + expect_tx;
-  // bulk completion drives tx. mbar_empty: 1 math signaling thread arrives.
-  // Visibility of all IO lanes' writes is handled by a math-side bar_sync
-  // after mbar_wait (canonical pattern, see mla_hopper.cuh:789 / hopper
-  // mainloop / sm100 TMA load — mbar.try_wait.parity has no implicit
-  // memory fence; consumer must acq-rel via __syncthreads or bar_sync).
+  // mbar_full: leader arrives + expect_tx, bulk completion drives tx.
+  // mbar_empty: math signaling thread arrives. mbar.try_wait.parity has no
+  // implicit memory fence — consumer must acq-rel via bar_sync after wait.
   if (threadIdx.x == 0) {
 #pragma unroll
     for (int s = 0; s < DSV4_KV_BUF_COUNT; ++s) {
@@ -382,13 +373,9 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       }
     }
     {
-      // K-rope B-operand loaded per-lane via scalar reads. mma.m16n8k16
-      // expects each thread's b0 = K-rows {tid*2, tid*2+1} of N-col gid and
-      // b1 = K-rows {tid*2+8, tid*2+9} of N-col gid (gid = lane>>2, tid =
-      // lane&3). ldmatrix.x2.trans on the N-outer smem here cannot produce
-      // that layout — adjacent lanes within a quad end up holding the same
-      // K-position of different entries instead of consecutive K-rows of
-      // one entry.
+      // K-rope B operand: scalar per-lane reads. mma.m16n8k16 needs each lane's
+      // b0/b1 to hold consecutive K-rows of one N-entry, which ldmatrix.x2.trans
+      // can't produce from the N-outer smem here (gid = lane>>2, tid = lane&3).
       const int warp_first_cand = warp_id * DSV4_ENTRIES_PER_WARP;
 #pragma unroll
       for (int ks = 0; ks < D_ROPE_C / 16; ks++) {
@@ -412,11 +399,9 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       }
     }
 
-    // Mask invalid cands + sm_scale × LOG2E. Invalid = absolute cand
-    // position past the per-token section length OR slot id = -1
-    // (indexer-padded). For the latter the IO warp already gathered
-    // slot 0 into smem (idx was clamped to 0); masking qk = -inf kills
-    // its contribution in softmax. Mirrors decode_dsv3_2_kernel.cuh.
+    // Mask invalid cands + sm_scale × LOG2E. Invalid = position past
+    // section_len OR slot id = -1 (indexer-padded; IO already gathered slot 0
+    // into smem with idx clamped — masking to -inf kills it in softmax).
     const int32_t* section_idx_base =
         is_extra_chunk ? (extra_indices + (size_t)t_idx * extra_topk) : idx_base;
     const int warp_first_cand = warp_id * DSV4_ENTRIES_PER_WARP;
