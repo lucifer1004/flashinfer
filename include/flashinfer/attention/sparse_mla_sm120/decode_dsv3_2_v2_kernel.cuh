@@ -337,17 +337,25 @@ __global__ void __launch_bounds__(V2_BLOCK_THREADS) sparse_mla_decode_dsv3_2_v2_
       }
     }
 
-    // Mask invalid cands + sm_scale × LOG2E.
+    // Mask invalid cands + sm_scale × LOG2E. Invalid = absolute cand position
+    // past the per-token topk_length OR slot id = -1 (indexer-padded). For
+    // the latter the IO warp already gathered slot 0 into smem (idx was
+    // clamped to 0), but we mask qk = -inf so that contribution is killed
+    // in softmax. Mirrors decode_dsv3_2_kernel.cuh (v1) masking.
     const int warp_first_cand = warp_id * V2_ENTRIES_PER_WARP;
 #pragma unroll
     for (int nt = 0; nt < V2_QK_N_TILES; nt++) {
       const int c0 = warp_first_cand + nt * 8 + tid * 2;
       const int c1 = c0 + 1;
-      if (c0 + split_cand_start >= split_cand_end) {
+      const int abs_c0 = c0 + split_cand_start;
+      const int abs_c1 = c1 + split_cand_start;
+      const int idx0 = (abs_c0 < topk_len) ? idx_base[abs_c0] : -1;
+      const int idx1 = (abs_c1 < topk_len) ? idx_base[abs_c1] : -1;
+      if (abs_c0 >= split_cand_end || idx0 < 0) {
         qk[nt][0] = -1e30f;
         qk[nt][2] = -1e30f;
       }
-      if (c1 + split_cand_start >= split_cand_end) {
+      if (abs_c1 >= split_cand_end || idx1 < 0) {
         qk[nt][1] = -1e30f;
         qk[nt][3] = -1e30f;
       }

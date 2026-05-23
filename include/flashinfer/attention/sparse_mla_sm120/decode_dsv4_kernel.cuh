@@ -413,17 +413,29 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       }
     }
 
-    // Mask invalid cands + sm_scale × LOG2E.
+    // Mask invalid cands + sm_scale × LOG2E. Invalid = absolute cand
+    // position past the per-token section length OR slot id = -1
+    // (indexer-padded). For the latter the IO warp already gathered
+    // slot 0 into smem (idx was clamped to 0); masking qk = -inf kills
+    // its contribution in softmax. Mirrors decode_dsv3_2_kernel.cuh (v1)
+    // and decode_dsv3_2_v2_kernel.cuh.
+    const int32_t* section_idx_base = is_extra_chunk
+        ? (extra_indices + (size_t)t_idx * extra_topk)
+        : idx_base;
     const int warp_first_cand = warp_id * DSV4_ENTRIES_PER_WARP;
 #pragma unroll
     for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
       const int c0 = warp_first_cand + nt * 8 + tid * 2;
       const int c1 = c0 + 1;
-      if (c0 + split_cand_start >= split_cand_end) {
+      const int abs_c0 = c0 + split_cand_start;
+      const int abs_c1 = c1 + split_cand_start;
+      const int idx0 = (abs_c0 < section_len) ? section_idx_base[abs_c0] : -1;
+      const int idx1 = (abs_c1 < section_len) ? section_idx_base[abs_c1] : -1;
+      if (abs_c0 >= split_cand_end || idx0 < 0) {
         qk[nt][0] = -1e30f;
         qk[nt][2] = -1e30f;
       }
-      if (c1 + split_cand_start >= split_cand_end) {
+      if (abs_c1 >= split_cand_end || idx1 < 0) {
         qk[nt][1] = -1e30f;
         qk[nt][3] = -1e30f;
       }

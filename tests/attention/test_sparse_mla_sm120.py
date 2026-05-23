@@ -311,7 +311,12 @@ def test_sparse_mla_sm120_decode_model1(
     indices = torch.randint(
         0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
-    indices[:, -10:] = -1  # mark some slots invalid
+    # Mark a large fraction of slots invalid (-1). The indexer emits -1 for
+    # any topk slot beyond the per-token effective seq_len; in production
+    # that's typically 50-95% of slots early in generation. Strong masking
+    # here ensures the kernel can't pass the test by ignoring -1 (only the
+    # first few logits would fall under softmax noise floor otherwise).
+    indices[:, topk // 2 :] = -1
 
     attn_sink = (
         torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
@@ -393,7 +398,12 @@ def test_sparse_mla_sm120_decode_dsv3_2(
     indices = torch.randint(
         0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
-    indices[:, -10:] = -1  # mark some slots invalid
+    # Mark a large fraction of slots invalid (-1). The indexer emits -1 for
+    # any topk slot beyond the per-token effective seq_len; in production
+    # that's typically 50-95% of slots early in generation. Strong masking
+    # here ensures the kernel can't pass the test by ignoring -1 (only the
+    # first few logits would fall under softmax noise floor otherwise).
+    indices[:, topk // 2 :] = -1
 
     attn_sink = (
         torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
