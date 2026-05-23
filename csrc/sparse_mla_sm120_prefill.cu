@@ -52,7 +52,7 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
                        int num_tokens, size_t stride_kv_block, const int* topk_length_ptr,
                        cudaStream_t stream) {
   constexpr size_t smem_bytes = SmemLayout<MT, CM>::TOTAL;
-  // Ceil-div: NUM_HEADS < HPB (e.g. 8 on TP=8 GLM-5.1) still gets 1 CTA per token.
+  // Ceil-div so NUM_HEADS < HPB (small-TP shards) still launches 1 CTA per token.
   constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
   dim3 grid(num_tokens * REPLICATE_H);
   dim3 block(BLOCK_THREADS);
@@ -127,11 +127,9 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
                          const int* topk_length_ptr, cudaStream_t stream) {
   if (topk != 2048) return false;
 
-  // PBS=64 matches the V32 decode (`decode_dsv3_2_kernel.cuh`) and the
-  // vLLM SPARSE_MLA_SM120 backend, both of which standardize on the
-  // 64-token page layout. NH=8 covers small-TP shards (GLM-5.1 TP=8 has
-  // 64/8 = 8 heads/rank); the SG kernel zero-pads invalid head slots up
-  // to HPB=16 internally and gates write-back by VALID_HPB.
+  // PBS=64 matches the V32 decode (`decode_dsv3_2_kernel.cuh`). NH=8 covers
+  // small-TP shards; the SG kernel zero-pads invalid head slots up to HPB=16
+  // internally and gates write-back by VALID_HPB.
   if (num_heads <= HPB) {
     if (num_heads == 8) {
       launch_prefill_sg<ModelType::DSV3_2, ComputeMode::FP8, 8, 2048, 64>(

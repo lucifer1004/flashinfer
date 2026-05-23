@@ -224,8 +224,7 @@ def _ref_sparse_attn(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dense SDPA over the sparse-gathered KV. Returns (output_bf16, lse_log2).
 
-    Mirrors :func:`ref_sparse_attn_decode` from the upstream test suite, with
-    extensions for ``attn_sink`` (FlashMLA V4 sink-merge convention) and
+    Honors ``attn_sink`` (FlashMLA V4 sink-merge convention) and
     ``topk_length`` (per-token valid-length mask).
     """
     num_tokens, num_heads, d_qk = q.shape
@@ -319,11 +318,8 @@ def test_sparse_mla_sm120_decode_dsv4(
     indices = torch.randint(
         0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
-    # Mark a large fraction of slots invalid (-1). The indexer emits -1 for
-    # any topk slot beyond the per-token effective seq_len; in production
-    # that's typically 50-95% of slots early in generation. Strong masking
-    # here ensures the kernel can't pass the test by ignoring -1 (only the
-    # first few logits would fall under softmax noise floor otherwise).
+    # Mark half the slots invalid (-1); ensures the kernel actually masks the
+    # sentinel rather than silently passing because the other logits dominate.
     indices[:, topk // 2 :] = -1
 
     attn_sink = (
@@ -396,11 +392,8 @@ def test_sparse_mla_sm120_decode_dsv3_2(
     indices = torch.randint(
         0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
-    # Mark a large fraction of slots invalid (-1). The indexer emits -1 for
-    # any topk slot beyond the per-token effective seq_len; in production
-    # that's typically 50-95% of slots early in generation. Strong masking
-    # here ensures the kernel can't pass the test by ignoring -1 (only the
-    # first few logits would fall under softmax noise floor otherwise).
+    # Mark half the slots invalid (-1); ensures the kernel actually masks the
+    # sentinel rather than silently passing because the other logits dominate.
     indices[:, topk // 2 :] = -1
 
     attn_sink = (
@@ -710,8 +703,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
 def test_sparse_mla_sm120_wrapper_class_run(model: str) -> None:
     """Smoke-test the wrapper class: construct once, call .run() across
     decode (T ∈ {1, 16, 64}) and prefill (T = 128) shapes for both V32 and
-    DSv4 envelopes. Exercises the BatchSparseMLAPagedAttentionWrapper path
-    used by the vLLM SPARSE_MLA_SM120 backend."""
+    DSv4 envelopes."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     page_block_size = 64

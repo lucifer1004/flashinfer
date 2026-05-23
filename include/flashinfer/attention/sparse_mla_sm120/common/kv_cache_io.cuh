@@ -45,7 +45,7 @@
 //   data:  kv_ptr + block_idx * stride_kv_block + local_idx * 576
 //   scale: kv_ptr + block_idx * stride_kv_block + page_block_size * 576 + local_idx * 8
 //
-// Reference: FlashMLA SM90 splitkv_mla.cuh L538-555, SM100 kernel.cuh L657-714.
+// Reference: FlashMLA SM90 splitkv_mla.cuh / SM100 kernel.cuh.
 
 template <ModelType MT>
 struct KVIOTraits {

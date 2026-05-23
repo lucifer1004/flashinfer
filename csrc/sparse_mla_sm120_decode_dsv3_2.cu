@@ -7,9 +7,9 @@
 // × num_splits). Reuses decode-dsv4's merge kernel for split combine.
 //
 // Supports the full V32-family dispatch grid:
-//   num_heads ∈ {8, 16, 32, 64, 128}    — covers TP={16,8,4,2,1}
-//   topk      ∈ {128, 512, 1024, 2048}  — covers SWA, indexer top-k, full
-//   pbs       = 64                       — vLLM CUDA DeepseekV32IndexerBackend
+//   num_heads ∈ {8, 16, 32, 64, 128}
+//   topk      ∈ {128, 512, 1024, 2048}
+//   pbs       = 64
 // = 20 instantiations.
 
 #include <cuda_runtime.h>

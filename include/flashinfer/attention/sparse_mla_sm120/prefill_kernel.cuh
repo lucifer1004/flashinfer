@@ -92,10 +92,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
   // Ceil-div so NUM_HEADS < HPB (small-TP shards) still launches 1 CTA per token.
   static constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
   static constexpr int QK_NOPE_KSTEPS = KV::QUANT_TILE / 32;
-  // Mirrors the decode-V2 pattern: smem layout always allocates HPB heads
-  // (zero-padded for invalid slots); Q load and the BF16 output / LSE
-  // write-back are gated by VALID_HPB so we don't read/write past the
-  // caller's [num_tokens, NUM_HEADS, ...] buffers.
+  // smem layout always allocates HPB heads (zero-padded for invalid slots);
+  // Q load and BF16 output / LSE write-back are gated by VALID_HPB to avoid
+  // reading/writing past the caller's [num_tokens, NUM_HEADS, ...] buffers.
   constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
 
   const int s_i = blockIdx.x / REPLICATE_H;
@@ -644,9 +643,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1) sparse_mla_prefill_mg_kernel
     io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
         sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid, stride_kv_block, kv_l2_policy);
 
-    // For dual-cache (TOPK_EXTRA > 0) we always iterate NI_TOTAL — topk_length
-    // masking happens at the QK stage. For single-cache, short-circuit at
-    // actual_ni (saves IO bandwidth when topk_length < TOPK).
+    // Dual-cache (TOPK_EXTRA > 0) always iterates NI_TOTAL; topk_length
+    // masking happens at QK. Single-cache short-circuits at actual_ni to
+    // save IO bandwidth when topk_length < TOPK.
     const int loop_bound = (TOPK_EXTRA == 0) ? actual_ni : NI_TOTAL;
 #pragma unroll 1
     for (int ti = 0; ti < loop_bound; ti++) {

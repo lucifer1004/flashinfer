@@ -71,7 +71,7 @@ _D_V = 512  # value head dim (universal across DSV3_2 and DSV4)
 _BI = 64  # KV partition tile size in candidates (BLOCK_SIZE_N)
 
 # Decode/prefill cutoff: num_tokens > _DECODE_MAX_TOKENS routes to the
-# prefill orchestrator; otherwise we route to the standalone decode kernels.
+# prefill orchestrator; otherwise to the standalone decode kernels.
 _DECODE_MAX_TOKENS = 64
 
 # decode-dsv4 supports a fixed (num_heads, topk) dispatch table. Outside of
@@ -90,9 +90,8 @@ _DECODE_DSV4_DISPATCH = frozenset({
 })
 _DECODE_DSV4_PAGE_BLOCK_SIZE = 64
 
-# decode-dsv3_2 (V32 family, V4-style warp-spec). Dispatch envelope spans
-# the production GLM-5.1 / Kimi K2.5 / DSv3.2 shapes (num_heads ∈
-# {8,16,32,64,128} covers TP={16,8,4,2,1}; topk ∈ {128, 512, 1024, 2048}).
+# decode-dsv3_2 (V32 family, V4-style warp-spec): num_heads ∈ {8,16,32,
+# 64,128} × topk ∈ {128, 512, 1024, 2048}.
 _DECODE_DSV3_2_DISPATCH = frozenset({
     (8, 128), (8, 512), (8, 1024), (8, 2048),
     (16, 128), (16, 512), (16, 1024), (16, 2048),
@@ -100,7 +99,6 @@ _DECODE_DSV3_2_DISPATCH = frozenset({
     (64, 128), (64, 512), (64, 1024), (64, 2048),
     (128, 128), (128, 512), (128, 1024), (128, 2048),
 })
-# Production page_block_size for V32 indexer caches. vLLM CUDA forces 64.
 _DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 
 
@@ -461,19 +459,11 @@ class BatchSparseMLAPagedAttentionWrapper:
         return out_lse_view if return_lse else None
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Decode-DSv4: AutoTuner-driven chunks_per_block tuning
-# ─────────────────────────────────────────────────────────────────────
-#
+# Decode-DSv4: AutoTuner-driven chunks_per_block tuning.
 # decode-dsv4 is the split-K decode kernel where each block handles
 # `chunks_per_block` chunks of `_BI`=64 candidates each. The wall-time-optimal
-# cpb is non-monotonic in (num_tokens, num_heads, topk): per-shape sweep shows
-# 20-28% gains over the C++ closed-form heuristic on contested shapes (e.g.,
-# 128/512/T=16, 128/1024/T=16, 64/1024/T=16, 64/512/T=16) — the gain is
-# finicky (cpb=13 vs cpb=14 differ ~12% on one shape) so a closed-form is
-# unlikely to capture it without ML-style fitting.
-#
-# Solution: expose `chunks_per_block` as a TunableRunner tactic and let
+# `cpb` is non-monotonic in (num_tokens, num_heads, topk) and not well captured
+# by a closed-form heuristic; expose it as a TunableRunner tactic and let
 # AutoTuner cache the best value per (T_bucket, num_heads, topk).
 
 
@@ -514,14 +504,11 @@ def _get_sparse_mla_decode_dsv4_module():
             extra_indices = kwargs.get("extra_indices")
             extra_topk_length = kwargs.get("extra_topk_length")
             topk = indices.shape[-1]  # 2D [T, topk] or 3D [T, 1, topk]
-            # Total num_splits = main chunks + extra chunks. The kernel grid
-            # spans all of them; mid_out is sized for this combined total by
-            # the caller. Computing only main here would silently undersize
-            # the kernel launch and skip the extra section.
+            # num_splits covers main + extra chunks; mid_out is sized for the
+            # combined total by the caller so both sections fit.
             extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
             num_splits = (topk + _BI - 1) // _BI + (extra_topk + _BI - 1) // _BI
-            # tactic ∈ [1, num_splits] → pass through; tactic == -1 (autotuner
-            # fallback) → pass -1 so the C++ heuristic picks cpb.
+            # tactic > 0 → use that cpb; tactic == -1 → fall back to the C++ heuristic.
             cpb_override = tactic if tactic > 0 else -1
             module.sparse_mla_sm120_decode_dsv4(
                 q,
@@ -614,13 +601,8 @@ def _decode_dsv4_runner_singleton():
 def _decode_dsv4_default_cache_path():
     """Default disk path for the decode-dsv4 AutoTuner cache.
 
-    Pattern mirrors flashinfer's JIT cache: ``$FLASHINFER_WORKSPACE_DIR/
-    autotune/sparse_mla_sm120_decode_dsv4.json``. Per-version + per-arch
-    (different GPUs / SM counts pick different optimal cpb), invalidated
-    when ``flashinfer_version`` changes.
-
-    Override via ``FLASHINFER_AUTOTUNE_DIR`` env var or call
-    :func:`sparse_mla_sm120_decode_dsv4_autotune` with an explicit path.
+    Override via ``FLASHINFER_AUTOTUNE_DIR`` env var or pass an explicit
+    path to :func:`sparse_mla_sm120_decode_dsv4_autotune`.
     """
     import pathlib
 
@@ -636,37 +618,24 @@ def _decode_dsv4_default_cache_path():
 
 _decode_dsv4_cache_mtime: float = -1.0
 
-# Per-process hot cache mapping shape signature → cpb tactic. Bypasses
-# AutoTuner.choose_one on the steady-state path: dict lookup is ~1 µs vs
-# ~3 µs through AutoTuner (lock + tensor-shape extract + cache-key build +
-# hash + metadata check). Populated lazily on cold misses + invalidated
-# implicitly when a `with autotune(True):` session re-tunes (since the
-# tuning-mode branch routes through choose_one and refreshes the entry).
+# Per-process hot cache mapping shape signature → cpb tactic. Skips
+# AutoTuner.choose_one on the steady-state path; entries are refreshed
+# whenever a `with autotune(True):` session re-tunes the shape.
 _decode_dsv4_hot_cache: dict = {}
 
 
 def _decode_dsv4_maybe_load_cache() -> None:
     """Mtime-gated lazy load of the default disk cache.
 
-    Loads the cache if the file is newer than what we've loaded before (or
-    never loaded). This is multi-rank safe: a rank that started serving
-    BEFORE another rank finished tuning will pick up the updated cache the
-    first time it calls into a still-untuned shape (which triggers
-    choose_one's cold path that wraps this function). One stat() per cold
-    call is cheap; the steady-state hot-cache path skips this entirely.
-
-    Silent on missing file (fresh install) and on load failure (version
-    mismatch, corrupt JSON): falls back to C++ heuristic via AutoTuner's
-    normal fallback path. Surfacing these as errors would break serving
-    for a cache problem.
+    Silent on missing file or load failure (version mismatch, corrupt JSON):
+    falls back to the C++ heuristic via AutoTuner's normal fallback path so
+    a bad cache never blocks serving.
     """
     global _decode_dsv4_cache_mtime
     path = _decode_dsv4_default_cache_path()
     try:
         mtime = path.stat().st_mtime
     except OSError:
-        # File doesn't exist yet — nothing to load. Keep mtime = -1 so we
-        # re-stat on the next cold call (cheap) until the file appears.
         return
     if mtime <= _decode_dsv4_cache_mtime:
         return
@@ -674,9 +643,7 @@ def _decode_dsv4_maybe_load_cache() -> None:
         AutoTuner.get().load_configs(str(path))
         _decode_dsv4_cache_mtime = mtime
     except Exception:
-        # Load failed; don't update mtime so we try again next cold call.
-        # (If the file is truly broken, we keep retrying — harmless since
-        # cold calls are rare in steady state.)
+        # Keep mtime unchanged so the next cold call retries.
         pass
 
 
@@ -805,9 +772,9 @@ def sparse_mla_sm120_decode_dsv4(
         return output
 
     # Hot-cache fast path: tactic is fully determined by (T_bucket, num_heads,
-    # topk); skip AutoTuner.choose_one entirely once we've resolved a shape.
-    # Only fires outside an active tuning session — inside `with autotune(True):`
-    # we route through choose_one so the autotuner gets the data it needs.
+    # topk), so skip AutoTuner.choose_one entirely once a shape is resolved.
+    # Only fires outside an active tuning session; tuning mode always routes
+    # through choose_one so the autotuner gets the data it needs.
     tuner = AutoTuner.get()
     if not tuner.is_tuning_mode:
         T_bucket = _decode_dsv4_map_to_token_bucket(q.shape[0])
@@ -831,17 +798,8 @@ def sparse_mla_sm120_decode_dsv4(
         inputs,
         **forward_kwargs,
     )
-    # Only cache POSITIVE tactics (real tuning results). The autotuner uses
-    # tactic=-1 as the "no tuning data, fall back to C++ heuristic" sentinel.
-    # Caching -1 would pin every subsequent call to the heuristic, even if
-    # a later tuning session (on this rank OR another rank that wrote the
-    # shared disk cache) provides a real result — the disk reload would be
-    # silently shadowed by the stale -1 in this process's hot dict.
-    #
-    # By skipping the cache on tactic=-1, untuned shapes pay the ~3 µs
-    # choose_one overhead on every call (acceptable since the kernel itself
-    # is also running the slower heuristic path), and stay agile to later
-    # tuning data arriving via disk reload or in-process autotune().
+    # Only cache positive tactics; tactic=-1 means "no tuning data, fall back
+    # to the C++ heuristic" and caching it would shadow a later disk reload.
     if int(tactic) > 0:
         T_bucket = _decode_dsv4_map_to_token_bucket(q.shape[0])
         hot_key = (T_bucket, q.shape[1], indices.shape[-1])

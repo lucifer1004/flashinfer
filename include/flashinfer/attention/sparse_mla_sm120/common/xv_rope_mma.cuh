@@ -84,13 +84,11 @@ __device__ __forceinline__ void xv_rope_mma(float acc_rope[4], float w0, float w
     ldmatrix_load_A_bf16(a0, a1, a2, a3, weight_smem + k_base, BI, lane);
 
     // B operand: 4 scalar loads from global (L2 cached). Invalid entries
-    // (idx < 0) read from a "zero" placeholder rather than slot 0 — if
-    // slot 0 of the KV cache happens to contain garbage (e.g. unwritten
-    // BF16 NaN/inf from prior workload), 0 * NaN = NaN propagates through
-    // the MMA. The QK side masks invalid entries to -1e30 (so weights are
-    // 0), but here we can't safely rely on 0 * V == 0 for non-finite V.
-    // Returning v=0 makes the contribution exactly zero regardless of
-    // softmax-weight precision.
+    // (idx < 0) return v=0 directly rather than reading slot 0 — if slot 0
+    // holds non-finite KV (unwritten BF16 NaN/inf from prior workload),
+    // 0 * NaN = NaN would propagate through the MMA. The QK side masks
+    // invalid entries to -1e30 so weights round to 0, but that's not safe
+    // against non-finite V.
     auto load_rope_v = [&](int entry_offset) -> uint16_t {
       int idx = tile_indices[entry_offset];
       if (idx < 0) return 0;

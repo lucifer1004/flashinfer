@@ -338,10 +338,9 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     }
 
     // Mask invalid cands + sm_scale × LOG2E. Invalid = absolute cand position
-    // past the per-token topk_length OR slot id = -1 (indexer-padded). For
-    // the latter the IO warp already gathered slot 0 into smem (idx was
-    // clamped to 0), but we mask qk = -inf so that contribution is killed
-    // in softmax.
+    // past the per-token topk_length OR slot id = -1 (indexer-padded). The
+    // IO warp gathered slot 0 into smem for the -1 case (idx clamped to 0);
+    // setting qk = -inf kills the contribution in softmax.
     const int warp_first_cand = warp_id * DSV3_2_ENTRIES_PER_WARP;
 #pragma unroll
     for (int nt = 0; nt < DSV3_2_QK_N_TILES; nt++) {

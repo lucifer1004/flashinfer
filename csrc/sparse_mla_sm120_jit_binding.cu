@@ -116,9 +116,8 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
           ? static_cast<const int*>(extra_topk_length.value().data_ptr())
           : nullptr;
   // extra_topk and stride_extra_kv_block derived from the optional tensors.
-  // pbs_extra: when extra cache is 4D [num_blocks, pbs_extra, 1, bpt] take
-  // pbs_extra from dim -3; when caller passes 2D [num_blocks, pbs_extra * bpt]
-  // we infer from the total row width / BPT_DSV4 (= 584).
+  // pbs_extra: 4D form gives it directly from dim -3; 2D form infers it
+  // from the total row width / BPT_DSV4 (= 584).
   int extra_topk_arg = 0;
   int pbs_extra_arg = 0;
   size_t stride_extra_kv_block = 0;
