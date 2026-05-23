@@ -391,7 +391,10 @@ class BatchSparseMLAPagedAttentionWrapper:
             device=self._device,
         )
 
-    @flashinfer_api(trace=sparse_mla_sm120_paged_trace)
+    # Trace fires on the inner sparse_mla_sm120_paged_attention call; no
+    # separate trace template here because wrapper.run owns out_lse internally
+    # and doesn't accept it as a parameter.
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,

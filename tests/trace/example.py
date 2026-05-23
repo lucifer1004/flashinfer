@@ -429,13 +429,13 @@ for mla_ps, mla_np in ((64, 32), (1, 2048)):
     kpe_cache = torch.randn(total_mla, mla_ps, kpe, dtype=torch.bfloat16, device=device)
     mla.run(q_nope, q_pe, ckv_cache, kpe_cache)
 
-# ── Sparse-MLA SM120 paged decode (DSv4 MODEL1: d_qk=512, page=64) ──────────
+# ── Sparse-MLA SM120 paged decode (DSv4: d_qk=512, page=64) ─────────────────
 # Suppress runtime failures on non-sm120 hardware; trace JSON is emitted before
 # the kernel launch and is what we want to capture.
 with contextlib.suppress(Exception):
     smla_T, smla_H, smla_dqk, smla_dv, smla_topk = 16, 32, 512, 512, 512
     smla_pbs, smla_pages = 64, 32
-    # MODEL1 byte-packed FP8 stride: 448 nope + 128 bf16 rope + 8 scale = 584
+    # DSv4 byte-packed FP8 stride: 448 nope + 128 bf16 rope + 8 scale = 584
     smla_bpt = 584
     smla_q = torch.randn(smla_T, smla_H, smla_dqk, dtype=torch.bfloat16, device=device)
     smla_kv = torch.zeros(
@@ -446,20 +446,12 @@ with contextlib.suppress(Exception):
     )
     smla_out = torch.zeros(smla_T, smla_H, smla_dv, dtype=torch.bfloat16, device=device)
     smla_lse = torch.zeros(smla_T, smla_H, dtype=torch.float32, device=device)
-    smla_ws = torch.empty(
-        flashinfer.compute_sparse_mla_sm120_workspace_size(
-            max_num_tokens=smla_T, max_num_heads=smla_H, d_v=smla_dv
-        ),
-        dtype=torch.uint8,
-        device=device,
-    )
     flashinfer.sparse_mla_sm120_paged_attention(
         smla_q,
         smla_kv,
         smla_idx,
         smla_out,
         smla_lse,
-        smla_ws,
         sm_scale=smla_dqk**-0.5,
         d_v=smla_dv,
     )

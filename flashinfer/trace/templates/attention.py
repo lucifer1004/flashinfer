@@ -1123,7 +1123,7 @@ dsa_paged_trace = TraceTemplate(
 )
 
 
-# ── Sparse MLA SM120 (DSv4 family + DSv3.2 / GLM5.1) ──────────────────────────
+# ── Sparse MLA SM120 (DSv4 + DSv3.2 families) ─────────────────────────────────
 
 sparse_mla_sm120_paged_trace = TraceTemplate(
     op_type="sparse_mla_paged_sm120",
@@ -1141,7 +1141,7 @@ sparse_mla_sm120_paged_trace = TraceTemplate(
             description="Number of query heads after TP split.", abbrev="h"
         ),
         "head_dim_qk": Const(
-            description="Query head dim. 512 = DSV4 (DSv4), 576 = DSV3_2 (DSv3.2 / GLM5.1).",
+            description="Query head dim. 512 = DSv4 family, 576 = DSv3.2 family.",
             abbrev="dqk",
         ),
         "head_dim_v": Const(
