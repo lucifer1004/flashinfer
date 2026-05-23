@@ -200,6 +200,9 @@ from .sparse_mla_sm120 import (
 from .sparse_mla_sm120 import (
     sparse_mla_sm120_paged_attention as sparse_mla_sm120_paged_attention,
 )
+from .swa_indices import (
+    compute_swa_indices_and_lens as compute_swa_indices_and_lens,
+)
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
