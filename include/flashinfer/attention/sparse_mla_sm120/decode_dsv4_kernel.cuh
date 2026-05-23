@@ -40,6 +40,9 @@ constexpr int DSV4_IO_THREADS = DSV4_IO_WARPS * 32;               // 32
 constexpr int DSV4_CAND_WINDOW = 64;
 constexpr int DSV4_BI = DSV4_CAND_WINDOW;
 constexpr int DSV4_KV_BUF_COUNT = 2;
+// Per-split LSE smem in the merge kernel is sized to this bound. Callers
+// must reject (or split-further) any launch with num_splits > DSV4_MAX_SPLITS.
+constexpr int DSV4_MAX_SPLITS = 32;
 constexpr int DSV4_ENTRIES_PER_WARP = DSV4_BI / DSV4_N_WARPS;  // 8
 constexpr int DSV4_QK_N_TILES = DSV4_ENTRIES_PER_WARP / 8;     // 1
 
@@ -787,7 +790,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
   static_assert(DIMS_PER_THREAD % 8 == 0, "DIMS_PER_THREAD must be multiple of 8 (uint4)");
   static_assert(BLOCK_THREADS * DIMS_PER_THREAD == D_V_VAL, "block must cover the full D_V row");
   constexpr int VECS_PER_THREAD = DIMS_PER_THREAD / 8;  // 1 for D_V=512, BT=64
-  constexpr int MAX_SPLITS = 32;
+  constexpr int MAX_SPLITS = DSV4_MAX_SPLITS;
 
   const int t_idx = blockIdx.x;
   const int h = blockIdx.y;

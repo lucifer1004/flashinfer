@@ -104,6 +104,10 @@ _DECODE_DSV4_DISPATCH = frozenset(
     }
 )
 _DECODE_DSV4_PAGE_BLOCK_SIZE = 64
+# Mirrors DSV4_MAX_SPLITS in include/.../decode_dsv4_kernel.cuh — the merge
+# kernel's sm_lse smem is statically sized to this. Callers must keep
+# main_splits + extra_splits below the bound.
+_DECODE_DSV4_MAX_SPLITS = 32
 
 # decode-dsv3_2 (V32 family, V4-style warp-spec): num_heads ∈ {8,16,32,
 # 64,128} × topk ∈ {128, 512, 1024, 2048}.
@@ -147,19 +151,28 @@ def _decode_dsv3_2_dispatchable(
 
 
 def _decode_dsv4_dispatchable(
-    num_tokens: int, num_heads: int, topk: int, d_qk: int, page_block_size: int
+    num_tokens: int,
+    num_heads: int,
+    topk: int,
+    d_qk: int,
+    page_block_size: int,
+    extra_topk: int = 0,
 ) -> bool:
     """Return True iff decode-dsv4 supports this shape configuration.
 
     decode-dsv4 is DSv4-only (d_qk=512) with a fixed (num_heads, topk)
-    instantiation set and PAGE_BLOCK_SIZE=64. Outside this envelope the
-    orchestrator routes to decode-dsv3_2 (V32-only) or prefill.
+    instantiation set and PAGE_BLOCK_SIZE=64. The merge kernel's per-split
+    LSE smem caps total num_splits at _DECODE_DSV4_MAX_SPLITS; if the dual-
+    cache sum (main_splits + extra_splits) would exceed that bound, fall
+    through to prefill instead of dispatching.
     """
+    num_splits = (topk + _BI - 1) // _BI + (extra_topk + _BI - 1) // _BI
     return (
         num_tokens <= _DECODE_MAX_TOKENS
         and d_qk == 512
         and page_block_size == _DECODE_DSV4_PAGE_BLOCK_SIZE
         and (num_heads, topk) in _DECODE_DSV4_DISPATCH
+        and num_splits <= _DECODE_DSV4_MAX_SPLITS
     )
 
 
@@ -194,12 +207,12 @@ def get_sparse_mla_sm120_module():
         # otherwise fall through to decode-dsv3_2 / prefill.
         # kv_cache layout: [num_blocks, page_block_size, 1, bytes_per_token].
         kv_pbs = int(kv_cache.size(-3)) if kv_cache.ndim >= 3 else 0
+        extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
         if kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE and _decode_dsv4_dispatchable(
-            num_tokens, num_heads, topk, d_qk, kv_pbs
+            num_tokens, num_heads, topk, d_qk, kv_pbs, extra_topk
         ):
             # mid_out / mid_lse scratch is small enough to allocate per call.
             num_splits_main = (topk + _BI - 1) // _BI
-            extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
             num_splits_extra = (extra_topk + _BI - 1) // _BI
             num_splits = num_splits_main + num_splits_extra
             mid_out = torch.empty(
@@ -622,12 +635,29 @@ def _decode_dsv4_init_indices(shapes, dtype, device):
 
 
 def _decode_dsv4_init_topk_length(shapes, dtype, device):
-    """Use full effective top-k during profiling.
-
-    The initializer does not know the paired index width, so use a large value
-    that leaves every generated index active for both main and extra caches.
+    """Placeholder full-active topk_length; clamped to indices.shape[-1] by
+    _decode_dsv4_inputs_pre_hook before profiling. A large sentinel would let
+    the kernel index past the real indices tensor (OOB) when chunks_per_block>1.
     """
     return torch.full(shapes, 1 << 30, dtype=dtype, device=device)
+
+
+def _decode_dsv4_inputs_pre_hook(inputs):
+    """Clamp synthetic topk_length / extra_topk_length to the paired
+    indices.shape[-1]. Initializers see only their own tensor shape, so this
+    runs after synthesis and pairs (indices, topk_length) /
+    (extra_indices, extra_topk_length) before the per-tactic profile loop.
+    """
+    inputs = list(inputs)
+    indices = inputs[1] if len(inputs) > 1 else None
+    topk_length = inputs[6] if len(inputs) > 6 else None
+    extra_indices = inputs[8] if len(inputs) > 8 else None
+    extra_topk_length = inputs[9] if len(inputs) > 9 else None
+    if topk_length is not None and indices is not None:
+        inputs[6] = torch.full_like(topk_length, indices.shape[-1])
+    if extra_topk_length is not None and extra_indices is not None:
+        inputs[9] = torch.full_like(extra_topk_length, extra_indices.shape[-1])
+    return inputs
 
 
 @functools.cache
@@ -654,6 +684,7 @@ def _decode_dsv4_tuning_config() -> TuningConfig:
                 ],
             ),
         ),
+        inputs_pre_hook=_decode_dsv4_inputs_pre_hook,
         # Constrain T (dim 0) of all output/scratch tensors to q's T so the
         # autotuner's synthesised q propagates to mid_out (2), mid_lse (3),
         # output (4), out_lse (5). Without these constraints, the kernel

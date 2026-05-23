@@ -190,14 +190,19 @@ def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0)
 def bench_sparse_mla_sm120_dsv3_2(num_heads, num_tokens, with_sink=False, seed=0):
     """Returns (median_us, kv_bw_gbps, attn_tflops) for DSv3.2 decode-dsv3_2.
 
-    Fixed: topk=2048, page_block_size=1, d_qk=576, d_v=512.
+    Fixed: topk=2048, page_block_size=64, d_qk=576, d_v=512.
+
+    page_block_size matches _DECODE_DSV3_2_PAGE_BLOCK_SIZE in
+    flashinfer/sparse_mla_sm120.py — the wrapper's decode dispatch only
+    activates at pbs=64, anything else falls through to prefill, which
+    rejects num_tokens <= 64.
     """
     torch.manual_seed(seed)
     device = torch.device("cuda")
     d_qk, d_v = 576, 512
     topk = 2048
-    page_block_size = 1
-    num_blocks = 4096  # one page per token (pbs=1); pool large enough for topk
+    page_block_size = 64
+    num_blocks = max(64, (topk + page_block_size - 1) // page_block_size * 2)
     s_kv = num_blocks * page_block_size
 
     kv_bf16 = (

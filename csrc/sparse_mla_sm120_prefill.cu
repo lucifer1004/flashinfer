@@ -171,35 +171,37 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
                                  float* out_lse, float sm_scale, int num_tokens,
                                  size_t stride_kv_block, const int* topk_length_ptr,
                                  cudaStream_t stream) {
-#define DISPATCH_SG_CM(CM, NH, TK)                                                       \
-  launch_prefill_sg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64>(                       \
-      Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block, \
-      topk_length_ptr, stream)
+#define DISPATCH_MG_CM(CM, NH, TK, NHG)                                                          \
+  launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, /*TK_EX=*/0, /*PBS_EX=*/64,    \
+                    NHG>(Q, KV, indices, /*KV_extra=*/nullptr, /*idx_extra=*/nullptr, attn_sink, \
+                         output, out_lse, sm_scale, num_tokens, stride_kv_block,                 \
+                         /*stride_kv_block_extra=*/(size_t)0, topk_length_ptr,                   \
+                         /*topk_length_extra=*/nullptr, stream)
 
-#define DISPATCH_MG_CM(CM, NH, TK)                                                                 \
-  launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64>(                                 \
-      Q, KV, indices, /*KV_extra=*/nullptr, /*idx_extra=*/nullptr, attn_sink, output, out_lse,     \
-      sm_scale, num_tokens, stride_kv_block, /*stride_kv_block_extra=*/(size_t)0, topk_length_ptr, \
-      /*topk_length_extra=*/nullptr, stream)
-
-#define DISPATCH_BY_NH_CM(CM, TK)    \
-  do {                               \
-    switch (num_heads) {             \
-      case 16:                       \
-        DISPATCH_SG_CM(CM, 16, TK);  \
-        return true;                 \
-      case 32:                       \
-        DISPATCH_MG_CM(CM, 32, TK);  \
-        return true;                 \
-      case 64:                       \
-        DISPATCH_MG_CM(CM, 64, TK);  \
-        return true;                 \
-      case 128:                      \
-        DISPATCH_MG_CM(CM, 128, TK); \
-        return true;                 \
-      default:                       \
-        return false;                \
-    }                                \
+// NH=16 routes through MG with MG_N_HG_T=1 (HEADS_PER_CTA=16, identical
+// shape to SG) rather than the SG kernel. The SG-BF16-QK path has a
+// pre-existing race (smem hazard at multi-wave NH=16 launches; same
+// pattern in upstream's BF16_QK SG); MG-BF16 is racecheck-clean.
+// This mirrors the dual-cache dispatcher which already routes NH=16
+// through MG with NHG=1.
+#define DISPATCH_BY_NH_CM(CM, TK)       \
+  do {                                  \
+    switch (num_heads) {                \
+      case 16:                          \
+        DISPATCH_MG_CM(CM, 16, TK, 1);  \
+        return true;                    \
+      case 32:                          \
+        DISPATCH_MG_CM(CM, 32, TK, 2);  \
+        return true;                    \
+      case 64:                          \
+        DISPATCH_MG_CM(CM, 64, TK, 2);  \
+        return true;                    \
+      case 128:                         \
+        DISPATCH_MG_CM(CM, 128, TK, 2); \
+        return true;                    \
+      default:                          \
+        return false;                   \
+    }                                   \
   } while (0)
 
   // Small K-loop: BF16 QK skips the FP8 Q-quantize prologue. Larger K
@@ -217,7 +219,6 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
 
 #undef DISPATCH_BY_NH_CM
 #undef DISPATCH_MG_CM
-#undef DISPATCH_SG_CM
   return false;  // unreachable
 }
 

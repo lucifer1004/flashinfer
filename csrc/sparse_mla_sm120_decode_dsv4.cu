@@ -142,6 +142,9 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int pa
                                    size_t stride_extra_kv_block, int chunks_per_block_override,
                                    float sm_scale, size_t stride_kv_block, cudaStream_t stream) {
   if (mt != ModelType::DSV4 || page_block_size != 64) return false;
+  // merge_kernel statically allocates sm_lse[DSV4_MAX_SPLITS]; reject any
+  // launch whose num_splits would overflow it.
+  if (num_splits > DSV4_MAX_SPLITS) return false;
 #define DSV4_DISPATCH(H, K)                                                                 \
   if (num_heads == (H) && topk == (K)) {                                                    \
     return launch_decode_dsv4_impl<ModelType::DSV4, (H), (K), 64>(                          \
