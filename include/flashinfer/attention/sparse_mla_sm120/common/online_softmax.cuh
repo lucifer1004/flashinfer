@@ -61,7 +61,7 @@ __device__ __forceinline__ void softmax_warp_sum(float w0, float w1, float w2, f
   ls1 += __shfl_xor_sync(0xffffffff, ls1, 2);
 }
 
-// Compute LSE (log-sum-exp) in log2 space for combine kernel
+// Compute LSE (log-sum-exp) in log2 space for the merge kernel
 __device__ __forceinline__ float softmax_lse(float m, float l) {
   return (l > 0.f) ? (log2f(l) + m) : -1e30f;
 }

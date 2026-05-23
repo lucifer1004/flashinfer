@@ -417,8 +417,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     // position past the per-token section length OR slot id = -1
     // (indexer-padded). For the latter the IO warp already gathered
     // slot 0 into smem (idx was clamped to 0); masking qk = -inf kills
-    // its contribution in softmax. Mirrors decode_dsv3_2_kernel.cuh (v1)
-    // and decode_dsv3_2_v2_kernel.cuh.
+    // its contribution in softmax. Mirrors decode_dsv3_2_kernel.cuh.
     const int32_t* section_idx_base = is_extra_chunk
         ? (extra_indices + (size_t)t_idx * extra_topk)
         : idx_base;
