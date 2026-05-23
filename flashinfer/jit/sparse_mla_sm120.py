@@ -44,11 +44,8 @@ def gen_sparse_mla_sm120_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_decode_dsv3_2.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_decode_dsv3_2_v2.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_decode_dsv4.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_prefill.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_combine.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_sched.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_jit_binding.cu",
         ],
         extra_cuda_cflags=nvcc_flags,

@@ -28,19 +28,15 @@
 
 """Sparse-MLA paged attention for SM120.
 
-Auto-dispatches between decode (num_tokens <= 64) and prefill (larger). For
-decode, DSv4 routes to the warp-specialized decode-dsv4 kernel and DSv3.2
-routes to the scheduler-driven decode-dsv3_2 kernel.
+Auto-dispatches between decode (num_tokens <= 64) and prefill (larger). Both
+DSv3.2 (d_qk=576) and DSv4 (d_qk=512) decode go through dedicated warp-spec
+standalone kernels; prefill is dispatched through the shared orchestrator.
 
-Two public surfaces, mirroring the b12x_fused_moe + B12xMoEWrapper convention:
+Two public surfaces:
 
-1. Functional API (:func:`sparse_mla_sm120_paged_attention`) — caller passes a
-   pre-allocated ``workspace_buffer``; cudagraph-friendly when reusing the
-   same buffer across calls.
-
-2. Wrapper API (:class:`BatchSparseMLAPagedAttentionWrapper`) — class with
-   pre-allocated workspace + output-LSE buffer for ``use_cuda_graph=True``
-   workflows.
+1. Functional API (:func:`sparse_mla_sm120_paged_attention`).
+2. Wrapper API (:class:`BatchSparseMLAPagedAttentionWrapper`) — class with a
+   pre-allocated output-LSE buffer for ``use_cuda_graph=True`` workflows.
 """
 
 from __future__ import annotations
@@ -71,17 +67,11 @@ from .utils import (
 
 # Kernel-side constants. Mirrored from
 # include/flashinfer/attention/sparse_mla_sm120/{arch,model}/*.cuh.
-_HPB = 16  # heads per HPB tile (HEADS_PER_BLOCK)
 _D_V = 512  # value head dim (universal across DSV3_2 and DSV4)
 _BI = 64  # KV partition tile size in candidates (BLOCK_SIZE_N)
-_MAX_OCCUPANCY = 2  # max additional waves of split-K parallelism beyond baseline
-_FIXED_OVERHEAD = 64  # scheduler tile-overhead constant
 
 # Decode/prefill cutoff: num_tokens > _DECODE_MAX_TOKENS routes to the
-# prefill kernel, which writes output / out_lse directly and does NOT use
-# the o_accum / lse_accum / sched_meta / num_splits workspace sections.
-# The wrapper's workspace_buffer is therefore sized for decode only,
-# independent of the (much larger) prefill token bound.
+# prefill orchestrator; otherwise we route to the standalone decode kernels.
 _DECODE_MAX_TOKENS = 64
 
 # decode-dsv4 supports a fixed (num_heads, topk) dispatch table. Outside of
@@ -100,38 +90,29 @@ _DECODE_DSV4_DISPATCH = frozenset({
 })
 _DECODE_DSV4_PAGE_BLOCK_SIZE = 64
 
-# decode-dsv3_2-v2 (V32 family, V4-style warp-spec). Dispatch envelope spans
+# decode-dsv3_2 (V32 family, V4-style warp-spec). Dispatch envelope spans
 # the production GLM-5.1 / Kimi K2.5 / DSv3.2 shapes (num_heads ∈
 # {8,16,32,64,128} covers TP={16,8,4,2,1}; topk ∈ {128, 512, 1024, 2048}).
-# v2 is the default V32 decode kernel; v1 (scheduler-driven) remains
-# available as a legacy fallback via FLASHINFER_DSV3_2_KERNEL=v1 — kept for
-# regression bisection and pbs=1 inputs that v2 doesn't support.
-_DECODE_DSV3_2_V2_DISPATCH = frozenset({
+_DECODE_DSV3_2_DISPATCH = frozenset({
     (8, 128), (8, 512), (8, 1024), (8, 2048),
     (16, 128), (16, 512), (16, 1024), (16, 2048),
     (32, 128), (32, 512), (32, 1024), (32, 2048),
     (64, 128), (64, 512), (64, 1024), (64, 2048),
     (128, 128), (128, 512), (128, 1024), (128, 2048),
 })
-# Production page_block_size for V32 indexer caches. vLLM CUDA forces 64;
-# ROCm-style pbs=1 is not supported by v2 (fall through to v1).
-_DECODE_DSV3_2_V2_PAGE_BLOCK_SIZE = 64
+# Production page_block_size for V32 indexer caches. vLLM CUDA forces 64.
+_DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 
 
-def _decode_dsv3_2_v2_disabled() -> bool:
-    """True iff FLASHINFER_DSV3_2_KERNEL=v1 forces the legacy path."""
-    return os.environ.get("FLASHINFER_DSV3_2_KERNEL", "v2").lower() == "v1"
-
-
-def _decode_dsv3_2_v2_dispatchable(
+def _decode_dsv3_2_dispatchable(
     num_tokens: int, num_heads: int, topk: int, d_qk: int, page_block_size: int
 ) -> bool:
-    """True iff decode-dsv3_2-v2 supports this shape configuration."""
+    """True iff decode-dsv3_2 supports this shape configuration."""
     return (
         num_tokens <= _DECODE_MAX_TOKENS
         and d_qk == 576
-        and page_block_size == _DECODE_DSV3_2_V2_PAGE_BLOCK_SIZE
-        and (num_heads, topk) in _DECODE_DSV3_2_V2_DISPATCH
+        and page_block_size == _DECODE_DSV3_2_PAGE_BLOCK_SIZE
+        and (num_heads, topk) in _DECODE_DSV3_2_DISPATCH
     )
 
 
@@ -151,150 +132,6 @@ def _decode_dsv4_dispatchable(num_tokens: int, num_heads: int, topk: int, d_qk: 
     )
 
 
-def _compute_num_sm_parts(
-    num_heads: int,
-    device: torch.device,
-    num_tokens: Optional[int] = None,
-    topk: Optional[int] = None,
-) -> int:
-    """Choose split-K partition count for decode-dsv3_2.
-
-    Without shape (``num_tokens``/``topk`` = None): returns the FlashMLA
-    baseline so the wrapper can size its workspace for any later runtime call.
-
-    With shape: pick the partition count that maximises throughput by
-    weighing two effects in the kernel:
-
-    1. The decode-dsv3_2 kernel has a bf16-direct-write fast path
-       (``is_no_split=true``, skips f32 o_accum staging and the combine
-       kernel) whenever a partition fully covers each of its batches with
-       no neighbour-partition split. For ``s_q == 1`` callers this fires
-       when ``num_sm_parts <= num_tokens`` and per-batch work fits in
-       each partition.
-    2. Grid size = ``replicate_h × num_sm_parts``; falling below ~half the
-       SM count underfills the GPU and dominates any bf16-path savings.
-
-    The chosen rule: prefer ``min(num_tokens, baseline)`` (no-split path)
-    when it still fills at least half the SMs across the head-tile dim,
-    else fall back to the FlashMLA baseline. ``num_tokens == 1`` is a
-    common decode path; we take the no-split path unconditionally there
-    since the per-token launch overhead dominates even when underfilled.
-    """
-    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    replicate_h = (num_heads + _HPB - 1) // _HPB
-    baseline = max(num_sms // replicate_h, 1)
-    if num_tokens is None or topk is None:
-        return baseline
-    if num_tokens == 1:
-        return 1
-    no_split = min(num_tokens, baseline)
-    if no_split * replicate_h >= num_sms // 2:
-        return no_split
-    return baseline
-
-
-# Workspace section alignment. The combine kernel issues float4 loads against
-# o_accum, so every section start must be at least 16-byte aligned; 32 bytes
-# satisfies that and matches DecodingSchedMeta's __align__(32).
-_WORKSPACE_ALIGN = 32
-
-
-def _align_up(n: int, a: int = _WORKSPACE_ALIGN) -> int:
-    return (n + a - 1) // a * a
-
-
-def compute_sparse_mla_sm120_workspace_size(
-    max_num_tokens: int,
-    max_num_heads: int,
-    d_v: int = _D_V,
-    device: Optional[torch.device] = None,
-) -> int:
-    """Bytes required for ``workspace_buffer`` given max input bounds.
-
-    Layout (uint8 offsets, in order, each section start aligned to 32 bytes):
-        sched_meta:  num_sm_parts * 32 bytes
-        num_splits:  (num_tokens + 1) * 4 bytes
-        o_accum:     total_splits * num_heads * d_v * 4 bytes
-        lse_accum:   total_splits * num_heads * 4 bytes
-
-    where ``total_splits = num_tokens + num_sm_parts`` (FlashMLA's upper bound
-    on per-batch splits) and ``num_sm_parts`` depends on the device's SM count.
-
-    Returns the exact byte count needed when ``num_tokens == max_num_tokens``
-    and ``num_heads == max_num_heads``. Callers planning for a range should
-    pass the worst-case bounds.
-    """
-    if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    num_sm_parts = _compute_num_sm_parts(max_num_heads, device)
-    total_splits = max_num_tokens + num_sm_parts
-
-    return (
-        _align_up(num_sm_parts * 32)  # DecodingSchedMeta (8x int32)
-        + _align_up((max_num_tokens + 1) * 4)  # num_splits int32 prefix sum
-        + _align_up(total_splits * max_num_heads * d_v * 4)  # o_accum float32
-        + _align_up(total_splits * max_num_heads * 4)  # lse_accum float32
-    )
-
-
-def _partition_workspace(
-    workspace_buffer: torch.Tensor,
-    num_tokens: int,
-    num_heads: int,
-    d_v: int,
-    num_sm_parts: int,
-):
-    """Carve workspace_buffer into (sched_meta, num_splits, o_accum, lse_accum)
-    typed views. Each section start is 32-byte aligned (float4 + DecodingSchedMeta
-    requirement). Raises if the buffer is too small for the request.
-    """
-    if workspace_buffer.dtype != torch.uint8 or workspace_buffer.ndim != 1:
-        raise ValueError(
-            "workspace_buffer must be a 1-D uint8 tensor; got "
-            f"dtype={workspace_buffer.dtype}, ndim={workspace_buffer.ndim}"
-        )
-    total_splits = num_tokens + num_sm_parts
-    sched_bytes = _align_up(num_sm_parts * 32)
-    ns_bytes = _align_up((num_tokens + 1) * 4)
-    oa_bytes = _align_up(total_splits * num_heads * d_v * 4)
-    la_bytes = _align_up(total_splits * num_heads * 4)
-    need = sched_bytes + ns_bytes + oa_bytes + la_bytes
-    if workspace_buffer.numel() < need:
-        raise ValueError(
-            f"workspace_buffer too small: have {workspace_buffer.numel()} B, "
-            f"need {need} B for num_tokens={num_tokens}, num_heads={num_heads}, "
-            f"d_v={d_v}, num_sm_parts={num_sm_parts}"
-        )
-
-    # The base pointer of workspace_buffer is at least 256-byte aligned
-    # (cudaMalloc default), so all section starts inherit that alignment.
-    off = 0
-    sched_meta = (
-        workspace_buffer[off : off + num_sm_parts * 32]
-        .view(torch.int32)
-        .view(num_sm_parts * 8)
-    )
-    off += sched_bytes
-    num_splits = (
-        workspace_buffer[off : off + (num_tokens + 1) * 4]
-        .view(torch.int32)
-        .view(num_tokens + 1)
-    )
-    off += ns_bytes
-    o_accum = (
-        workspace_buffer[off : off + total_splits * num_heads * d_v * 4]
-        .view(torch.float32)
-        .view(total_splits, 1, num_heads, d_v)
-    )
-    off += oa_bytes
-    lse_accum = (
-        workspace_buffer[off : off + total_splits * num_heads * 4]
-        .view(torch.float32)
-        .view(total_splits, 1, num_heads)
-    )
-    return sched_meta, num_splits, o_accum, lse_accum
-
-
 @functools.cache
 def get_sparse_mla_sm120_module():
     """Build and cache the sparse-MLA SM120 module + bound custom op."""
@@ -302,7 +139,7 @@ def get_sparse_mla_sm120_module():
 
     @register_custom_op(
         "flashinfer::sparse_mla_sm120_paged_attention",
-        mutates_args=("output", "out_lse", "workspace_buffer"),
+        mutates_args=("output", "out_lse"),
     )
     def _paged_attention(
         q: torch.Tensor,
@@ -310,7 +147,6 @@ def get_sparse_mla_sm120_module():
         indices: torch.Tensor,
         output: torch.Tensor,
         out_lse: torch.Tensor,
-        workspace_buffer: torch.Tensor,
         sm_scale: float,
         d_v: int,
         topk_length: Optional[torch.Tensor],
@@ -329,9 +165,7 @@ def get_sparse_mla_sm120_module():
         kv_pbs = int(kv_cache.size(-3)) if kv_cache.ndim >= 3 else 0
         if (kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
                 and _decode_dsv4_dispatchable(num_tokens, num_heads, topk, d_qk, kv_pbs)):
-            # mid_out / mid_lse scratch is small enough to allocate per call
-            # (could be carved from workspace_buffer later for cudagraph
-            # alloc-free reuse if it ever shows up in profiling).
+            # mid_out / mid_lse scratch is small enough to allocate per call.
             num_splits_main = (topk + _BI - 1) // _BI
             extra_topk = (
                 int(extra_indices.size(-1)) if extra_indices is not None else 0
@@ -368,14 +202,9 @@ def get_sparse_mla_sm120_module():
             )
             return
 
-        # decode-dsv3_2-v2 fast path. V32 family (d_qk=576), V4-style warp-spec
-        # standalone kernel — the default V32 decode path. Falls through to
-        # the legacy v1 orchestrator below for unsupported shapes or when
-        # FLASHINFER_DSV3_2_KERNEL=v1 forces it.
-        if (
-            not _decode_dsv3_2_v2_disabled()
-            and _decode_dsv3_2_v2_dispatchable(num_tokens, num_heads, topk, d_qk, kv_pbs)
-        ):
+        # decode-dsv3_2 fast path. V32 family (d_qk=576), V4-style warp-spec
+        # standalone kernel — the V32 decode path.
+        if _decode_dsv3_2_dispatchable(num_tokens, num_heads, topk, d_qk, kv_pbs):
             num_splits = (topk + _BI - 1) // _BI
             mid_out = torch.empty(
                 (num_tokens, num_heads, num_splits, d_v),
@@ -387,7 +216,7 @@ def get_sparse_mla_sm120_module():
                 dtype=torch.float32,
                 device=q.device,
             )
-            module.sparse_mla_sm120_decode_dsv3_2_v2(
+            module.sparse_mla_sm120_decode_dsv3_2(
                 q,
                 kv_cache,
                 indices,
@@ -403,32 +232,16 @@ def get_sparse_mla_sm120_module():
             )
             return
 
-        # decode-dsv3_2 / prefill fallback path.
-        num_sm_parts = _compute_num_sm_parts(num_heads, q.device, num_tokens, topk)
-        # The decode-dsv3_2 path uses the workspace partitions; prefill writes
-        # output / out_lse directly and ignores them. Cap the partition
-        # request at the decode cutoff so the caller's workspace_buffer only
-        # needs to hold the decode-side scratch.
-        partition_tokens = min(num_tokens, _DECODE_MAX_TOKENS)
-        sched_meta, num_splits, o_accum, lse_accum = _partition_workspace(
-            workspace_buffer,
-            partition_tokens,
-            num_heads,
-            d_v,
-            num_sm_parts,
-        )
+        # Prefill fallback path (num_tokens > 64, or outside decode dispatch
+        # envelope). Orchestrator routes to the prefill kernel; both
+        # output / out_lse are written in place.
         module.sparse_mla_sm120_paged_attention(
             q,
             kv_cache,
             indices,
             output,
             out_lse,
-            o_accum,
-            lse_accum,
-            sched_meta,
-            num_splits,
             sm_scale,
-            num_sm_parts,
             topk_length,
             attn_sink,
             extra_kv_cache,
@@ -451,7 +264,6 @@ def sparse_mla_sm120_paged_attention(
     indices: torch.Tensor,
     output: torch.Tensor,
     out_lse: torch.Tensor,
-    workspace_buffer: torch.Tensor,
     sm_scale: float,
     *,
     d_v: int = _D_V,
@@ -464,7 +276,7 @@ def sparse_mla_sm120_paged_attention(
     r"""Sparse-MLA paged attention on SM120.
 
     Auto-dispatches decode (``num_tokens <= 64``) vs prefill (larger).
-    Mutates ``output``, ``out_lse``, and ``workspace_buffer`` in place.
+    Mutates ``output`` and ``out_lse`` in place.
 
     Parameters
     ----------
@@ -482,9 +294,6 @@ def sparse_mla_sm120_paged_attention(
         In-place output, shape ``[num_tokens, num_heads, d_v]``, dtype bf16.
     out_lse : torch.Tensor
         In-place log-sum-exp, shape ``[num_tokens, num_heads]``, dtype float32.
-    workspace_buffer : torch.Tensor
-        1-D uint8 scratch buffer. Size required:
-        :func:`compute_sparse_mla_sm120_workspace_size`.
     sm_scale : float
         Softmax scale (typically ``1 / sqrt(d_qk)``).
     d_v : int
@@ -518,7 +327,6 @@ def sparse_mla_sm120_paged_attention(
         indices,
         output,
         out_lse,
-        workspace_buffer,
         sm_scale,
         d_v,
         topk_length,
@@ -532,22 +340,16 @@ def sparse_mla_sm120_paged_attention(
 class BatchSparseMLAPagedAttentionWrapper:
     """Sparse-MLA paged attention wrapper for SM120 with cudagraph support.
 
-    Pre-allocates workspace + LSE buffer at construction so :meth:`run` is
+    Pre-allocates an LSE buffer at construction so :meth:`run` is
     allocation-free and safe to capture inside a CUDA graph.
-
-    Mirrors the :class:`B12xMoEWrapper` precedent (functional API + wrapper
-    class for cudagraph workflows).
 
     Parameters
     ----------
     max_num_tokens : int
         Worst-case ``num_tokens`` the wrapper will accept. Used to size the
-        ``out_lse`` buffer. The internal ``workspace_buffer`` is sized at the
-        decode cutoff (``num_tokens <= 64``) regardless — prefill writes
-        ``output``/``out_lse`` directly and does not touch the workspace.
+        ``out_lse`` buffer.
     max_num_heads : int
-        Worst-case ``num_heads``. Together with the decode-cutoff token bound
-        determines workspace size.
+        Worst-case ``num_heads``.
     d_v : int
         Value head dim. ``512`` for DSV3_2 / DSV4.
     device : Optional[torch.device]
@@ -583,18 +385,6 @@ class BatchSparseMLAPagedAttentionWrapper:
         self._max_num_heads = max_num_heads
         self._d_v = d_v
 
-        # Workspace is decode-only — sized at the decode cutoff (64 tokens)
-        # regardless of max_num_tokens. Prefill (num_tokens > 64) doesn't
-        # touch sched_meta / num_splits / o_accum / lse_accum.
-        ws_bytes = compute_sparse_mla_sm120_workspace_size(
-            max_num_tokens=_DECODE_MAX_TOKENS,
-            max_num_heads=max_num_heads,
-            d_v=d_v,
-            device=self._device,
-        )
-        self._workspace_buffer = torch.empty(
-            ws_bytes, dtype=torch.uint8, device=self._device
-        )
         # Pre-allocated LSE buffer; sliced to actual shape on run(). Sized
         # for prefill worst case since prefill writes here too.
         self._out_lse = torch.empty(
@@ -660,7 +450,6 @@ class BatchSparseMLAPagedAttentionWrapper:
             indices,
             output,
             out_lse_view,
-            self._workspace_buffer,
             sm_scale,
             d_v=self._d_v,
             topk_length=topk_length,

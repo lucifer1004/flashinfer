@@ -26,20 +26,14 @@
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Sparse-MLA SM120 paged attention orchestrator.
+// Sparse-MLA SM120 paged attention orchestrator (prefill-only).
 //
-// Single TVM-FFI entry point that:
-//   - Validates inputs (dtype / shape / contiguity)
-//   - Detects model type from d_qk (DSV3_2: 576, DSV4: 512)
-//   - Dispatches decode-dsv3_2 (num_tokens <= 64) vs prefill (larger)
-//   - For decode: launches sched + decode + combine
-//   - For prefill: launches prefill (single or dual cache)
-//
-// Workspace partitioning is handled by the Python wrapper; this orchestrator
-// takes pre-partitioned tensors directly to match the cutlass_mla precedent.
+// Decode for both DSV3_2 and DSV4 routes through the standalone
+// SparseMlaSm120DecodeDsv3_2 / SparseMlaSm120DecodeDsv4 entry points from
+// Python (see flashinfer/sparse_mla_sm120.py). This entry point handles
+// prefill dispatch for both model types (with optional dual cache for DSV4).
 
 #include <cuda_runtime.h>
-#include <flashinfer/attention/sparse_mla_sm120/common/sched_params.h>
 #include <flashinfer/attention/sparse_mla_sm120/model/model_type.h>
 
 #include <flashinfer/attention/sparse_mla_sm120/arch/common.cuh>
@@ -50,18 +44,7 @@ using tvm::ffi::Optional;
 
 namespace flashinfer::sparse_mla_sm120 {
 
-// Forward declarations (defined in sibling .cu files).
-void launch_get_sched_meta(int b, int topk, int extra_topk, int block_size_n, int fixed_overhead,
-                           int num_sm_parts, const int* topk_length, const int* extra_topk_length,
-                           DecodingSchedMeta* sched_meta, int* num_splits, cudaStream_t stream);
-
-bool sparse_mla_decode_dsv3_2_dispatch(
-    ModelType mt, int num_heads, int topk, int page_block_size, const bf16* Q,
-    const uint8_t* KV_cache, const int32_t* indices, float* o_accum, float* lse_accum, bf16* output,
-    float* out_lse, const DecodingSchedMeta* sched_meta, const int* num_splits_ptr, float sm_scale,
-    int num_batches, int s_q, int stride_kv_row, int num_sm_parts, const float* attn_sink,
-    const int* topk_length, cudaStream_t stream);
-
+// Forward declaration (defined in sparse_mla_sm120_prefill.cu).
 bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page_block_size,
                                  int topk_extra, int extra_page_block_size, const bf16* Q,
                                  const uint8_t* KV_cache, const int32_t* indices,
@@ -70,10 +53,6 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
                                  int stride_kv_row, int extra_stride_kv_row, const float* attn_sink,
                                  const int* topk_length, const int* extra_topk_length,
                                  cudaStream_t stream);
-
-bool launch_combine_dsv3_2(const float* o_accum, const float* lse_accum, bf16* output, float* out_lse,
-                       const int* num_splits_ptr, int batch, int s_q, int num_heads,
-                       int max_nsplits, const float* attn_sink, cudaStream_t stream);
 
 namespace {
 
@@ -110,11 +89,7 @@ void SparseMlaSm120PagedAttention(
     TensorView indices,     // [num_tokens, topk] int32 (-1 = skip)
     TensorView output,      // [num_tokens, num_heads, d_v] bf16 — in-place
     TensorView out_lse,     // [num_tokens, num_heads] f32 — in-place
-    TensorView o_accum,     // [num_sm_parts, s_q, num_heads, d_v] f32
-    TensorView lse_accum,   // [num_sm_parts, s_q, num_heads] f32
-    TensorView sched_meta,  // [num_sm_parts] DecodingSchedMeta — bytes-typed
-    TensorView num_splits,  // [batch + 1] int32
-    double sm_scale, int64_t num_sm_parts,
+    double sm_scale,
     Optional<TensorView> topk_length,        // [num_tokens] int32, optional
     Optional<TensorView> attn_sink,          // [num_heads] f32, optional
     Optional<TensorView> extra_kv_cache,     // optional dual cache
@@ -193,72 +168,22 @@ void SparseMlaSm120PagedAttention(
   const auto O_ptr = static_cast<bf16*>(output.data_ptr());
   const auto LSE_ptr = static_cast<float*>(out_lse.data_ptr());
 
-  // ── Prefill path (num_tokens > 64) ────────────────────────────────
-  // Prefill writes output and out_lse directly; o_accum/lse_accum/sched_meta/
-  // num_splits are unused but still passed in (Python wrapper allocates a
-  // shared workspace regardless).
-  if (num_tokens > 64) {
-    const bool ok = sparse_mla_prefill_dispatch(
-        mt, num_heads, topk, page_block_size, extra_topk, extra_page_block_size, Q_ptr, KV_ptr,
-        idx_ptr, extra_kv_ptr, extra_idx_ptr, O_ptr, LSE_ptr, static_cast<float>(sm_scale),
-        num_tokens, stride_kv_row, extra_stride_kv_row, attn_sink_ptr, tl_ptr, etl_ptr, stream);
-    TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA prefill configuration: "
-                       << "model=" << (mt == ModelType::DSV3_2 ? "DSV3_2" : "DSV4")
-                       << " num_heads=" << num_heads << " topk=" << topk
-                       << " page_block_size=" << page_block_size << " topk_extra=" << extra_topk
-                       << " extra_page_block_size=" << extra_page_block_size;
-    return;
-  }
+  // Decode (num_tokens <= 64) is dispatched by Python directly through the
+  // standalone decode-dsv3_2 / decode-dsv4 entry points. The orchestrator
+  // only handles prefill.
+  TVM_FFI_ICHECK_GT(num_tokens, 64)
+      << "Decode (num_tokens <= 64) must go through sparse_mla_sm120_decode_dsv3_2 "
+         "or sparse_mla_sm120_decode_dsv4; got num_tokens=" << num_tokens;
 
-  // ── Decode path (num_tokens <= 64) ──────────────────────────────────
-  const int s_q = 1;
-  const int num_batches = num_tokens;  // s_q == 1 ⇒ tokens == batches
-  constexpr int BI = 64;
-  constexpr int FIXED_OVERHEAD = 5;
-
-  CHECK_INPUT_AND_TYPE(o_accum, dl_float32);
-  CHECK_INPUT_AND_TYPE(lse_accum, dl_float32);
-  CHECK_INPUT(sched_meta);
-  CHECK_INPUT_AND_TYPE(num_splits, dl_int32);
-
-  // 1) Scheduler: emit sched_meta + num_splits prefix sum.
-  auto* meta_ptr = reinterpret_cast<DecodingSchedMeta*>(sched_meta.data_ptr());
-  auto* ns_ptr = static_cast<int*>(num_splits.data_ptr());
-  launch_get_sched_meta(num_batches, topk, extra_topk, BI, FIXED_OVERHEAD,
-                        static_cast<int>(num_sm_parts), tl_ptr, etl_ptr, meta_ptr, ns_ptr, stream);
-
-  // 2) Decode dispatch. Orchestrator decode is V32-only; DSv4 decode is
-  //    handled by the standalone decode-dsv4 entry, which Python routes
-  //    to before this orchestrator is called. If a DSv4 request reaches
-  //    this path the dispatch fails fast.
-  TVM_FFI_ICHECK_EQ(static_cast<int>(mt), static_cast<int>(ModelType::DSV3_2))
-      << "Orchestrator decode supports DSV3_2 only; DSV4 decode must go through "
-         "sparse_mla_sm120_decode_dsv4.";
-  TVM_FFI_ICHECK(extra_kv_ptr == nullptr)
-      << "DSV3_2 decode has no dual-cache support (extra_kv_cache must be nullptr).";
-  auto* oa_ptr = static_cast<float*>(o_accum.data_ptr());
-  auto* la_ptr = static_cast<float*>(lse_accum.data_ptr());
-  const bool ok = sparse_mla_decode_dsv3_2_dispatch(
-      mt, num_heads, topk, page_block_size, Q_ptr, KV_ptr, idx_ptr, oa_ptr, la_ptr, O_ptr, LSE_ptr,
-      meta_ptr, ns_ptr, static_cast<float>(sm_scale), num_batches, s_q, stride_kv_row,
-      static_cast<int>(num_sm_parts), attn_sink_ptr, tl_ptr, stream);
-  TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA decode configuration: "
-                     << "num_heads=" << num_heads << " topk=" << topk
-                     << " page_block_size=" << page_block_size;
-
-  // 3) Combine: merge per-split partials when num_sm_parts > 1.
-  // Skip the combine launch entirely when no splits are possible: either
-  // num_sm_parts == 1 (single partition, decode writes output directly), or
-  // num_sm_parts <= num_batches (each partition covers a whole batch end-to-
-  // end on the s_q==1 path, so decode takes the bf16 fast path and o_accum
-  // is never populated). Matches upstream's v1-bypass behavior.
-  if (num_sm_parts > 1 && num_sm_parts > num_batches) {
-    const bool combine_ok =
-        launch_combine_dsv3_2(oa_ptr, la_ptr, O_ptr, LSE_ptr, ns_ptr, num_batches, s_q, num_heads,
-                          static_cast<int>(num_sm_parts), attn_sink_ptr, stream);
-    TVM_FFI_ICHECK(combine_ok) << "combine-dsv3_2 max_nsplits=" << num_sm_parts
-                               << " exceeds the compiled MAX_SPLITS=256 ceiling";
-  }
+  const bool ok = sparse_mla_prefill_dispatch(
+      mt, num_heads, topk, page_block_size, extra_topk, extra_page_block_size, Q_ptr, KV_ptr,
+      idx_ptr, extra_kv_ptr, extra_idx_ptr, O_ptr, LSE_ptr, static_cast<float>(sm_scale),
+      num_tokens, stride_kv_row, extra_stride_kv_row, attn_sink_ptr, tl_ptr, etl_ptr, stream);
+  TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA prefill configuration: "
+                     << "model=" << (mt == ModelType::DSV3_2 ? "DSV3_2" : "DSV4")
+                     << " num_heads=" << num_heads << " topk=" << topk
+                     << " page_block_size=" << page_block_size << " topk_extra=" << extra_topk
+                     << " extra_page_block_size=" << extra_page_block_size;
 }
 
 }  // namespace flashinfer::sparse_mla_sm120

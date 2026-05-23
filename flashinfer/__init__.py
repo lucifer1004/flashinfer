@@ -192,9 +192,6 @@ from .sparse_mla_sm120 import (
     BatchSparseMLAPagedAttentionWrapper as BatchSparseMLAPagedAttentionWrapper,
 )
 from .sparse_mla_sm120 import (
-    compute_sparse_mla_sm120_workspace_size as compute_sparse_mla_sm120_workspace_size,
-)
-from .sparse_mla_sm120 import (
     sparse_mla_sm120_paged_attention as sparse_mla_sm120_paged_attention,
 )
 from .xqa import xqa as xqa

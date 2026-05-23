@@ -1153,19 +1153,13 @@ sparse_mla_sm120_paged_trace = TraceTemplate(
             abbrev="topk",
         ),
         "page_block_size": Const(
-            description="KV cache page block size (64 for DSV4, 1 for DSV3_2).",
+            description="KV cache page block size (64 for both DSV4 and DSV3_2).",
             abbrev="ps",
         ),
         "num_pages": Var(description="Total allocated pages in the KV cache."),
         "kv_bytes_per_token": Const(
             description="Byte-packed FP8 token stride (weights + interleaved scales).",
             abbrev="kvb",
-        ),
-        "workspace_size": Var(
-            description=(
-                "Bytes of caller-allocated workspace_buffer. See "
-                "compute_sparse_mla_sm120_workspace_size."
-            ),
         ),
     },
     inputs={
@@ -1195,11 +1189,6 @@ sparse_mla_sm120_paged_trace = TraceTemplate(
             ["num_tokens", "num_heads"],
             dtype="float32",
             description="In-place log-sum-exp (2-based; merges attn_sink when present).",
-        ),
-        "workspace_buffer": Tensor(
-            ["workspace_size"],
-            dtype="uint8",
-            description="In-place scratch (sched_meta + num_splits + o_accum + lse_accum).",
         ),
         "sm_scale": Scalar(
             "float32", description="Softmax scale, typically 1/sqrt(head_dim_qk)."
