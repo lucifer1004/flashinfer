@@ -58,7 +58,10 @@ from .autotuner import (
     TuningConfig,
 )
 from .jit.sparse_mla_sm120 import gen_sparse_mla_sm120_module
-from .trace.templates.attention import sparse_mla_sm120_paged_trace
+from .trace.templates.attention import (
+    sparse_mla_sm120_decode_dsv4_trace,
+    sparse_mla_sm120_paged_trace,
+)
 from .utils import (
     register_custom_op,
     register_fake_op,
@@ -689,7 +692,7 @@ def sparse_mla_sm120_decode_dsv4_autotune(cache_path: Optional[str] = None):
 
 
 @supported_compute_capability([120, 121])
-@flashinfer_api
+@flashinfer_api(trace=sparse_mla_sm120_decode_dsv4_trace)
 def sparse_mla_sm120_decode_dsv4(
     q: torch.Tensor,
     kv_cache: torch.Tensor,

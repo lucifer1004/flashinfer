@@ -192,6 +192,12 @@ from .sparse_mla_sm120 import (
     BatchSparseMLAPagedAttentionWrapper as BatchSparseMLAPagedAttentionWrapper,
 )
 from .sparse_mla_sm120 import (
+    sparse_mla_sm120_decode_dsv4 as sparse_mla_sm120_decode_dsv4,
+)
+from .sparse_mla_sm120 import (
+    sparse_mla_sm120_decode_dsv4_autotune as sparse_mla_sm120_decode_dsv4_autotune,
+)
+from .sparse_mla_sm120 import (
     sparse_mla_sm120_paged_attention as sparse_mla_sm120_paged_attention,
 )
 from .xqa import xqa as xqa
