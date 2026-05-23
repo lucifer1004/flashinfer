@@ -188,6 +188,18 @@ from .trtllm_low_latency_gemm import (
     prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
+from .sparse_mla_sm120 import (
+    BatchSparseMLAPagedAttentionWrapper as BatchSparseMLAPagedAttentionWrapper,
+)
+from .sparse_mla_sm120 import (
+    sparse_mla_sm120_decode_dsv4 as sparse_mla_sm120_decode_dsv4,
+)
+from .sparse_mla_sm120 import (
+    sparse_mla_sm120_decode_dsv4_autotune as sparse_mla_sm120_decode_dsv4_autotune,
+)
+from .sparse_mla_sm120 import (
+    sparse_mla_sm120_paged_attention as sparse_mla_sm120_paged_attention,
+)
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
