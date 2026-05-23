@@ -53,9 +53,9 @@
 //
 // Template params (all constexpr):
 //   MT:              ModelType (DSV3_2 / DSV4)
-//   CM:              ComputeMode (FP8 / BF16) — currently FP8 only
+//   CM:              ComputeMode (FP8 / BF16) for the QK MMA; XV is always FP8
 //   NUM_HEADS:       8, 16, 64, 128 (NUM_HEADS < HPB=16 zero-pads + gates)
-//   TOPK:            512, 1024, 2048
+//   TOPK:            128, 512, 1024, 2048
 //   PAGE_BLOCK_SIZE: 64 (DSV3_2 and DSV4 both use the 64-token page layout)
 // ============================================================================
 
@@ -84,7 +84,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
   constexpr int page_block_size = PAGE_BLOCK_SIZE;
   const size_t stride_kv_block = cold.stride_kv_block;
   using KV = KVCacheTraits<MT>;
-  using CT = ComputeTraits<MT, CM>;
+  // CT pinned to FP8: XV always uses FP8 W; CM only flips the QK side.
+  using CT = ComputeTraits<MT, ComputeMode::FP8>;
   using L = SmemLayout<MT, CM>;
   using IO = KVIOTraits<MT>;
 
@@ -157,8 +158,12 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
     const int32_t* idx_base = indices + (size_t)s_i * TOPK;
 
-    quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
-                                         sm.reduce_buf, VALID_HPB);
+    if constexpr (CM == ComputeMode::BF16) {
+      load_q_bf16_to_smem<MT, MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB);
+    } else {
+      quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
+                                           sm.reduce_buf, VALID_HPB);
+    }
     QRopeRegs q_rope_regs = preload_q_rope_regs(sm.q_rope, lane);
 
     for (int h = threadIdx.x; h < HPB; h += MATH_THREADS) sm.m_smem[h] = -1e30f;
@@ -204,31 +209,71 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       KVRopePrefetch rope_pf = prefetch_kv_rope(
           reinterpret_cast<const bf16*>(entry_base[gid] + KV::KV_ROPE_GMEM_OFFSET), lane);
 
-      // ── QK nope (block-scaled FP8 MMA) ─────────────────────
+      // ── QK nope MMA ─────────────────────
       float qk[4] = {0.f, 0.f, 0.f, 0.f};
       const uint8_t* kv_gid_base = kv_warp_base + gid * KV::KV_SMEM_STRIDE;
+      if constexpr (CM == ComputeMode::BF16) {
+        // BF16 m16n8k16 with per-thread FP8→BF16 dequant on KV.
 #pragma unroll
-      for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
-        uint8_t sfa = fp32_to_ue8m0(sm.q_nope_sc[(gid + (lane & 1) * 8) * KV::NUM_SCALES + blk]);
-        uint8_t sfb;
-        if constexpr (KV::SCALE_IN_KV_SMEM) {
-          sfb = fp32_to_ue8m0(reinterpret_cast<const float*>(kv_gid_base + KV::D_NOPE)[blk]);
-        } else {
-          sfb = sm.kv_scale_bufs[ti & 1][(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk];
+        for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
+          float scale_f;
+          if constexpr (KV::SCALE_IN_KV_SMEM) {
+            scale_f = reinterpret_cast<const float*>(kv_gid_base + KV::D_NOPE)[blk];
+          } else {
+            scale_f = ue8m0_to_fp32(
+                sm.kv_scale_bufs[ti & 1][(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk]);
+          }
+#pragma unroll
+          for (int ks = 0; ks < KV::QUANT_TILE / 16; ks++) {
+            int ko = blk * KV::QUANT_TILE + ks * 16;
+            uint32_t a0, a1, a2, a3;
+            ldmatrix_load_A_bf16(a0, a1, a2, a3, sm.q_nope_bf16 + ko, KV::Q_NOPE_BF16_STRIDE,
+                                 lane);
+            uint16_t p0 = *reinterpret_cast<const uint16_t*>(kv_gid_base + ko + 2 * tid);
+            uint16_t p1 = *reinterpret_cast<const uint16_t*>(kv_gid_base + ko + 2 * tid + 8);
+            uint32_t f16x2_0, f16x2_1;
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16x2_0) : "h"(p0));
+            asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16x2_1) : "h"(p1));
+            __half2 h2_0 = *reinterpret_cast<__half2*>(&f16x2_0);
+            __half2 h2_1 = *reinterpret_cast<__half2*>(&f16x2_1);
+            float fk0 = __low2float(h2_0) * scale_f, fk1 = __high2float(h2_0) * scale_f;
+            float fk2 = __low2float(h2_1) * scale_f, fk3 = __high2float(h2_1) * scale_f;
+            uint32_t b0, b1;
+            asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(b0) : "f"(fk1), "f"(fk0));
+            asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(b1) : "f"(fk3), "f"(fk2));
+            MmaBf16Result r =
+                mma_bf16_m16n8k16(a0, a1, a2, a3, b0, b1, qk[0], qk[1], qk[2], qk[3]);
+            qk[0] = r.d0;
+            qk[1] = r.d1;
+            qk[2] = r.d2;
+            qk[3] = r.d3;
+          }
         }
+      } else {
+#pragma unroll
+        for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
+          uint8_t sfa =
+              fp32_to_ue8m0(sm.q_nope_sc[(gid + (lane & 1) * 8) * KV::NUM_SCALES + blk]);
+          uint8_t sfb;
+          if constexpr (KV::SCALE_IN_KV_SMEM) {
+            sfb = fp32_to_ue8m0(reinterpret_cast<const float*>(kv_gid_base + KV::D_NOPE)[blk]);
+          } else {
+            sfb = sm.kv_scale_bufs[ti & 1][(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk];
+          }
 
 #pragma unroll
-        for (int ks = 0; ks < QK_NOPE_KSTEPS; ks++) {
-          int ko = blk * KV::QUANT_TILE + ks * 32;
-          uint32_t a0, a1, a2, a3, b0, b1;
-          ldmatrix_load_A_fp8(a0, a1, a2, a3, sm.q_nope_fp8 + ko, KV::Q_NOPE_STRIDE, lane);
-          ldmatrix_load_B_fp8(b0, b1, kv_warp_base + ko, KV::KV_SMEM_STRIDE, lane);
-          MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, qk[0], qk[1],
-                                                         qk[2], qk[3], sfa, sfb);
-          qk[0] = r.d0;
-          qk[1] = r.d1;
-          qk[2] = r.d2;
-          qk[3] = r.d3;
+          for (int ks = 0; ks < QK_NOPE_KSTEPS; ks++) {
+            int ko = blk * KV::QUANT_TILE + ks * 32;
+            uint32_t a0, a1, a2, a3, b0, b1;
+            ldmatrix_load_A_fp8(a0, a1, a2, a3, sm.q_nope_fp8 + ko, KV::Q_NOPE_STRIDE, lane);
+            ldmatrix_load_B_fp8(b0, b1, kv_warp_base + ko, KV::KV_SMEM_STRIDE, lane);
+            MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, qk[0], qk[1],
+                                                           qk[2], qk[3], sfa, sfb);
+            qk[0] = r.d0;
+            qk[1] = r.d1;
+            qk[2] = r.d2;
+            qk[3] = r.d3;
+          }
         }
       }
 
@@ -564,7 +609,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1) sparse_mla_prefill_mg_kernel
   const size_t stride_kv_block = cold.stride_kv_block;
   const size_t stride_kv_block_extra = cold.stride_kv_block_extra;
   using KV = KVCacheTraits<MT>;
-  using CT = ComputeTraits<MT, CM>;
+  // CT pinned to FP8: XV always uses FP8 W; CM only flips the QK side.
+  using CT = ComputeTraits<MT, ComputeMode::FP8>;
   using LMG = SmemLayoutMG<MT, CM>;
   using IO = KVIOTraits<MT>;
   using SMG = SmemPtrsMG<MT, CM>;
@@ -714,8 +760,14 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1) sparse_mla_prefill_mg_kernel
     for (int g = 0; g < MG_N_HG; g++) {
       const bf16* q_base_g =
           Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)(h_start + g * HPB) * KV::D_QK;
-      quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8[g], sm.q_nope_sc[g],
-                                           sm.q_rope + g * HPB * D_ROPE, q_base_g, sm.reduce_buf);
+      if constexpr (CM == ComputeMode::BF16) {
+        load_q_bf16_to_smem<MT, MATH_THREADS>(sm.q_nope_bf16[g], sm.q_rope + g * HPB * D_ROPE,
+                                              q_base_g);
+      } else {
+        quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8[g], sm.q_nope_sc[g],
+                                             sm.q_rope + g * HPB * D_ROPE, q_base_g,
+                                             sm.reduce_buf);
+      }
     }
 
     // Preload Q rope to registers for both groups
@@ -792,30 +844,69 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1) sparse_mla_prefill_mg_kernel
       for (int g = 0; g < MG_N_HG; g++) {
         const uint8_t* kv_gid_base = kv_warp_base + gid * KV::KV_SMEM_STRIDE;
 
-        // QK nope (block-scaled FP8 MMA)
+        // QK nope MMA. BF16: m16n8k16 with per-thread FP8→BF16 dequant on KV.
         float qk[4] = {0.f, 0.f, 0.f, 0.f};
+        if constexpr (CM == ComputeMode::BF16) {
 #pragma unroll
-        for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
-          uint8_t sfa =
-              fp32_to_ue8m0(sm.q_nope_sc[g][(gid + (lane & 1) * 8) * KV::NUM_SCALES + blk]);
-          uint8_t sfb;
-          if constexpr (KV::SCALE_IN_KV_SMEM) {
-            sfb = fp32_to_ue8m0(reinterpret_cast<const float*>(kv_gid_base + KV::D_NOPE)[blk]);
-          } else {
-            sfb = sm.kv_scale_bufs[ti & 1][(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk];
+          for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
+            float scale_f;
+            if constexpr (KV::SCALE_IN_KV_SMEM) {
+              scale_f = reinterpret_cast<const float*>(kv_gid_base + KV::D_NOPE)[blk];
+            } else {
+              scale_f = ue8m0_to_fp32(
+                  sm.kv_scale_bufs[ti & 1][(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk]);
+            }
+#pragma unroll
+            for (int ks = 0; ks < KV::QUANT_TILE / 16; ks++) {
+              int ko = blk * KV::QUANT_TILE + ks * 16;
+              uint32_t a0, a1, a2, a3;
+              ldmatrix_load_A_bf16(a0, a1, a2, a3, sm.q_nope_bf16[g] + ko,
+                                   KV::Q_NOPE_BF16_STRIDE, lane);
+              uint16_t p0 = *reinterpret_cast<const uint16_t*>(kv_gid_base + ko + 2 * tid);
+              uint16_t p1 = *reinterpret_cast<const uint16_t*>(kv_gid_base + ko + 2 * tid + 8);
+              uint32_t f16x2_0, f16x2_1;
+              asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16x2_0) : "h"(p0));
+              asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(f16x2_1) : "h"(p1));
+              __half2 h2_0 = *reinterpret_cast<__half2*>(&f16x2_0);
+              __half2 h2_1 = *reinterpret_cast<__half2*>(&f16x2_1);
+              float fk0 = __low2float(h2_0) * scale_f, fk1 = __high2float(h2_0) * scale_f;
+              float fk2 = __low2float(h2_1) * scale_f, fk3 = __high2float(h2_1) * scale_f;
+              uint32_t b0, b1;
+              asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(b0) : "f"(fk1), "f"(fk0));
+              asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(b1) : "f"(fk3), "f"(fk2));
+              MmaBf16Result r =
+                  mma_bf16_m16n8k16(a0, a1, a2, a3, b0, b1, qk[0], qk[1], qk[2], qk[3]);
+              qk[0] = r.d0;
+              qk[1] = r.d1;
+              qk[2] = r.d2;
+              qk[3] = r.d3;
+            }
           }
+        } else {
 #pragma unroll
-          for (int ks = 0; ks < QK_NOPE_KSTEPS; ks++) {
-            int ko = blk * KV::QUANT_TILE + ks * 32;
-            uint32_t a0, a1, a2, a3, b0, b1;
-            ldmatrix_load_A_fp8(a0, a1, a2, a3, sm.q_nope_fp8[g] + ko, KV::Q_NOPE_STRIDE, lane);
-            ldmatrix_load_B_fp8(b0, b1, kv_warp_base + ko, KV::KV_SMEM_STRIDE, lane);
-            MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, qk[0], qk[1],
-                                                           qk[2], qk[3], sfa, sfb);
-            qk[0] = r.d0;
-            qk[1] = r.d1;
-            qk[2] = r.d2;
-            qk[3] = r.d3;
+          for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
+            uint8_t sfa =
+                fp32_to_ue8m0(sm.q_nope_sc[g][(gid + (lane & 1) * 8) * KV::NUM_SCALES + blk]);
+            uint8_t sfb;
+            if constexpr (KV::SCALE_IN_KV_SMEM) {
+              sfb = fp32_to_ue8m0(reinterpret_cast<const float*>(kv_gid_base + KV::D_NOPE)[blk]);
+            } else {
+              sfb = sm.kv_scale_bufs[ti & 1][(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk];
+            }
+#pragma unroll
+            for (int ks = 0; ks < QK_NOPE_KSTEPS; ks++) {
+              int ko = blk * KV::QUANT_TILE + ks * 32;
+              uint32_t a0, a1, a2, a3, b0, b1;
+              ldmatrix_load_A_fp8(a0, a1, a2, a3, sm.q_nope_fp8[g] + ko, KV::Q_NOPE_STRIDE,
+                                  lane);
+              ldmatrix_load_B_fp8(b0, b1, kv_warp_base + ko, KV::KV_SMEM_STRIDE, lane);
+              MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(a0, a1, a2, a3, b0, b1, qk[0],
+                                                             qk[1], qk[2], qk[3], sfa, sfb);
+              qk[0] = r.d0;
+              qk[1] = r.d1;
+              qk[2] = r.d2;
+              qk[3] = r.d3;
+            }
           }
         }
 

@@ -46,8 +46,11 @@ struct SmemLayout {
   using CT = ComputeTraits<MT, CM>;
 
   // Q buffers
-  static constexpr size_t SMEM_Q_NOPE = HPB * KV::Q_NOPE_STRIDE;
-  static constexpr size_t SMEM_Q_SC = HPB * KV::NUM_SCALES * sizeof(float);
+  static constexpr bool BF16_Q = (CM == ComputeMode::BF16);
+  static constexpr size_t SMEM_Q_NOPE =
+      BF16_Q ? HPB * KV::Q_NOPE_BF16_STRIDE * sizeof(bf16) : HPB * KV::Q_NOPE_STRIDE;
+  static constexpr size_t SMEM_Q_SC =
+      BF16_Q ? 0 : HPB * KV::NUM_SCALES * sizeof(float);
   static constexpr size_t SMEM_Q_ROPE = HPB * D_ROPE * sizeof(bf16);
 
   // KV double buffer
@@ -67,9 +70,10 @@ struct SmemLayout {
   static constexpr size_t SMEM_M = HPB * sizeof(float);
   static constexpr size_t SMEM_L = HPB * sizeof(float);
 
-  // XV phase — w_fp8 for all V chunks (batch W quant, single barrier)
+  // XV phase — w_fp8 for all V chunks (batch W quant, single barrier).
+  // XV is always FP8; CM only flips the QK side.
   static constexpr size_t SMEM_W_SC_ALL = CT::N_V_CHUNKS * HPB * sizeof(float);
-  static constexpr size_t SMEM_W_FP8_ONE = (CM == ComputeMode::FP8) ? HPB * (BI + 16) : 0;
+  static constexpr size_t SMEM_W_FP8_ONE = HPB * (BI + 16);
   static constexpr size_t SMEM_W_FP8 = SMEM_W_FP8_ONE * CT::N_V_CHUNKS;
 
   // Mbarrier (double-buffered)
@@ -102,8 +106,11 @@ struct SmemLayoutMG {
   using CT = ComputeTraits<MT, CM>;
   static constexpr int N_HG = 2;
 
-  static constexpr size_t SMEM_Q_NOPE = HPB * KV::Q_NOPE_STRIDE;
-  static constexpr size_t SMEM_Q_SC = HPB * KV::NUM_SCALES * sizeof(float);
+  static constexpr bool BF16_Q = (CM == ComputeMode::BF16);
+  static constexpr size_t SMEM_Q_NOPE =
+      BF16_Q ? HPB * KV::Q_NOPE_BF16_STRIDE * sizeof(bf16) : HPB * KV::Q_NOPE_STRIDE;
+  static constexpr size_t SMEM_Q_SC =
+      BF16_Q ? 0 : HPB * KV::NUM_SCALES * sizeof(float);
   static constexpr size_t SMEM_KV_BUF = BI * KV::KV_SMEM_STRIDE;
   static constexpr size_t SMEM_KV_SCALE_BUF =
       SmemLayout<MT, CM>::NEED_SCALE_BUF ? BI * KV::SCALE_BYTES_PER_TOKEN : 0;
@@ -114,7 +121,7 @@ struct SmemLayoutMG {
   static constexpr size_t SMEM_M = N_HG * HPB * sizeof(float);
   static constexpr size_t SMEM_L = N_HG * HPB * sizeof(float);
   static constexpr size_t SMEM_W_SC_ALL = N_HG * CT::N_V_CHUNKS * HPB * sizeof(float);
-  static constexpr size_t SMEM_W_FP8_MG = (CM == ComputeMode::FP8) ? N_HG * HPB * (BI + 16) : 0;
+  static constexpr size_t SMEM_W_FP8_MG = N_HG * HPB * (BI + 16);
   // Scratch area: q_rope staging (O2 overlap) and xv_rope weight staging
   // q_rope needs: N_HG * HPB * D_ROPE * sizeof(bf16) = 4096 bytes
   // xv_rope needs: HPB * BI * sizeof(bf16) = 2048 bytes
@@ -155,7 +162,10 @@ struct SmemPtrsMG {
   static constexpr int WSC_GRP_STRIDE = CT::N_V_CHUNKS * HPB;
   static constexpr int WFP8_GRP_SIZE = HPB * (BI + 16);
 
+  // q_nope_fp8 / q_nope_bf16 alias the same OFF_Q_NOPE region; one is used
+  // per ComputeMode. q_nope_sc is empty under CM=BF16.
   uint8_t* q_nope_fp8[N_HG];
+  bf16* q_nope_bf16[N_HG];
   float* q_nope_sc[N_HG];
   bf16* q_rope;  // O2: both groups stored sequentially in v_trans area
   uint8_t* kv_bufs[2];
@@ -172,6 +182,8 @@ struct SmemPtrsMG {
     SmemPtrsMG s;
     s.q_nope_fp8[0] = (uint8_t*)(base + LMG::OFF_Q_NOPE0);
     s.q_nope_fp8[1] = (uint8_t*)(base + LMG::OFF_Q_NOPE1);
+    s.q_nope_bf16[0] = (bf16*)(base + LMG::OFF_Q_NOPE0);
+    s.q_nope_bf16[1] = (bf16*)(base + LMG::OFF_Q_NOPE1);
     s.q_nope_sc[0] = (float*)(base + LMG::OFF_Q_SC0);
     s.q_nope_sc[1] = (float*)(base + LMG::OFF_Q_SC1);
     s.q_rope = (bf16*)(base + LMG::OFF_SCRATCH);
@@ -200,7 +212,10 @@ template <ModelType MT, ComputeMode CM>
 struct SmemPtrs {
   using L = SmemLayout<MT, CM>;
 
+  // q_nope_fp8 / q_nope_bf16 alias the same OFF_Q_NOPE region; one is used
+  // per ComputeMode. q_nope_sc is empty under CM=BF16.
   uint8_t* q_nope_fp8;
+  bf16* q_nope_bf16;
   float* q_nope_sc;
   bf16* q_rope;
   uint8_t* kv_bufs[2];
@@ -216,6 +231,7 @@ struct SmemPtrs {
   __device__ static SmemPtrs init(char* base) {
     SmemPtrs s;
     s.q_nope_fp8 = (uint8_t*)(base + L::OFF_Q_NOPE);
+    s.q_nope_bf16 = (bf16*)(base + L::OFF_Q_NOPE);
     s.q_nope_sc = (float*)(base + L::OFF_Q_SC);
     s.q_rope = (bf16*)(base + L::OFF_Q_ROPE);
     s.kv_bufs[0] = (uint8_t*)(base + L::OFF_KV0);

@@ -73,6 +73,8 @@ struct KVCacheTraits<ModelType::DSV3_2> {
 
   // Q nope stride (padded for ldmatrix alignment + bank conflict avoidance)
   static constexpr int Q_NOPE_STRIDE = D_NOPE + 16;  // 528
+  // Unused for DSV3_2 prefill; declared so SmemLayout<DSV3_2, BF16> compiles.
+  static constexpr int Q_NOPE_BF16_STRIDE = D_NOPE + 8;  // 520
 
   // V = pure nope (no rope component)
   static constexpr bool V_HAS_ROPE = false;
@@ -121,6 +123,7 @@ struct KVCacheTraits<ModelType::DSV4> {
 
   // Q nope stride
   static constexpr int Q_NOPE_STRIDE = D_NOPE + 16;  // 464
+  static constexpr int Q_NOPE_BF16_STRIDE = D_NOPE + 8;  // 456 bf16 (912 B)
 
   // V = nope[0:448] + rope[0:64]
   // XV nope: V_CHUNK=128, pad 448→512, MMA same as DSV3_2

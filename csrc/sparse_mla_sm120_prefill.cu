@@ -171,49 +171,53 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
                                    float* out_lse, float sm_scale, int num_tokens,
                                    size_t stride_kv_block, const int* topk_length_ptr,
                                    cudaStream_t stream) {
-#define DISPATCH_SG(NH, TK)                                                              \
-  launch_prefill_sg<ModelType::DSV4, ComputeMode::FP8, NH, TK, 64>(                    \
+#define DISPATCH_SG_CM(CM, NH, TK)                                                       \
+  launch_prefill_sg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64>(                     \
       Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block, \
       topk_length_ptr, stream)
 
-#define DISPATCH_MG(NH, TK)                                                                        \
-  launch_prefill_mg<ModelType::DSV4, ComputeMode::FP8, NH, TK, 64>(                              \
+#define DISPATCH_MG_CM(CM, NH, TK)                                                                 \
+  launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64>(                               \
       Q, KV, indices, /*KV_extra=*/nullptr, /*idx_extra=*/nullptr, attn_sink, output, out_lse,     \
       sm_scale, num_tokens, stride_kv_block, /*stride_kv_block_extra=*/(size_t)0, topk_length_ptr, \
       /*topk_length_extra=*/nullptr, stream)
 
-#define DISPATCH_BY_NH(TK)    \
-  do {                        \
-    switch (num_heads) {      \
-      case 16:                \
-        DISPATCH_SG(16, TK);  \
-        return true;          \
-      case 32:                \
-        DISPATCH_MG(32, TK);  \
-        return true;          \
-      case 64:                \
-        DISPATCH_MG(64, TK);  \
-        return true;          \
-      case 128:               \
-        DISPATCH_MG(128, TK); \
-        return true;          \
-      default:                \
-        return false;         \
-    }                         \
+#define DISPATCH_BY_NH_CM(CM, TK)    \
+  do {                                \
+    switch (num_heads) {              \
+      case 16:                        \
+        DISPATCH_SG_CM(CM, 16, TK);  \
+        return true;                  \
+      case 32:                        \
+        DISPATCH_MG_CM(CM, 32, TK);  \
+        return true;                  \
+      case 64:                        \
+        DISPATCH_MG_CM(CM, 64, TK);  \
+        return true;                  \
+      case 128:                       \
+        DISPATCH_MG_CM(CM, 128, TK); \
+        return true;                  \
+      default:                        \
+        return false;                 \
+    }                                 \
   } while (0)
 
+  // Small K-loop: BF16 QK skips the FP8 Q-quantize prologue. Larger K
+  // amortises FP8's higher Tensor-Core throughput.
   if (topk == 128)
-    DISPATCH_BY_NH(128);
+    DISPATCH_BY_NH_CM(BF16, 128);
   else if (topk == 512)
-    DISPATCH_BY_NH(512);
+    DISPATCH_BY_NH_CM(FP8, 512);
   else if (topk == 1024)
-    DISPATCH_BY_NH(1024);
+    DISPATCH_BY_NH_CM(FP8, 1024);
+  else if (topk == 2048)
+    DISPATCH_BY_NH_CM(FP8, 2048);
   else
     return false;
 
-#undef DISPATCH_BY_NH
-#undef DISPATCH_MG
-#undef DISPATCH_SG
+#undef DISPATCH_BY_NH_CM
+#undef DISPATCH_MG_CM
+#undef DISPATCH_SG_CM
   return false;  // unreachable
 }
 
@@ -224,70 +228,69 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
                                  float sm_scale, int num_tokens, size_t stride_kv_block,
                                  size_t stride_kv_block_extra, const int* topk_length_ptr,
                                  const int* topk_length_extra_ptr, cudaStream_t stream) {
-// NH=16 dispatches through MG with MG_N_HG_T=1 (HEADS_PER_CTA=16) so callers
-// can pad TP=4 / TP=8 (real heads 16 / 8) without going through SG (SG has
-// no dual-cache support).
-#define DISPATCH_DUAL_MG(NH, TK, TK_EX, PBSX, NHG)                                           \
-  launch_prefill_mg<ModelType::DSV4, ComputeMode::FP8, NH, TK, 64, TK_EX, PBSX, NHG>(      \
+// NH=16 dispatches through MG with MG_N_HG_T=1 so callers can pad TP=4/TP=8
+// without falling into SG (SG has no dual-cache support).
+#define DISPATCH_DUAL_MG_CM(CM, NH, TK, TK_EX, PBSX, NHG)                                    \
+  launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, TK_EX, PBSX, NHG>(       \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, \
       stride_kv_block, stride_kv_block_extra, topk_length_ptr, topk_length_extra_ptr, stream)
 
   if (topk == 128 && topk_extra == 128 && extra_page_block_size == 64) {
     switch (num_heads) {
       case 16:
-        DISPATCH_DUAL_MG(16, 128, 128, 64, 1);
+        DISPATCH_DUAL_MG_CM(BF16, 16, 128, 128, 64, 1);
         return true;
       case 32:
-        DISPATCH_DUAL_MG(32, 128, 128, 64, 2);
+        DISPATCH_DUAL_MG_CM(BF16, 32, 128, 128, 64, 2);
         return true;
       case 64:
-        DISPATCH_DUAL_MG(64, 128, 128, 64, 2);
+        DISPATCH_DUAL_MG_CM(BF16, 64, 128, 128, 64, 2);
         return true;
       case 128:
-        DISPATCH_DUAL_MG(128, 128, 128, 64, 2);
+        DISPATCH_DUAL_MG_CM(BF16, 128, 128, 128, 64, 2);
         return true;
       default:
         return false;
     }
   } else if (topk == 128 && topk_extra == 512 && extra_page_block_size == 64) {
-    // Dual-cache C4A: SWA window=128, indexer top_k=512, compress_ratio=4.
+    // C4A: SWA window=128, indexer top_k=512, compress_ratio=4.
     switch (num_heads) {
       case 16:
-        DISPATCH_DUAL_MG(16, 128, 512, 64, 1);
+        DISPATCH_DUAL_MG_CM(BF16, 16, 128, 512, 64, 1);
         return true;
       case 32:
-        DISPATCH_DUAL_MG(32, 128, 512, 64, 2);
+        DISPATCH_DUAL_MG_CM(BF16, 32, 128, 512, 64, 2);
         return true;
       case 64:
-        DISPATCH_DUAL_MG(64, 128, 512, 64, 2);
+        DISPATCH_DUAL_MG_CM(BF16, 64, 128, 512, 64, 2);
         return true;
       case 128:
-        DISPATCH_DUAL_MG(128, 128, 512, 64, 2);
+        DISPATCH_DUAL_MG_CM(BF16, 128, 128, 512, 64, 2);
         return true;
       default:
         return false;
     }
   } else if (topk == 128 && topk_extra == 512 && extra_page_block_size == 2) {
-    // Dual-cache C128A: SWA window=128, indexer top_k=512, compress_ratio=128.
+    // C128A: SWA window=128, indexer top_k=512, compress_ratio=128.
     switch (num_heads) {
       case 16:
-        DISPATCH_DUAL_MG(16, 128, 512, 2, 1);
+        DISPATCH_DUAL_MG_CM(BF16, 16, 128, 512, 2, 1);
         return true;
       case 32:
-        DISPATCH_DUAL_MG(32, 128, 512, 2, 2);
+        DISPATCH_DUAL_MG_CM(BF16, 32, 128, 512, 2, 2);
         return true;
       case 64:
-        DISPATCH_DUAL_MG(64, 128, 512, 2, 2);
+        DISPATCH_DUAL_MG_CM(BF16, 64, 128, 512, 2, 2);
         return true;
       case 128:
-        DISPATCH_DUAL_MG(128, 128, 512, 2, 2);
+        DISPATCH_DUAL_MG_CM(BF16, 128, 128, 512, 2, 2);
         return true;
       default:
         return false;
     }
   }
   return false;
-#undef DISPATCH_DUAL_MG
+#undef DISPATCH_DUAL_MG_CM
 }
 
 }  // namespace
