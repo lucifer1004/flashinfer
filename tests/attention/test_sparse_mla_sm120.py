@@ -350,14 +350,9 @@ def test_sparse_mla_sm120_decode_model1(
         attn_sink=attn_sink,
     )
 
-    err = (output.float() - ref_out.float()).abs()
-    max_err = err.max().item()
-    # Tolerance: bf16 + FP8 quantization noise. 1e-2 matches the upstream test
-    # suite's coarse pass threshold (FlashMLA reference parity).
-    assert max_err < 5e-2, (
-        f"max_err={max_err:.4f} exceeds 5e-2 for "
-        f"num_heads={num_heads} topk={topk} num_tokens={num_tokens} sink={with_sink}"
-    )
+    # FP8 KV + BF16 output tolerance. Matches the repo convention for FP8
+    # attention tests (see tests/attention/test_xqa_mla_batch_decode.py).
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
 
 
 _DSV3_2_DECODE_HEADS = [8, 16, 32, 64, 128]
@@ -430,12 +425,279 @@ def test_sparse_mla_sm120_decode_dsv3_2(
         attn_sink=attn_sink,
     )
 
-    err = (output.float() - ref_out.float()).abs()
-    max_err = err.max().item()
-    assert max_err < 5e-2, (
-        f"max_err={max_err:.4f} exceeds 5e-2 for "
-        f"num_heads={num_heads} num_tokens={num_tokens} sink={with_sink}"
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+
+
+_DSV3_2_PREFILL_HEADS = [8, 16, 32, 64, 128]
+
+
+@pytest.mark.parametrize("num_heads", _DSV3_2_PREFILL_HEADS)
+@pytest.mark.parametrize("num_tokens", [128, 256])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_sparse_mla_sm120_prefill_dsv3_2(
+    num_heads: int, num_tokens: int, with_sink: bool
+) -> None:
+    """DSv3.2 prefill path: d_qk=576, topk=2048, page_block_size=64, T>64.
+
+    Covers the SG kernel (NH=8 small-TP + NH=16) and the MG kernel
+    (NH=32/64/128). num_tokens>64 routes through the prefill orchestrator;
+    the kernel iterates all NI=TOPK/BI tiles per token and writes BF16
+    output directly (no split-K, no merge).
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v = 576, 512
+    topk = 2048
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size  # 4096 slots
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv3_2(kv_bf16)
+    kv_dequant = dequantize_kv_dsv3_2(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
+    # Mark half the slots invalid (-1); matches the decode-test masking
+    # convention and ensures the prefill kernel can't pass by ignoring -1.
+    indices[:, topk // 2 :] = -1
+
+    attn_sink = (
+        torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
+        if with_sink
+        else None
+    )
+
+    sm_scale = d_qk**-0.5
+
+    ref_out, _ref_lse = _ref_sparse_attn(
+        q, kv_dequant, indices, sm_scale, d_v, attn_sink=attn_sink
+    )
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+
+    flashinfer.sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+
+
+_MODEL1_PREFILL_CONFIGS = [
+    # (num_heads, topk). DSv4 prefill envelope: NH ∈ {16, 32, 64, 128},
+    # topk ∈ {128, 512, 1024}. NH=8 is not in the DSv4 prefill dispatch.
+    (16, 128),
+    (32, 512),
+    (64, 1024),
+    (128, 1024),
+]
+
+
+@pytest.mark.parametrize("num_heads,topk", _MODEL1_PREFILL_CONFIGS)
+@pytest.mark.parametrize("num_tokens", [128, 256])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_sparse_mla_sm120_prefill_model1(
+    num_heads: int, topk: int, num_tokens: int, with_sink: bool
+) -> None:
+    """DSv4 prefill (single-cache) path: d_qk=512, page_block_size=64, T>64.
+
+    NH=16 dispatches through the SG kernel; NH=32/64/128 through the MG
+    kernel. Dual-cache (extra_kv_cache) variants are not exercised here.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v = 512, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size  # 4096 slots
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_model1(kv_bf16)
+    kv_dequant = dequantize_kv_model1(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    # Mark half the slots invalid (-1); same convention as the decode tests.
+    indices[:, topk // 2 :] = -1
+
+    attn_sink = (
+        torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
+        if with_sink
+        else None
+    )
+
+    sm_scale = d_qk**-0.5
+
+    ref_out, _ref_lse = _ref_sparse_attn(
+        q, kv_dequant, indices, sm_scale, d_v, attn_sink=attn_sink
+    )
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+
+    flashinfer.sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+
+
+_MODEL1_PREFILL_DUAL_CONFIGS = [
+    # (extra_topk, extra_pbs). Main is fixed at (topk=128, pbs=64).
+    # Covers:
+    #   (128, 64): basic dual-cache (same shape as main)
+    #   (512, 64): C4A — SWA window=128, indexer top_k=512, compress_ratio=4
+    #   (512,  2): C128A — SWA window=128, indexer top_k=512, compress_ratio=128
+    (128, 64),
+    (512, 64),
+    (512, 2),
+]
+
+_MODEL1_PREFILL_DUAL_HEADS = [16, 32, 64, 128]
+
+
+@pytest.mark.parametrize("num_heads", _MODEL1_PREFILL_DUAL_HEADS)
+@pytest.mark.parametrize("extra_topk,extra_pbs", _MODEL1_PREFILL_DUAL_CONFIGS)
+def test_sparse_mla_sm120_prefill_model1_dual(
+    num_heads: int, extra_topk: int, extra_pbs: int
+) -> None:
+    """DSv4 prefill (dual-cache) path: main + extra KV with disjoint slot pools.
+
+    Main cache: topk=128, pbs=64 (always). Extra cache parameterized to cover
+    basic dual, C4A (extra_topk=512, pbs=64), and C128A (extra_topk=512, pbs=2)
+    layouts. NH ∈ {16, 32, 64, 128} covers the MG dual-cache dispatch (SG has
+    no dual-cache support — NH=16 in DSv4 dual routes through MG with
+    MG_N_HG_T=1).
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v = 512, 512
+    topk = 128
+    main_pbs = 64
+    num_tokens = 128
+
+    # Size both pools so all topk slot ids fit.
+    main_num_blocks = 64
+    main_s_kv = main_num_blocks * main_pbs  # 4096
+    # Round extra block count up to fit extra_topk slots.
+    extra_num_blocks = max((extra_topk + extra_pbs - 1) // extra_pbs * 2, 16)
+    extra_s_kv = extra_num_blocks * extra_pbs
+
+    # Main cache.
+    main_bf16 = (
+        torch.randn(
+            main_num_blocks, main_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    main_packed = quantize_kv_model1(main_bf16)
+    main_dequant = dequantize_kv_model1(main_packed)
+
+    # Extra cache (independent quantization noise + slot pool).
+    extra_bf16 = (
+        torch.randn(
+            extra_num_blocks, extra_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    extra_packed = quantize_kv_model1(extra_bf16)
+    extra_dequant = dequantize_kv_model1(extra_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    main_idx = torch.randint(
+        0, main_s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    extra_idx = torch.randint(
+        0, extra_s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
+    )
+    # Mark half of each cache's slots invalid (-1).
+    main_idx[:, topk // 2 :] = -1
+    extra_idx[:, extra_topk // 2 :] = -1
+
+    attn_sink = (
+        torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
+    )
+
+    sm_scale = d_qk**-0.5
+
+    # Reference: treat dual cache as one virtual pool. Main occupies slots
+    # [0, main_s_kv); extra occupies [main_s_kv, main_s_kv + extra_s_kv).
+    # Shift extra indices by main_s_kv so the unified pool sees disjoint
+    # index spaces. The kernel's running-softmax across both caches matches
+    # dense softmax over the union.
+    virtual_kv = torch.cat(
+        [main_dequant.reshape(-1, d_qk), extra_dequant.reshape(-1, d_qk)], dim=0
+    ).reshape(-1, 1, 1, d_qk)
+    extra_idx_shifted = torch.where(
+        extra_idx < 0, extra_idx, extra_idx + main_s_kv
+    )
+    virtual_idx = torch.cat([main_idx, extra_idx_shifted], dim=-1)
+
+    ref_out, _ref_lse = _ref_sparse_attn(
+        q, virtual_kv, virtual_idx, sm_scale, d_v, attn_sink=attn_sink
+    )
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+
+    flashinfer.sparse_mla_sm120_paged_attention(
+        q,
+        main_packed,
+        main_idx,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_packed,
+        extra_indices=extra_idx,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
 
 
 def test_sparse_mla_sm120_wrapper_class_run() -> None:
