@@ -100,6 +100,40 @@ _DECODE_DSV4_DISPATCH = frozenset({
 })
 _DECODE_DSV4_PAGE_BLOCK_SIZE = 64
 
+# decode-dsv3_2-v2 (V32 family, V4-style warp-spec). Dispatch envelope spans
+# the production GLM-5.1 / Kimi K2.5 / DSv3.2 shapes (num_heads ∈
+# {8,16,32,64,128} covers TP={16,8,4,2,1}; topk ∈ {128, 512, 1024, 2048}).
+# v2 is the default V32 decode kernel; v1 (scheduler-driven) remains
+# available as a legacy fallback via FLASHINFER_DSV3_2_KERNEL=v1 — kept for
+# regression bisection and pbs=1 inputs that v2 doesn't support.
+_DECODE_DSV3_2_V2_DISPATCH = frozenset({
+    (8, 128), (8, 512), (8, 1024), (8, 2048),
+    (16, 128), (16, 512), (16, 1024), (16, 2048),
+    (32, 128), (32, 512), (32, 1024), (32, 2048),
+    (64, 128), (64, 512), (64, 1024), (64, 2048),
+    (128, 128), (128, 512), (128, 1024), (128, 2048),
+})
+# Production page_block_size for V32 indexer caches. vLLM CUDA forces 64;
+# ROCm-style pbs=1 is not supported by v2 (fall through to v1).
+_DECODE_DSV3_2_V2_PAGE_BLOCK_SIZE = 64
+
+
+def _decode_dsv3_2_v2_disabled() -> bool:
+    """True iff FLASHINFER_DSV3_2_KERNEL=v1 forces the legacy path."""
+    return os.environ.get("FLASHINFER_DSV3_2_KERNEL", "v2").lower() == "v1"
+
+
+def _decode_dsv3_2_v2_dispatchable(
+    num_tokens: int, num_heads: int, topk: int, d_qk: int, page_block_size: int
+) -> bool:
+    """True iff decode-dsv3_2-v2 supports this shape configuration."""
+    return (
+        num_tokens <= _DECODE_MAX_TOKENS
+        and d_qk == 576
+        and page_block_size == _DECODE_DSV3_2_V2_PAGE_BLOCK_SIZE
+        and (num_heads, topk) in _DECODE_DSV3_2_V2_DISPATCH
+    )
+
 
 def _decode_dsv4_dispatchable(num_tokens: int, num_heads: int, topk: int, d_qk: int,
                             page_block_size: int) -> bool:
@@ -331,6 +365,41 @@ def get_sparse_mla_sm120_module():
                 extra_kv_cache=extra_kv_cache,
                 extra_indices=extra_indices,
                 extra_topk_length=extra_topk_length,
+            )
+            return
+
+        # decode-dsv3_2-v2 fast path. V32 family (d_qk=576), V4-style warp-spec
+        # standalone kernel — the default V32 decode path. Falls through to
+        # the legacy v1 orchestrator below for unsupported shapes or when
+        # FLASHINFER_DSV3_2_KERNEL=v1 forces it.
+        if (
+            not _decode_dsv3_2_v2_disabled()
+            and _decode_dsv3_2_v2_dispatchable(num_tokens, num_heads, topk, d_qk, kv_pbs)
+        ):
+            num_splits = (topk + _BI - 1) // _BI
+            mid_out = torch.empty(
+                (num_tokens, num_heads, num_splits, d_v),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            mid_lse = torch.empty(
+                (num_tokens, num_heads, num_splits),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            module.sparse_mla_sm120_decode_dsv3_2_v2(
+                q,
+                kv_cache,
+                indices,
+                mid_out,
+                mid_lse,
+                output,
+                out_lse,
+                num_splits,
+                sm_scale,
+                topk_length,
+                attn_sink,
+                -1,  # chunks_per_block_override = -1 → C++ heuristic
             )
             return
 
