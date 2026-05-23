@@ -28,10 +28,16 @@
 
 """Correctness tests for sparse-MLA paged attention on SM120.
 
-Covers both decode paths against a PyTorch SDPA-with-sparse-mask reference:
+Covers both decode (num_tokens <= 64) and prefill (num_tokens > 64) paths
+against a PyTorch SDPA-with-sparse-mask reference, plus the dual-cache
+prefill variant exclusive to DSv4:
 
-* DSv4 (d_qk=512, FP8 FOOTER 584 B/token, page_block_size=64) → decode-dsv4
-* DSv3.2 (d_qk=576, FP8 INLINE 656 B/token, page_block_size=64) → decode-dsv3_2
+* DSv4 (d_qk=512, FP8 FOOTER 584 B/token, page_block_size=64)
+    - decode-dsv4   (single-cache)
+    - prefill-dsv4  (single-cache + dual-cache: basic / C4A / C128A)
+* DSv3.2 (d_qk=576, FP8 INLINE 656 B/token, page_block_size=64)
+    - decode-dsv3_2
+    - prefill-dsv3_2
 
 Quantization helpers port the upstream FlashMLA packed layouts.
 
@@ -66,7 +72,7 @@ def _fp32_to_ue8m0_bytes(scale_fp32: torch.Tensor) -> torch.Tensor:
     return ((bits >> 23) & 0xFF).to(torch.uint8)
 
 
-def quantize_kv_model1(kv_bf16: torch.Tensor) -> torch.Tensor:
+def quantize_kv_dsv4(kv_bf16: torch.Tensor) -> torch.Tensor:
     """Pack bf16 KV into DSV4 FP8 FOOTER format.
 
     Input  shape (nb, bs, 1, 512) bf16.
@@ -109,8 +115,8 @@ def quantize_kv_model1(kv_bf16: torch.Tensor) -> torch.Tensor:
     return result_flat.view(nb, bs, 1, bpt)
 
 
-def dequantize_kv_model1(packed: torch.Tensor) -> torch.Tensor:
-    """Unpack DSV4 FP8 FOOTER → bf16. Inverse of :func:`quantize_kv_model1`."""
+def dequantize_kv_dsv4(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack DSV4 FP8 FOOTER → bf16. Inverse of :func:`quantize_kv_dsv4`."""
     d_nope, d_rope, tile_size, num_tiles = 448, 64, 64, 7
     data_stride = d_nope + d_rope * 2
     scale_bytes = num_tiles + 1
@@ -268,7 +274,7 @@ def _ref_sparse_attn(
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 
-_MODEL1_DECODE_CONFIGS = [
+_DSV4_DECODE_CONFIGS = [
     # (num_heads, topk)
     # h=8 cases exercise the VALID_HPB < HPB code path (small-TP corner);
     # cover all three topk values to confirm the dispatch table.
@@ -282,10 +288,10 @@ _MODEL1_DECODE_CONFIGS = [
 ]
 
 
-@pytest.mark.parametrize("num_heads,topk", _MODEL1_DECODE_CONFIGS)
+@pytest.mark.parametrize("num_heads,topk", _DSV4_DECODE_CONFIGS)
 @pytest.mark.parametrize("num_tokens", [1, 16, 64])
 @pytest.mark.parametrize("with_sink", [False, True])
-def test_sparse_mla_sm120_decode_model1(
+def test_sparse_mla_sm120_decode_dsv4(
     num_heads: int, topk: int, num_tokens: int, with_sink: bool
 ) -> None:
     """DSV4 decode-dsv3_2 path: num_tokens <= 64, d_qk=512, page_block_size=64."""
@@ -303,8 +309,8 @@ def test_sparse_mla_sm120_decode_model1(
         )
         / 10.0
     ).clamp(-1, 1)
-    kv_packed = quantize_kv_model1(kv_bf16)
-    kv_dequant = dequantize_kv_model1(kv_packed)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
 
     q = (
         torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
@@ -503,7 +509,7 @@ def test_sparse_mla_sm120_prefill_dsv3_2(
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
 
 
-_MODEL1_PREFILL_CONFIGS = [
+_DSV4_PREFILL_CONFIGS = [
     # (num_heads, topk). DSv4 prefill envelope: NH ∈ {16, 32, 64, 128},
     # topk ∈ {128, 512, 1024}. NH=8 is not in the DSv4 prefill dispatch.
     (16, 128),
@@ -513,10 +519,10 @@ _MODEL1_PREFILL_CONFIGS = [
 ]
 
 
-@pytest.mark.parametrize("num_heads,topk", _MODEL1_PREFILL_CONFIGS)
+@pytest.mark.parametrize("num_heads,topk", _DSV4_PREFILL_CONFIGS)
 @pytest.mark.parametrize("num_tokens", [128, 256])
 @pytest.mark.parametrize("with_sink", [False, True])
-def test_sparse_mla_sm120_prefill_model1(
+def test_sparse_mla_sm120_prefill_dsv4(
     num_heads: int, topk: int, num_tokens: int, with_sink: bool
 ) -> None:
     """DSv4 prefill (single-cache) path: d_qk=512, page_block_size=64, T>64.
@@ -537,8 +543,8 @@ def test_sparse_mla_sm120_prefill_model1(
         )
         / 10.0
     ).clamp(-1, 1)
-    kv_packed = quantize_kv_model1(kv_bf16)
-    kv_dequant = dequantize_kv_model1(kv_packed)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
 
     q = (
         torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
@@ -581,7 +587,7 @@ def test_sparse_mla_sm120_prefill_model1(
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
 
 
-_MODEL1_PREFILL_DUAL_CONFIGS = [
+_DSV4_PREFILL_DUAL_CONFIGS = [
     # (extra_topk, extra_pbs). Main is fixed at (topk=128, pbs=64).
     # Covers:
     #   (128, 64): basic dual-cache (same shape as main)
@@ -592,12 +598,12 @@ _MODEL1_PREFILL_DUAL_CONFIGS = [
     (512, 2),
 ]
 
-_MODEL1_PREFILL_DUAL_HEADS = [16, 32, 64, 128]
+_DSV4_PREFILL_DUAL_HEADS = [16, 32, 64, 128]
 
 
-@pytest.mark.parametrize("num_heads", _MODEL1_PREFILL_DUAL_HEADS)
-@pytest.mark.parametrize("extra_topk,extra_pbs", _MODEL1_PREFILL_DUAL_CONFIGS)
-def test_sparse_mla_sm120_prefill_model1_dual(
+@pytest.mark.parametrize("num_heads", _DSV4_PREFILL_DUAL_HEADS)
+@pytest.mark.parametrize("extra_topk,extra_pbs", _DSV4_PREFILL_DUAL_CONFIGS)
+def test_sparse_mla_sm120_prefill_dsv4_dual(
     num_heads: int, extra_topk: int, extra_pbs: int
 ) -> None:
     """DSv4 prefill (dual-cache) path: main + extra KV with disjoint slot pools.
@@ -629,8 +635,8 @@ def test_sparse_mla_sm120_prefill_model1_dual(
         )
         / 10.0
     ).clamp(-1, 1)
-    main_packed = quantize_kv_model1(main_bf16)
-    main_dequant = dequantize_kv_model1(main_packed)
+    main_packed = quantize_kv_dsv4(main_bf16)
+    main_dequant = dequantize_kv_dsv4(main_packed)
 
     # Extra cache (independent quantization noise + slot pool).
     extra_bf16 = (
@@ -639,8 +645,8 @@ def test_sparse_mla_sm120_prefill_model1_dual(
         )
         / 10.0
     ).clamp(-1, 1)
-    extra_packed = quantize_kv_model1(extra_bf16)
-    extra_dequant = dequantize_kv_model1(extra_packed)
+    extra_packed = quantize_kv_dsv4(extra_bf16)
+    extra_dequant = dequantize_kv_dsv4(extra_packed)
 
     q = (
         torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
@@ -700,14 +706,26 @@ def test_sparse_mla_sm120_prefill_model1_dual(
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_wrapper_class_run() -> None:
-    """Smoke-test the wrapper class: construct once, call .run() repeatedly."""
+@pytest.mark.parametrize("model", ["dsv4", "dsv3_2"])
+def test_sparse_mla_sm120_wrapper_class_run(model: str) -> None:
+    """Smoke-test the wrapper class: construct once, call .run() across
+    decode (T ∈ {1, 16, 64}) and prefill (T = 128) shapes for both V32 and
+    DSv4 envelopes. Exercises the BatchSparseMLAPagedAttentionWrapper path
+    used by the vLLM SPARSE_MLA_SM120 backend."""
     torch.manual_seed(0)
     device = torch.device("cuda")
-    num_heads, topk = 32, 512
-    d_qk, d_v = 512, 512
     page_block_size = 64
     num_blocks = 32
+
+    if model == "dsv4":
+        num_heads, topk = 32, 512
+        d_qk, d_v = 512, 512
+        quantize = quantize_kv_dsv4
+    else:
+        num_heads, topk = 32, 2048
+        d_qk, d_v = 576, 512
+        quantize = quantize_kv_dsv3_2
+
     s_kv = num_blocks * page_block_size
 
     kv_bf16 = (
@@ -716,16 +734,17 @@ def test_sparse_mla_sm120_wrapper_class_run() -> None:
         )
         / 10.0
     ).clamp(-1, 1)
-    kv_packed = quantize_kv_model1(kv_bf16)
+    kv_packed = quantize(kv_bf16)
 
     wrapper = flashinfer.BatchSparseMLAPagedAttentionWrapper(
-        max_num_tokens=64,
+        max_num_tokens=128,
         max_num_heads=num_heads,
         d_v=d_v,
         device=device,
     )
 
-    for num_tokens in (1, 16, 64):
+    # 1, 16, 64 -> decode kernel; 128 -> prefill orchestrator.
+    for num_tokens in (1, 16, 64, 128):
         q = (
             torch.randn(
                 num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16

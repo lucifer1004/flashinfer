@@ -168,7 +168,7 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
 #undef DISPATCH_DSV3_2_MG
 }
 
-inline bool dispatch_model1_single(int num_heads, int topk, const bf16* Q, const uint8_t* KV,
+inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const uint8_t* KV,
                                    const int32_t* indices, const float* attn_sink, bf16* output,
                                    float* out_lse, float sm_scale, int num_tokens,
                                    size_t stride_kv_block, const int* topk_length_ptr,
@@ -219,7 +219,7 @@ inline bool dispatch_model1_single(int num_heads, int topk, const bf16* Q, const
   return false;  // unreachable
 }
 
-inline bool dispatch_model1_dual(int num_heads, int topk, int topk_extra, int extra_page_block_size,
+inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extra_page_block_size,
                                  const bf16* Q, const uint8_t* KV, const int32_t* indices,
                                  const uint8_t* KV_extra, const int32_t* idx_extra,
                                  const float* attn_sink, bf16* output, float* out_lse,
@@ -315,7 +315,7 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
 
   if (extra_KV_cache != nullptr) {
     if (mt != ModelType::DSV4) return false;
-    return dispatch_model1_dual(num_heads, topk, topk_extra, extra_page_block_size, Q, KV_cache,
+    return dispatch_dsv4_dual(num_heads, topk, topk_extra, extra_page_block_size, Q, KV_cache,
                                 indices, extra_KV_cache, extra_indices, attn_sink, output, out_lse,
                                 sm_scale, num_tokens, stride_kv_block, stride_kv_block_extra,
                                 topk_length, extra_topk_length, stream);
@@ -326,7 +326,7 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
       return dispatch_v32(num_heads, topk, Q, KV_cache, indices, attn_sink, output, out_lse,
                           sm_scale, num_tokens, stride_kv_block, topk_length, stream);
     case ModelType::DSV4:
-      return dispatch_model1_single(num_heads, topk, Q, KV_cache, indices, attn_sink, output,
+      return dispatch_dsv4_single(num_heads, topk, Q, KV_cache, indices, attn_sink, output,
                                     out_lse, sm_scale, num_tokens, stride_kv_block, topk_length,
                                     stream);
   }

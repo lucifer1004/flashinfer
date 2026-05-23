@@ -49,7 +49,6 @@ constexpr float FP8_MAX_INV = 1.0f / 448.0f;
 
 __device__ __forceinline__ float to_float(bf16 x) { return __bfloat162float(x); }
 __device__ __forceinline__ bf16 to_bf16(float x) { return __float2bfloat16(x); }
-__device__ __forceinline__ float fast_exp2f(float x) { return exp2f(x); }
 
 __device__ __forceinline__ float warp_reduce_max(float val) {
 #pragma unroll
