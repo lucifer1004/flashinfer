@@ -28,8 +28,9 @@
 
 """Sparse-MLA paged attention for SM120.
 
-Auto-dispatches between decode (num_tokens <= 64) and prefill (larger) and,
-within decode, between the DSv4 fast path and the DSv3.2 / fallback path.
+Auto-dispatches between decode (num_tokens <= 64) and prefill (larger). For
+decode, DSv4 routes to the warp-specialized decode-dsv4 kernel and DSv3.2
+routes to the scheduler-driven decode-dsv3_2 kernel.
 
 Two public surfaces, mirroring the b12x_fused_moe + B12xMoEWrapper convention:
 
@@ -104,14 +105,10 @@ def _decode_dsv4_dispatchable(num_tokens: int, num_heads: int, topk: int, d_qk: 
                             page_block_size: int) -> bool:
     """Return True iff decode-dsv4 supports this shape configuration.
 
-    decode-dsv4 is DSV4-only (d_qk=512) with a fixed (num_heads, topk)
+    decode-dsv4 is DSv4-only (d_qk=512) with a fixed (num_heads, topk)
     instantiation set and PAGE_BLOCK_SIZE=64. Outside this envelope the
-    orchestrator routes to decode-dsv3_2 / prefill.
+    orchestrator routes to decode-dsv3_2 (V32-only) or prefill.
     """
-    # FLASHINFER_DISABLE_DECODE_DSV4=1 routes everything through the
-    # decode-dsv3_2 fallback path; useful as an in-production kill switch.
-    if os.getenv("FLASHINFER_DISABLE_DECODE_DSV4") == "1":
-        return False
     return (
         num_tokens <= _DECODE_MAX_TOKENS
         and d_qk == 512

@@ -66,34 +66,25 @@ struct DecodeDsv3_2ColdParams {
   size_t stride_la_split;  // s_q * NUM_HEADS
   size_t stride_la_sq;     // NUM_HEADS
   const float* attn_sink;  // [NUM_HEADS] float32, nullptr = disabled
-  // V4 features (DSV4 only)
-  const int* topk_length;        // [num_batches] int32, nullptr = uniform topk
-  int extra_topk;                // 0 = no extra cache
-  const int* extra_topk_length;  // [num_batches] int32, nullptr = uniform extra_topk
-  size_t stride_extra_kv_block;  // extra cache block stride
+  const int* topk_length;  // [num_batches] int32, nullptr = uniform topk
 };
 
-// PAGE_BLOCK_SIZE_EXTRA defaults to PAGE_BLOCK_SIZE so single-cache callers
-// keep a strict subset. When the extra cache uses a different block size
-// (e.g. DSv4 C128A: PAGE_BLOCK_SIZE=64, PAGE_BLOCK_SIZE_EXTRA=2), set it
-// explicitly.
-template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
-          int PAGE_BLOCK_SIZE_EXTRA = PAGE_BLOCK_SIZE>
+template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     sparse_mla_decode_dsv3_2_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
                                 const int32_t* __restrict__ indices,
-                                const uint8_t* __restrict__ extra_KV_cache,
-                                const int32_t* __restrict__ extra_indices,
                                 float* __restrict__ o_accum, float* __restrict__ lse_accum,
                                 bf16* __restrict__ output, float* __restrict__ out_lse,
                                 const DecodingSchedMeta* __restrict__ sched_meta,
                                 const int* __restrict__ num_splits_ptr,
                                 __grid_constant__ const DecodeDsv3_2ColdParams cold) {
+  static_assert(MT == ModelType::DSV3_2,
+                "decode-dsv3_2 only services the DSv3.2 model. DSv4 decode is "
+                "handled by decode-dsv4 (which has its own dual-cache support).");
   const float sm_scale = cold.sm_scale;
   const int num_batches = cold.num_batches;
   const int s_q = cold.s_q;
   constexpr int page_block_size = PAGE_BLOCK_SIZE;
-  constexpr int page_block_size_extra = PAGE_BLOCK_SIZE_EXTRA;
   const size_t stride_kv_block = cold.stride_kv_block;
   const int topk = cold.topk;
   using KV = KVCacheTraits<MT>;
@@ -128,16 +119,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
   for (int req = meta.begin_req_idx; req <= meta.end_req_idx && req < num_batches; req++) {
     const int s_i = req * s_q + s_q_idx;
 
-    // Per-batch topk_length and extra_topk (match FlashMLA: orig_topk_padded = max(ceil(tl, BI),
-    // BI))
+    // Per-batch topk_length (matches FlashMLA: padded = max(ceil(tl, BI), BI))
     const int topk_len = cold.topk_length ? __ldg(cold.topk_length + req) : topk;
-    const int orig_topk_padded = max(((topk_len + BI - 1) / BI) * BI, BI);
-    const int num_orig_blocks = orig_topk_padded / BI;
-    const int extra_topk_len =
-        (cold.extra_topk > 0)
-            ? (cold.extra_topk_length ? __ldg(cold.extra_topk_length + req) : cold.extra_topk)
-            : 0;
-    const int total_blocks = (orig_topk_padded + ((extra_topk_len + BI - 1) / BI) * BI) / BI;
+    const int topk_padded = max(((topk_len + BI - 1) / BI) * BI, BI);
+    const int total_blocks = topk_padded / BI;
 
     const int start_block = (req == meta.begin_req_idx) ? meta.begin_block_idx : 0;
     const int end_block = (req == meta.end_req_idx) ? meta.end_block_idx : total_blocks;
@@ -169,36 +154,19 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
       const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
-      // Per-tile IO gather — select main vs extra cache based on block index.
-      // When PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE (typical), both branches
-      // compile to the same instantiation; otherwise the extra-cache branch
-      // picks the smaller block-size kernel (e.g. DSv4 C128A: 2).
-      //
       // Scales-then-bulk ordering: io_gather_scales is synchronous (no mbar
       // signal). Math wakes on mbar_kv signaled by bulk completion; if scales
       // were written AFTER the bulk, math could read partial scales.
       // Threadfence between the two makes scales visible before the bulk
       // signals mbar. (Same race pattern fixed in prefill_kernel.cuh.)
       auto io_gather_one = [&](int global_blk, int buf_idx) {
-        if (global_blk < num_orig_blocks) {
-          const int32_t* idx_ptr = indices + (size_t)s_i * topk + (size_t)global_blk * BI;
-          io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_bufs[buf_idx], idx_ptr, KV_cache,
-                                                io_tid, stride_kv_block);
-          __threadfence_block();
-          io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_bufs[buf_idx], idx_ptr, KV_cache,
-                                                         sm.mbar_kv + buf_idx, io_tid,
-                                                         stride_kv_block, kv_l2_policy);
-        } else {
-          int eb = global_blk - num_orig_blocks;
-          const int32_t* idx_ptr = extra_indices + (size_t)s_i * cold.extra_topk + (size_t)eb * BI;
-          io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(sm.kv_scale_bufs[buf_idx], idx_ptr,
-                                                      extra_KV_cache, io_tid,
-                                                      cold.stride_extra_kv_block);
-          __threadfence_block();
-          io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
-              sm.kv_bufs[buf_idx], idx_ptr, extra_KV_cache, sm.mbar_kv + buf_idx, io_tid,
-              cold.stride_extra_kv_block, kv_l2_policy);
-        }
+        const int32_t* idx_ptr = indices + (size_t)s_i * topk + (size_t)global_blk * BI;
+        io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_bufs[buf_idx], idx_ptr, KV_cache,
+                                              io_tid, stride_kv_block);
+        __threadfence_block();
+        io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_bufs[buf_idx], idx_ptr, KV_cache,
+                                                       sm.mbar_kv + buf_idx, io_tid,
+                                                       stride_kv_block, kv_l2_policy);
       };
 
       // Prologue: gather tile 0
@@ -247,51 +215,25 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       for (int ti = 0; ti < num_tiles; ti++) {
         uint8_t* kv_smem = sm.kv_bufs[ti & 1];
         const int global_blk = start_block + ti;
-        const bool is_extra_tile = (global_blk >= num_orig_blocks);
-
-        // Per-tile index base and KV cache pointer (main vs extra)
-        const int32_t* ib;
-        const uint8_t* tile_kv_cache;
-        size_t tile_stride;
-        if (!is_extra_tile) {
-          ib = indices + (size_t)s_i * topk + (size_t)global_blk * BI;
-          tile_kv_cache = KV_cache;
-          tile_stride = stride_kv_block;
-        } else {
-          int extra_blk = global_blk - num_orig_blocks;
-          ib = extra_indices + (size_t)s_i * cold.extra_topk + (size_t)extra_blk * BI;
-          tile_kv_cache = extra_KV_cache;
-          tile_stride = cold.stride_extra_kv_block;
-        }
+        const int32_t* ib = indices + (size_t)s_i * topk + (size_t)global_blk * BI;
 
         const int qk_nb = mwarp * ENTRIES_PER_WARP;
         uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
-        // Pick block-size for index decomposition based on which cache this
-        // tile reads from. When PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE the
-        // compiler folds this away.
-        const int tile_page_block_size =
-            (PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE || !is_extra_tile) ? page_block_size
-                                                                         : page_block_size_extra;
-
-        // Only entry_base[gid] is read (line ~329 below), and gid is per-lane
-        // constant within a warp (= lane >> 2 ∈ 0..7). Each thread therefore
-        // needs just ONE pointer, not an array of 8. The previous version
-        // declared a full register array of size ENTRIES_PER_WARP and the
-        // V_HAS_ROPE branch initialised all 8 slots — 7 of which were dead
-        // per thread, costing ~56 B of spill stack each. Single-pointer form
-        // matches the !V_HAS_ROPE branch's intent and is correct for both.
+        // Only entry_base[gid] is read below, and gid is per-lane constant
+        // within a warp (= lane >> 2 ∈ 0..7). Each thread therefore needs
+        // just ONE pointer, not an array of 8.
         const uint8_t* entry_base_local;
         {
           int idx = ib[qk_nb + gid];
           idx = (idx >= 0) ? idx : 0;
           if constexpr (KV::V_HAS_ROPE) {
-            int bi_e = idx / tile_page_block_size;
-            int li_e = idx % tile_page_block_size;
+            int bi_e = idx / page_block_size;
+            int li_e = idx % page_block_size;
             entry_base_local =
-                tile_kv_cache + (size_t)bi_e * tile_stride + (size_t)li_e * IO::IO_STRIDE;
+                KV_cache + (size_t)bi_e * stride_kv_block + (size_t)li_e * IO::IO_STRIDE;
           } else {
-            entry_base_local = tile_kv_cache + (size_t)idx * IO::IO_STRIDE;
+            entry_base_local = KV_cache + (size_t)idx * IO::IO_STRIDE;
           }
         }
 
@@ -369,28 +311,15 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
             qk[1] = -1e30f;
             qk[3] = -1e30f;
           }
-          // Mask entries beyond topk_length (main tiles) or extra_topk_length (extra tiles)
-          if (!is_extra_tile) {
-            int abs0 = global_blk * BI + e0, abs1 = global_blk * BI + e1;
-            if (abs0 >= topk_len) {
-              qk[0] = -1e30f;
-              qk[2] = -1e30f;
-            }
-            if (abs1 >= topk_len) {
-              qk[1] = -1e30f;
-              qk[3] = -1e30f;
-            }
-          } else if (extra_topk_len > 0) {
-            int extra_blk = global_blk - num_orig_blocks;
-            int abs0 = extra_blk * BI + e0, abs1 = extra_blk * BI + e1;
-            if (abs0 >= extra_topk_len) {
-              qk[0] = -1e30f;
-              qk[2] = -1e30f;
-            }
-            if (abs1 >= extra_topk_len) {
-              qk[1] = -1e30f;
-              qk[3] = -1e30f;
-            }
+          // Mask entries beyond topk_length.
+          int abs0 = global_blk * BI + e0, abs1 = global_blk * BI + e1;
+          if (abs0 >= topk_len) {
+            qk[0] = -1e30f;
+            qk[2] = -1e30f;
+          }
+          if (abs1 >= topk_len) {
+            qk[1] = -1e30f;
+            qk[3] = -1e30f;
           }
         }
 
@@ -549,23 +478,12 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
           if constexpr (!KV::V_HAS_ROPE) bar_sync_t<2, MATH_THREADS>();
         }
 
-        // XV rope — pick the matching block-size template instantiation.
+        // XV rope.
         if constexpr (KV::V_HAS_ROPE) {
           bar_sync_t<2, MATH_THREADS>();
-          if constexpr (PAGE_BLOCK_SIZE_EXTRA == PAGE_BLOCK_SIZE) {
-            xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3, ib, tile_kv_cache, mwarp,
-                                             lane, tile_stride, reinterpret_cast<bf16*>(sm.w_fp8));
-          } else {
-            if (!is_extra_tile) {
-              xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3, ib, tile_kv_cache, mwarp,
-                                               lane, tile_stride,
-                                               reinterpret_cast<bf16*>(sm.w_fp8));
-            } else {
-              xv_rope_mma<MT, PAGE_BLOCK_SIZE_EXTRA>(acc_rope, w0, w1, w2, w3, ib, tile_kv_cache,
-                                                     mwarp, lane, tile_stride,
-                                                     reinterpret_cast<bf16*>(sm.w_fp8));
-            }
-          }
+          xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3, ib, KV_cache, mwarp,
+                                           lane, stride_kv_block,
+                                           reinterpret_cast<bf16*>(sm.w_fp8));
         }
 
         bar_arrive_t<1, BLOCK_THREADS>();
