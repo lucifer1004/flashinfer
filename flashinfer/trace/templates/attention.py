@@ -1168,7 +1168,7 @@ sparse_mla_sm120_paged_trace = TraceTemplate(
             description="Query tensor, dtype bf16.",
         ),
         "kv_cache": Tensor(
-            ["num_pages", "page_block_size", 1, "kv_bytes_per_token"],
+            ["num_pages", "page_block_size", "1", "kv_bytes_per_token"],
             dtype="uint8",
             description=(
                 "Paged main KV cache. Byte-packed FP8 (weights + interleaved scales). "
@@ -1282,7 +1282,7 @@ sparse_mla_sm120_decode_dsv4_trace = TraceTemplate(
             description="Query tensor, dtype bf16.",
         ),
         "kv_cache": Tensor(
-            ["num_pages", "page_block_size", 1, "kv_bytes_per_token"],
+            ["num_pages", "page_block_size", "1", "kv_bytes_per_token"],
             dtype="uint8",
             description="Paged main KV cache, FP8 FOOTER layout.",
         ),
