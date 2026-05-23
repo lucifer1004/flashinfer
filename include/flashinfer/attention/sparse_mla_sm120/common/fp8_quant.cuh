@@ -59,8 +59,7 @@ __device__ __forceinline__ void load_q_bf16_to_smem(bf16* q_nope_bf16, bf16* q_r
   }
   for (int i = threadIdx.x; i < HPB * D_ROPE; i += _MATH_THREADS) {
     int h = i / D_ROPE, d = i % D_ROPE;
-    q_rope[h * D_ROPE + d] =
-        (h < valid_hpb) ? q_base[h * DIM + D_NOPE + d] : __float2bfloat16(0.f);
+    q_rope[h * D_ROPE + d] = (h < valid_hpb) ? q_base[h * DIM + D_NOPE + d] : __float2bfloat16(0.f);
   }
   bar_sync_t<2, _MATH_THREADS>();
 }

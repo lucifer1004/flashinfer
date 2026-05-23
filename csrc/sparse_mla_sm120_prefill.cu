@@ -144,8 +144,8 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
     return true;
   }
 
-#define DISPATCH_DSV3_2_MG(NH)                                                                       \
-  launch_prefill_mg<ModelType::DSV3_2, ComputeMode::FP8, NH, 2048, 64>(                              \
+#define DISPATCH_DSV3_2_MG(NH)                                                                     \
+  launch_prefill_mg<ModelType::DSV3_2, ComputeMode::FP8, NH, 2048, 64>(                            \
       Q, KV, indices, /*KV_extra=*/nullptr, /*idx_extra=*/nullptr, attn_sink, output, out_lse,     \
       sm_scale, num_tokens, stride_kv_block, /*stride_kv_block_extra=*/(size_t)0, topk_length_ptr, \
       /*topk_length_extra=*/nullptr, stream)
@@ -167,39 +167,39 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
 }
 
 inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const uint8_t* KV,
-                                   const int32_t* indices, const float* attn_sink, bf16* output,
-                                   float* out_lse, float sm_scale, int num_tokens,
-                                   size_t stride_kv_block, const int* topk_length_ptr,
-                                   cudaStream_t stream) {
+                                 const int32_t* indices, const float* attn_sink, bf16* output,
+                                 float* out_lse, float sm_scale, int num_tokens,
+                                 size_t stride_kv_block, const int* topk_length_ptr,
+                                 cudaStream_t stream) {
 #define DISPATCH_SG_CM(CM, NH, TK)                                                       \
-  launch_prefill_sg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64>(                     \
+  launch_prefill_sg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64>(                       \
       Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block, \
       topk_length_ptr, stream)
 
 #define DISPATCH_MG_CM(CM, NH, TK)                                                                 \
-  launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64>(                               \
+  launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64>(                                 \
       Q, KV, indices, /*KV_extra=*/nullptr, /*idx_extra=*/nullptr, attn_sink, output, out_lse,     \
       sm_scale, num_tokens, stride_kv_block, /*stride_kv_block_extra=*/(size_t)0, topk_length_ptr, \
       /*topk_length_extra=*/nullptr, stream)
 
 #define DISPATCH_BY_NH_CM(CM, TK)    \
-  do {                                \
-    switch (num_heads) {              \
-      case 16:                        \
+  do {                               \
+    switch (num_heads) {             \
+      case 16:                       \
         DISPATCH_SG_CM(CM, 16, TK);  \
-        return true;                  \
-      case 32:                        \
+        return true;                 \
+      case 32:                       \
         DISPATCH_MG_CM(CM, 32, TK);  \
-        return true;                  \
-      case 64:                        \
+        return true;                 \
+      case 64:                       \
         DISPATCH_MG_CM(CM, 64, TK);  \
-        return true;                  \
-      case 128:                       \
+        return true;                 \
+      case 128:                      \
         DISPATCH_MG_CM(CM, 128, TK); \
-        return true;                  \
-      default:                        \
-        return false;                 \
-    }                                 \
+        return true;                 \
+      default:                       \
+        return false;                \
+    }                                \
   } while (0)
 
   // Small K-loop: BF16 QK skips the FP8 Q-quantize prologue. Larger K
@@ -222,16 +222,16 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
 }
 
 inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extra_page_block_size,
-                                 const bf16* Q, const uint8_t* KV, const int32_t* indices,
-                                 const uint8_t* KV_extra, const int32_t* idx_extra,
-                                 const float* attn_sink, bf16* output, float* out_lse,
-                                 float sm_scale, int num_tokens, size_t stride_kv_block,
-                                 size_t stride_kv_block_extra, const int* topk_length_ptr,
-                                 const int* topk_length_extra_ptr, cudaStream_t stream) {
+                               const bf16* Q, const uint8_t* KV, const int32_t* indices,
+                               const uint8_t* KV_extra, const int32_t* idx_extra,
+                               const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
+                               int num_tokens, size_t stride_kv_block, size_t stride_kv_block_extra,
+                               const int* topk_length_ptr, const int* topk_length_extra_ptr,
+                               cudaStream_t stream) {
 // NH=16 dispatches through MG with MG_N_HG_T=1 so callers can pad TP=4/TP=8
 // without falling into SG (SG has no dual-cache support).
 #define DISPATCH_DUAL_MG_CM(CM, NH, TK, TK_EX, PBSX, NHG)                                    \
-  launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, TK_EX, PBSX, NHG>(       \
+  launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, TK_EX, PBSX, NHG>(         \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, \
       stride_kv_block, stride_kv_block_extra, topk_length_ptr, topk_length_extra_ptr, stream)
 
@@ -317,9 +317,9 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
   if (extra_KV_cache != nullptr) {
     if (mt != ModelType::DSV4) return false;
     return dispatch_dsv4_dual(num_heads, topk, topk_extra, extra_page_block_size, Q, KV_cache,
-                                indices, extra_KV_cache, extra_indices, attn_sink, output, out_lse,
-                                sm_scale, num_tokens, stride_kv_block, stride_kv_block_extra,
-                                topk_length, extra_topk_length, stream);
+                              indices, extra_KV_cache, extra_indices, attn_sink, output, out_lse,
+                              sm_scale, num_tokens, stride_kv_block, stride_kv_block_extra,
+                              topk_length, extra_topk_length, stream);
   }
 
   switch (mt) {
@@ -327,9 +327,8 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
       return dispatch_v32(num_heads, topk, Q, KV_cache, indices, attn_sink, output, out_lse,
                           sm_scale, num_tokens, stride_kv_block, topk_length, stream);
     case ModelType::DSV4:
-      return dispatch_dsv4_single(num_heads, topk, Q, KV_cache, indices, attn_sink, output,
-                                    out_lse, sm_scale, num_tokens, stride_kv_block, topk_length,
-                                    stream);
+      return dispatch_dsv4_single(num_heads, topk, Q, KV_cache, indices, attn_sink, output, out_lse,
+                                  sm_scale, num_tokens, stride_kv_block, topk_length, stream);
   }
   return false;
 }

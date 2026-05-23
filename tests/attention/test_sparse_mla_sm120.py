@@ -173,9 +173,9 @@ def quantize_kv_dsv3_2(kv_bf16: torch.Tensor) -> torch.Tensor:
         fp8 = (tile / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
         result[:, ti * tile_size : (ti + 1) * tile_size] = fp8.view(torch.uint8)
         # FP32 scale → 4 bytes inline at offset 512 + ti*4.
-        result[:, d_nope + ti * 4 : d_nope + (ti + 1) * 4] = scale.view(
-            torch.float32
-        ).view(torch.uint8).view(nt, 4)
+        result[:, d_nope + ti * 4 : d_nope + (ti + 1) * 4] = (
+            scale.view(torch.float32).view(torch.uint8).view(nt, 4)
+        )
 
     # BF16 rope tail.
     rope = kv[:, d_nope:].to(torch.bfloat16).contiguous().view(torch.uint8)
@@ -193,9 +193,11 @@ def dequantize_kv_dsv3_2(packed: torch.Tensor) -> torch.Tensor:
 
     result = torch.zeros(nt, d_nope + d_rope, dtype=torch.bfloat16, device=p.device)
     for ti in range(num_tiles):
-        fp8 = p[:, ti * tile_size : (ti + 1) * tile_size].view(
-            torch.float8_e4m3fn
-        ).float()
+        fp8 = (
+            p[:, ti * tile_size : (ti + 1) * tile_size]
+            .view(torch.float8_e4m3fn)
+            .float()
+        )
         scale = (
             p[:, d_nope + ti * 4 : d_nope + (ti + 1) * 4]
             .contiguous()
@@ -655,9 +657,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
     main_idx[:, topk // 2 :] = -1
     extra_idx[:, extra_topk // 2 :] = -1
 
-    attn_sink = (
-        torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
-    )
+    attn_sink = torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
 
     sm_scale = d_qk**-0.5
 
@@ -669,9 +669,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
     virtual_kv = torch.cat(
         [main_dequant.reshape(-1, d_qk), extra_dequant.reshape(-1, d_qk)], dim=0
     ).reshape(-1, 1, 1, d_qk)
-    extra_idx_shifted = torch.where(
-        extra_idx < 0, extra_idx, extra_idx + main_s_kv
-    )
+    extra_idx_shifted = torch.where(extra_idx < 0, extra_idx, extra_idx + main_s_kv)
     virtual_idx = torch.cat([main_idx, extra_idx_shifted], dim=-1)
 
     ref_out, _ref_lse = _ref_sparse_attn(

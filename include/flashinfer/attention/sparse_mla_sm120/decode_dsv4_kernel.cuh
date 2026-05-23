@@ -31,54 +31,53 @@ namespace flashinfer::sparse_mla_sm120 {
 // smem, otherwise non-leader IO writes can be stale. We use
 // bar_sync<3, MATH_THREADS> since only math warps participate.
 
-constexpr int DSV4_N_WARPS = 8;                                    // math warps
+constexpr int DSV4_N_WARPS = 8;  // math warps
 constexpr int DSV4_IO_WARPS = 1;
-constexpr int DSV4_N_TOTAL_WARPS = DSV4_N_WARPS + DSV4_IO_WARPS;        // 9
-constexpr int DSV4_BLOCK_THREADS = DSV4_N_TOTAL_WARPS * 32;            // 288
-constexpr int DSV4_MATH_THREADS = DSV4_N_WARPS * 32;                   // 256
-constexpr int DSV4_IO_THREADS = DSV4_IO_WARPS * 32;                    // 32
+constexpr int DSV4_N_TOTAL_WARPS = DSV4_N_WARPS + DSV4_IO_WARPS;  // 9
+constexpr int DSV4_BLOCK_THREADS = DSV4_N_TOTAL_WARPS * 32;       // 288
+constexpr int DSV4_MATH_THREADS = DSV4_N_WARPS * 32;              // 256
+constexpr int DSV4_IO_THREADS = DSV4_IO_WARPS * 32;               // 32
 constexpr int DSV4_CAND_WINDOW = 64;
 constexpr int DSV4_BI = DSV4_CAND_WINDOW;
 constexpr int DSV4_KV_BUF_COUNT = 2;
-constexpr int DSV4_ENTRIES_PER_WARP = DSV4_BI / DSV4_N_WARPS;            // 8
-constexpr int DSV4_QK_N_TILES = DSV4_ENTRIES_PER_WARP / 8;             // 1
+constexpr int DSV4_ENTRIES_PER_WARP = DSV4_BI / DSV4_N_WARPS;  // 8
+constexpr int DSV4_QK_N_TILES = DSV4_ENTRIES_PER_WARP / 8;     // 1
 
 // No minBlocksPerSM hint on launch_bounds: the kernel is smem-bound at
 // 1 block/SM regardless, and the unconstrained ptxas register budget
 // avoids the per-warp spill the hint would otherwise force.
 template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_kernel(
-    const bf16* __restrict__ Q,            // [num_tokens, num_heads, d_qk] bf16
-    const uint8_t* __restrict__ KV_cache,  // FP8 paged (DSV4 footer layout)
-    const int32_t* __restrict__ indices,   // [num_tokens, topk] int32
-    bf16* __restrict__ mid_out,            // [num_tokens, num_heads, num_splits, d_v] bf16
-    float* __restrict__ mid_lse,           // [num_tokens, num_heads, num_splits] f32
+    const bf16* __restrict__ Q,               // [num_tokens, num_heads, d_qk] bf16
+    const uint8_t* __restrict__ KV_cache,     // FP8 paged (DSV4 footer layout)
+    const int32_t* __restrict__ indices,      // [num_tokens, topk] int32
+    bf16* __restrict__ mid_out,               // [num_tokens, num_heads, num_splits, d_v] bf16
+    float* __restrict__ mid_lse,              // [num_tokens, num_heads, num_splits] f32
     const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
     // Optional secondary KV cache (DSv4 C4A / C128A second-tier per-token cache).
     // When extra_KV_cache != nullptr the kernel concatenates the extra candidate
     // window after the main one; per-chunk dispatch in the IO warp + math mask
     // routes each chunk to the correct source. pbs_extra is the page-block
     // size of the extra cache, which may differ from the main pbs.
-    const uint8_t* __restrict__ extra_KV_cache,        // nullable; may use different pbs
-    const int32_t* __restrict__ extra_indices,         // [num_tokens, extra_topk]
-    const int* __restrict__ extra_topk_length_ptr,     // [num_tokens] or null
-    int extra_topk,                                    // 0 = no extra cache
-    int pbs_extra,                                     // page_block_size for extra cache (e.g. 2 for DSv4 C128A)
-    size_t stride_extra_kv_block,
-    int num_tokens, int num_splits, int chunks_per_block,
+    const uint8_t* __restrict__ extra_KV_cache,     // nullable; may use different pbs
+    const int32_t* __restrict__ extra_indices,      // [num_tokens, extra_topk]
+    const int* __restrict__ extra_topk_length_ptr,  // [num_tokens] or null
+    int extra_topk,                                 // 0 = no extra cache
+    int pbs_extra,  // page_block_size for extra cache (e.g. 2 for DSv4 C128A)
+    size_t stride_extra_kv_block, int num_tokens, int num_splits, int chunks_per_block,
     float sm_scale, size_t stride_kv_block) {
   using KV = KVCacheTraits<MT>;
   static_assert(MT == ModelType::DSV4, "decode-dsv4 currently DSV4-only");
-  constexpr int D_NOPE = KV::D_NOPE;                              // 448
-  constexpr int D_ROPE_C = KV::D_ROPE;                            // 64
-  constexpr int D_QK = KV::D_QK;                                  // 512
-  constexpr int D_V_C = KV::D_V;                                  // 512
-  constexpr int QUANT_TILE = KV::QUANT_TILE;                      // 64
-  constexpr int NUM_SCALES = KV::NUM_SCALES;                      // 7
-  constexpr int Q_NOPE_STRIDE = KV::Q_NOPE_STRIDE;                // 464
-  constexpr int KV_SMEM_STRIDE = KV::KV_SMEM_STRIDE;              // 464
+  constexpr int D_NOPE = KV::D_NOPE;                                // 448
+  constexpr int D_ROPE_C = KV::D_ROPE;                              // 64
+  constexpr int D_QK = KV::D_QK;                                    // 512
+  constexpr int D_V_C = KV::D_V;                                    // 512
+  constexpr int QUANT_TILE = KV::QUANT_TILE;                        // 64
+  constexpr int NUM_SCALES = KV::NUM_SCALES;                        // 7
+  constexpr int Q_NOPE_STRIDE = KV::Q_NOPE_STRIDE;                  // 464
+  constexpr int KV_SMEM_STRIDE = KV::KV_SMEM_STRIDE;                // 464
   constexpr int SCALE_BYTES_PER_TOKEN = KV::SCALE_BYTES_PER_TOKEN;  // 8
-  constexpr int IO_STRIDE = D_NOPE + D_ROPE_C * 2;                // 576
+  constexpr int IO_STRIDE = D_NOPE + D_ROPE_C * 2;                  // 576
   constexpr int pbs = PAGE_BLOCK_SIZE;
   // Heads actually populated per CTA tile. For the standard dispatch
   // (NUM_HEADS ∈ {16, 32, 64, 128}) this is HPB=16. For NUM_HEADS=8 (small TP
@@ -123,14 +122,14 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     return;
   }
 
-  constexpr int V_CHUNK = QUANT_TILE;                              // 64
-  constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;                     // 7
-  constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / DSV4_N_WARPS;         // 1
-  constexpr int XV_KSTEPS = DSV4_BI / 32;                            // 2
-  constexpr int W_FP8_STRIDE = DSV4_BI + 16;                         // 80
-  constexpr int ROPE_DIMS_PER_WARP = D_ROPE_C / DSV4_N_WARPS;        // 8
-  constexpr int ROPE_N_TILES = ROPE_DIMS_PER_WARP / 8;             // 1
-  constexpr int ROPE_K_ITERS = DSV4_BI / 16;                         // 4
+  constexpr int V_CHUNK = QUANT_TILE;                          // 64
+  constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;                 // 7
+  constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / DSV4_N_WARPS;   // 1
+  constexpr int XV_KSTEPS = DSV4_BI / 32;                      // 2
+  constexpr int W_FP8_STRIDE = DSV4_BI + 16;                   // 80
+  constexpr int ROPE_DIMS_PER_WARP = D_ROPE_C / DSV4_N_WARPS;  // 8
+  constexpr int ROPE_N_TILES = ROPE_DIMS_PER_WARP / 8;         // 1
+  constexpr int ROPE_K_ITERS = DSV4_BI / 16;                   // 4
 
   // ── Dynamic smem layout ────────────────────────────────────────
   // Single-buffer Q/scratch + double-buffered KV bufs.
@@ -211,8 +210,8 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   __syncthreads();
 
   // ── TMA bulk constants ──
-  constexpr uint32_t DSV4_BULK_NOPE_BYTES = (uint32_t)D_NOPE;                  // 448
-  constexpr uint32_t DSV4_BULK_ROPE_BYTES = (uint32_t)D_ROPE_C * sizeof(bf16); // 128
+  constexpr uint32_t DSV4_BULK_NOPE_BYTES = (uint32_t)D_NOPE;                   // 448
+  constexpr uint32_t DSV4_BULK_ROPE_BYTES = (uint32_t)D_ROPE_C * sizeof(bf16);  // 128
   constexpr uint32_t DSV4_BULK_TX_BYTES =
       (uint32_t)DSV4_BI * (DSV4_BULK_NOPE_BYTES + DSV4_BULK_ROPE_BYTES);
 
@@ -223,8 +222,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   // don't care which source the data came from.
   auto issue_gather = [&](int gather_chunk_idx, int buf) {
     const bool is_extra = (gather_chunk_idx >= num_orig_chunks);
-    const int chunk_in_section =
-        is_extra ? (gather_chunk_idx - num_orig_chunks) : gather_chunk_idx;
+    const int chunk_in_section = is_extra ? (gather_chunk_idx - num_orig_chunks) : gather_chunk_idx;
     const int section_len = is_extra ? extra_topk_len : topk_len;
     const int g_start = chunk_in_section * DSV4_CAND_WINDOW;
     const int g_end = min(g_start + DSV4_CAND_WINDOW, section_len);
@@ -280,10 +278,10 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       const int local_idx_g = idx - block_idx_g * section_pbs;
       const uint8_t* data_base =
           section_kv + (size_t)block_idx_g * section_stride + (size_t)local_idx_g * IO_STRIDE;
-      cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE,
-                        data_base, DSV4_BULK_NOPE_BYTES, mbar_full + buf);
-      cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C,
-                        data_base + D_NOPE, DSV4_BULK_ROPE_BYTES, mbar_full + buf);
+      cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
+                        DSV4_BULK_NOPE_BYTES, mbar_full + buf);
+      cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + D_NOPE,
+                        DSV4_BULK_ROPE_BYTES, mbar_full + buf);
     }
   };
 
@@ -316,7 +314,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   // internally with count=DSV4_MATH_THREADS).
   const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
   quantize_q_to_smem<MT, DSV4_MATH_THREADS>(sm_q_fp8, sm_q_sc, sm_q_rope, q_base, sm_reduce,
-                                          VALID_HPB);
+                                            VALID_HPB);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};
@@ -335,8 +333,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     // pair is used by the math-warp mask: any candidate slot whose absolute
     // offset within its section ≥ section_len gets qk = -inf.
     const bool is_extra_chunk = (chunk_idx >= num_orig_chunks);
-    const int chunk_in_section =
-        is_extra_chunk ? (chunk_idx - num_orig_chunks) : chunk_idx;
+    const int chunk_in_section = is_extra_chunk ? (chunk_idx - num_orig_chunks) : chunk_idx;
     const int section_len = is_extra_chunk ? extra_topk_len : topk_len;
     const int split_cand_start = chunk_in_section * DSV4_CAND_WINDOW;
     const int split_cand_end = min(split_cand_start + DSV4_CAND_WINDOW, section_len);
@@ -369,8 +366,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
             const int cand_row_base = warp_first_cand + nt * 8;
             uint8_t sfb = sm_kv_sc[(cand_row_base + gid) * SCALE_BYTES_PER_TOKEN + blk];
             uint32_t b0, b1;
-            ldmatrix_load_B_fp8(b0, b1,
-                                sm_kv_fp8 + (size_t)cand_row_base * KV_SMEM_STRIDE + ko,
+            ldmatrix_load_B_fp8(b0, b1, sm_kv_fp8 + (size_t)cand_row_base * KV_SMEM_STRIDE + ko,
                                 KV_SMEM_STRIDE, lane);
             MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(
                 a0, a1, a2, a3, b0, b1, qk[nt][0], qk[nt][1], qk[nt][2], qk[nt][3], sfa, sfb);
@@ -403,8 +399,8 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
           const bf16* kv_rope_row = sm_kv_rope + (size_t)entry * D_ROPE_C + ks * 16;
           uint32_t b0 = *reinterpret_cast<const uint32_t*>(kv_rope_row + tid * 2);
           uint32_t b1 = *reinterpret_cast<const uint32_t*>(kv_rope_row + tid * 2 + 8);
-          MmaBf16Result r = mma_bf16_m16n8k16(
-              a0, a1, a2, a3, b0, b1, qk[nt][0], qk[nt][1], qk[nt][2], qk[nt][3]);
+          MmaBf16Result r =
+              mma_bf16_m16n8k16(a0, a1, a2, a3, b0, b1, qk[nt][0], qk[nt][1], qk[nt][2], qk[nt][3]);
           qk[nt][0] = r.d0;
           qk[nt][1] = r.d1;
           qk[nt][2] = r.d2;
@@ -418,9 +414,8 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     // (indexer-padded). For the latter the IO warp already gathered
     // slot 0 into smem (idx was clamped to 0); masking qk = -inf kills
     // its contribution in softmax. Mirrors decode_dsv3_2_kernel.cuh.
-    const int32_t* section_idx_base = is_extra_chunk
-        ? (extra_indices + (size_t)t_idx * extra_topk)
-        : idx_base;
+    const int32_t* section_idx_base =
+        is_extra_chunk ? (extra_indices + (size_t)t_idx * extra_topk) : idx_base;
     const int warp_first_cand = warp_id * DSV4_ENTRIES_PER_WARP;
 #pragma unroll
     for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
@@ -508,10 +503,8 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     // Online softmax update.
     float new_gmax0 = fmaxf(global_max[0], block_local_max0);
     float new_gmax1 = fmaxf(global_max[1], block_local_max1);
-    const float alpha0 =
-        (global_max[0] > -1e29f) ? exp2f(global_max[0] - new_gmax0) : 0.f;
-    const float alpha1 =
-        (global_max[1] > -1e29f) ? exp2f(global_max[1] - new_gmax1) : 0.f;
+    const float alpha0 = (global_max[0] > -1e29f) ? exp2f(global_max[0] - new_gmax0) : 0.f;
+    const float alpha1 = (global_max[1] > -1e29f) ? exp2f(global_max[1] - new_gmax1) : 0.f;
     // Two distinct rescale factors:
     //   block_rescale = exp(block_local_max - new_gmax) — rescales the
     //     block-wide sum (already weighted by per-warp local_max during
@@ -594,16 +587,12 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
         const int cand_e1 = cand_e0 + 1;
 #pragma unroll
         for (int vc = 0; vc < N_V_CHUNKS; vc++) {
-          const float vsc0 = ue8m0_to_fp32(
-              sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
-          const float vsc1 = ue8m0_to_fp32(
-              sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
+          const float vsc0 = ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
+          const float vsc1 = ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
           atomicMax(reinterpret_cast<int*>(&sm_w_head_sc[vc * HPB + gid]),
-                    __float_as_int(fmaxf(fabsf(w_pre[nt][0] * vsc0),
-                                         fabsf(w_pre[nt][1] * vsc1))));
+                    __float_as_int(fmaxf(fabsf(w_pre[nt][0] * vsc0), fabsf(w_pre[nt][1] * vsc1))));
           atomicMax(reinterpret_cast<int*>(&sm_w_head_sc[vc * HPB + gid + 8]),
-                    __float_as_int(fmaxf(fabsf(w_pre[nt][2] * vsc0),
-                                         fabsf(w_pre[nt][3] * vsc1))));
+                    __float_as_int(fmaxf(fabsf(w_pre[nt][2] * vsc0), fabsf(w_pre[nt][3] * vsc1))));
         }
       }
     }
@@ -628,10 +617,8 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
         for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
           const int cand_e0 = warp_first_cand_xv + nt * 8 + tid * 2;
           const int cand_e1 = cand_e0 + 1;
-          const float vsc0 = ue8m0_to_fp32(
-              sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
-          const float vsc1 = ue8m0_to_fp32(
-              sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
+          const float vsc0 = ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
+          const float vsc1 = ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
           __nv_fp8_e4m3 f00(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][0] * vsc0 * si0)));
           __nv_fp8_e4m3 f01(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][1] * vsc1 * si0)));
           __nv_fp8_e4m3 f10(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][2] * vsc0 * si1)));
@@ -656,8 +643,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
           uint32_t a0, a1, a2, a3, b0, b1;
           ldmatrix_load_A_fp8(a0, a1, a2, a3, sm_w_fp8 + ko, W_FP8_STRIDE, lane);
           d2_load_b_fp8<KV_SMEM_STRIDE>(b0, b1, sm_kv_fp8, kstep * 32, dim, lane);
-          MmaFp8Result r =
-              mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv[0], xv[1], xv[2], xv[3]);
+          MmaFp8Result r = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv[0], xv[1], xv[2], xv[3]);
           xv[0] = r.d0;
           xv[1] = r.d1;
           xv[2] = r.d2;
@@ -676,8 +662,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
 #pragma unroll
       for (int ks = 0; ks < ROPE_K_ITERS; ks++) {
         uint32_t a0, a1, a2, a3;
-        ldmatrix_load_A_bf16(a0, a1, a2, a3,
-                             reinterpret_cast<const bf16*>(&sm_p_full[0][ks * 16]),
+        ldmatrix_load_A_bf16(a0, a1, a2, a3, reinterpret_cast<const bf16*>(&sm_p_full[0][ks * 16]),
                              DSV4_BI, lane);
 #pragma unroll
         for (int nt = 0; nt < ROPE_N_TILES; nt++) {
@@ -688,19 +673,18 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
           const int ent8 = ent0 + 8;
           const int ent9 = ent0 + 9;
           const int col = n_col + gid;
-          uint16_t v0 = *reinterpret_cast<const uint16_t*>(
-              sm_kv_rope + (size_t)ent0 * D_ROPE_C + col);
-          uint16_t v1 = *reinterpret_cast<const uint16_t*>(
-              sm_kv_rope + (size_t)ent1 * D_ROPE_C + col);
-          uint16_t v8 = *reinterpret_cast<const uint16_t*>(
-              sm_kv_rope + (size_t)ent8 * D_ROPE_C + col);
-          uint16_t v9 = *reinterpret_cast<const uint16_t*>(
-              sm_kv_rope + (size_t)ent9 * D_ROPE_C + col);
+          uint16_t v0 =
+              *reinterpret_cast<const uint16_t*>(sm_kv_rope + (size_t)ent0 * D_ROPE_C + col);
+          uint16_t v1 =
+              *reinterpret_cast<const uint16_t*>(sm_kv_rope + (size_t)ent1 * D_ROPE_C + col);
+          uint16_t v8 =
+              *reinterpret_cast<const uint16_t*>(sm_kv_rope + (size_t)ent8 * D_ROPE_C + col);
+          uint16_t v9 =
+              *reinterpret_cast<const uint16_t*>(sm_kv_rope + (size_t)ent9 * D_ROPE_C + col);
           uint32_t b0 = (uint32_t)v0 | ((uint32_t)v1 << 16);
           uint32_t b1 = (uint32_t)v8 | ((uint32_t)v9 << 16);
-          MmaBf16Result r = mma_bf16_m16n8k16(
-              a0, a1, a2, a3, b0, b1, acc_rope[nt][0], acc_rope[nt][1],
-              acc_rope[nt][2], acc_rope[nt][3]);
+          MmaBf16Result r = mma_bf16_m16n8k16(a0, a1, a2, a3, b0, b1, acc_rope[nt][0],
+                                              acc_rope[nt][1], acc_rope[nt][2], acc_rope[nt][3]);
           acc_rope[nt][0] = r.d0;
           acc_rope[nt][1] = r.d1;
           acc_rope[nt][2] = r.d2;
@@ -728,9 +712,8 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   const float inv_g0 = (global_sum[0] > 0.f) ? (1.f / global_sum[0]) : 0.f;
   const float inv_g1 = (global_sum[1] > 0.f) ? (1.f / global_sum[1]) : 0.f;
 
-  const size_t mid_o_base =
-      ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V_C +
-      (size_t)split_idx * D_V_C;
+  const size_t mid_o_base = ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V_C +
+                            (size_t)split_idx * D_V_C;
 
   // Pack adjacent (d0, d0+1) bf16 pairs into __nv_bfloat162 so the compiler
   // emits STG.E.64 instead of two STG.E.U16 — halves the global-store
@@ -743,10 +726,10 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
 #pragma unroll
     for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
       const int d0 = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8 + tid * 2;
-      const __nv_bfloat162 pair_lo = __floats2bfloat162_rn(
-          acc_nope[vc][nt][0] * inv_g0, acc_nope[vc][nt][1] * inv_g0);
-      const __nv_bfloat162 pair_hi = __floats2bfloat162_rn(
-          acc_nope[vc][nt][2] * inv_g1, acc_nope[vc][nt][3] * inv_g1);
+      const __nv_bfloat162 pair_lo =
+          __floats2bfloat162_rn(acc_nope[vc][nt][0] * inv_g0, acc_nope[vc][nt][1] * inv_g0);
+      const __nv_bfloat162 pair_hi =
+          __floats2bfloat162_rn(acc_nope[vc][nt][2] * inv_g1, acc_nope[vc][nt][3] * inv_g1);
       *reinterpret_cast<__nv_bfloat162*>(
           &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
       // gid + 8 slot exists only when the kernel tile holds > 8 heads. For
@@ -763,10 +746,10 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
 #pragma unroll
     for (int nt = 0; nt < ROPE_N_TILES; nt++) {
       const int d0 = D_NOPE + rope_dim_base + nt * 8 + tid * 2;
-      const __nv_bfloat162 pair_lo = __floats2bfloat162_rn(
-          acc_rope[nt][0] * inv_g0, acc_rope[nt][1] * inv_g0);
-      const __nv_bfloat162 pair_hi = __floats2bfloat162_rn(
-          acc_rope[nt][2] * inv_g1, acc_rope[nt][3] * inv_g1);
+      const __nv_bfloat162 pair_lo =
+          __floats2bfloat162_rn(acc_rope[nt][0] * inv_g0, acc_rope[nt][1] * inv_g0);
+      const __nv_bfloat162 pair_hi =
+          __floats2bfloat162_rn(acc_rope[nt][2] * inv_g1, acc_rope[nt][3] * inv_g1);
       *reinterpret_cast<__nv_bfloat162*>(
           &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
       if constexpr (VALID_HPB > 8) {
@@ -776,12 +759,9 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     }
   }
   if (warp_id == 0 && tid == 0) {
-    const float lse0 =
-        (global_sum[0] > 0.f) ? (log2f(global_sum[0]) + global_max[0]) : -1e30f;
-    const float lse1 =
-        (global_sum[1] > 0.f) ? (log2f(global_sum[1]) + global_max[1]) : -1e30f;
-    const size_t lse_base =
-        (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
+    const float lse0 = (global_sum[0] > 0.f) ? (log2f(global_sum[0]) + global_max[0]) : -1e30f;
+    const float lse1 = (global_sum[1] > 0.f) ? (log2f(global_sum[1]) + global_max[1]) : -1e30f;
+    const size_t lse_base = (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
     mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
     if constexpr (VALID_HPB > 8) {
       mid_lse[lse_base + (size_t)(gid + 8) * num_splits + split_idx] = lse1;
@@ -799,16 +779,13 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
 // from smem rather than re-fetching from L1/L2.
 template <int NUM_HEADS, int D_V_VAL, int BLOCK_THREADS, int DIMS_PER_THREAD>
 __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge_kernel(
-    const bf16* __restrict__ mid_out,
-    const float* __restrict__ mid_lse,
-    bf16* __restrict__ output,
+    const bf16* __restrict__ mid_out, const float* __restrict__ mid_lse, bf16* __restrict__ output,
     float* __restrict__ out_lse,
     const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable. natural-log domain.
     int num_tokens, int num_splits) {
   static_assert(BLOCK_THREADS % 32 == 0, "BLOCK_THREADS must be multiple of 32");
   static_assert(DIMS_PER_THREAD % 8 == 0, "DIMS_PER_THREAD must be multiple of 8 (uint4)");
-  static_assert(BLOCK_THREADS * DIMS_PER_THREAD == D_V_VAL,
-                "block must cover the full D_V row");
+  static_assert(BLOCK_THREADS * DIMS_PER_THREAD == D_V_VAL, "block must cover the full D_V row");
   constexpr int VECS_PER_THREAD = DIMS_PER_THREAD / 8;  // 1 for D_V=512, BT=64
   constexpr int MAX_SPLITS = 32;
 
@@ -823,8 +800,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
   __shared__ float sm_inv_gsum;
   __shared__ float sm_glse;
 
-  const float* lse_ptr =
-      mid_lse + (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h * num_splits;
+  const float* lse_ptr = mid_lse + (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h * num_splits;
 
   // Stage 0: cooperatively load mid_lse into smem.
   for (int sp = tid; sp < num_splits; sp += BLOCK_THREADS) {
@@ -876,8 +852,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
   const float inv_global_sum = sm_inv_gsum;
 
   // Stage 2: vec-load the partial outputs per split and accumulate.
-  const bf16* mid_base =
-      mid_out + ((size_t)t_idx * NUM_HEADS + h) * (size_t)num_splits * D_V_VAL;
+  const bf16* mid_base = mid_out + ((size_t)t_idx * NUM_HEADS + h) * (size_t)num_splits * D_V_VAL;
   bf16* out_ptr = output + ((size_t)t_idx * NUM_HEADS + h) * D_V_VAL;
   const int dim_base = tid * DIMS_PER_THREAD;
 
@@ -893,8 +868,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
 #pragma unroll
     for (int v = 0; v < VECS_PER_THREAD; v++) {
       const uint4 packed = *reinterpret_cast<const uint4*>(row_base + v * 8);
-      const __nv_bfloat162* pairs =
-          reinterpret_cast<const __nv_bfloat162*>(&packed);
+      const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&packed);
 #pragma unroll
       for (int p = 0; p < 4; p++) {
         const float2 f = __bfloat1622float2(pairs[p]);

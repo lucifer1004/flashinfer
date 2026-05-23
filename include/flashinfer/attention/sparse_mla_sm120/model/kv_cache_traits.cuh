@@ -122,7 +122,7 @@ struct KVCacheTraits<ModelType::DSV4> {
   static constexpr bool SCALE_IN_KV_SMEM = false;
 
   // Q nope stride
-  static constexpr int Q_NOPE_STRIDE = D_NOPE + 16;  // 464
+  static constexpr int Q_NOPE_STRIDE = D_NOPE + 16;      // 464
   static constexpr int Q_NOPE_BF16_STRIDE = D_NOPE + 8;  // 456 bf16 (912 B)
 
   // V = nope[0:448] + rope[0:64]

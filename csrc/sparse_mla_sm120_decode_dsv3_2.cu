@@ -13,31 +13,30 @@
 // = 20 instantiations.
 
 #include <cuda_runtime.h>
-#include <cstdio>
 
+#include <cstdio>
 #include <flashinfer/attention/sparse_mla_sm120/decode_dsv3_2_kernel.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/decode_dsv4_kernel.cuh>  // merge kernel
 #include <flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh>
 
 namespace flashinfer::sparse_mla_sm120 {
 
-#define DSV3_2_CUDA_CHECK(call)                                   \
-  do {                                                            \
-    cudaError_t e = (call);                                       \
-    if (e != cudaSuccess) {                                       \
-      printf("CUDA %s:%d %s\n", __FILE__, __LINE__,               \
-             cudaGetErrorString(e));                              \
-      return false;                                               \
-    }                                                             \
+#define DSV3_2_CUDA_CHECK(call)                                             \
+  do {                                                                      \
+    cudaError_t e = (call);                                                 \
+    if (e != cudaSuccess) {                                                 \
+      printf("CUDA %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
+      return false;                                                         \
+    }                                                                       \
   } while (0)
 
 template <int NUM_HEADS, int TOPK>
-static bool launch_decode_dsv3_2_impl(
-    const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
-    bf16* mid_out, float* mid_lse, const int* topk_length, bf16* output,
-    float* out_lse, const float* attn_sink, int num_tokens, int num_splits,
-    int chunks_per_block_override, float sm_scale, size_t stride_kv_block,
-    cudaStream_t stream) {
+static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
+                                      const int32_t* indices, bf16* mid_out, float* mid_lse,
+                                      const int* topk_length, bf16* output, float* out_lse,
+                                      const float* attn_sink, int num_tokens, int num_splits,
+                                      int chunks_per_block_override, float sm_scale,
+                                      size_t stride_kv_block, cudaStream_t stream) {
   using KV = KVCacheTraits<ModelType::DSV3_2>;
   constexpr int H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
 
@@ -55,20 +54,20 @@ static bool launch_decode_dsv3_2_impl(
   // Grand total ≈ 98 KB (under 99 KB sm120a carveout, 1 block/SM).
   constexpr int N_V_CHUNKS_LAUNCH = KV::D_NOPE / KV::QUANT_TILE;  // 4
   constexpr int DYN_SMEM_BYTES =
-      HPB * KV::D_ROPE * (int)sizeof(bf16)                              // sm_q_rope
-      + HPB * KV::Q_NOPE_STRIDE                                         // sm_q_fp8
-      + HPB * KV::NUM_SCALES * (int)sizeof(float)                       // sm_q_sc
-      + DSV3_2_KV_BUF_COUNT * DSV3_2_BI * KV::KV_SMEM_STRIDE            // sm_kv_fp8 ×2 (NoPE + INLINE scales)
-      + DSV3_2_KV_BUF_COUNT * DSV3_2_BI * KV::D_ROPE * (int)sizeof(bf16)// sm_kv_rope ×2
-      + 16                                                              // mbar align pad
-      + 4 * (int)sizeof(uint64_t)                                       // mbar_full + mbar_empty
-      + 2 * DSV3_2_N_WARPS * HPB * (int)sizeof(float)                   // sm_reduce
-      + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                    // sm_w_head_sc
-      + 2 * HPB * (DSV3_2_BI + 16);                                     // sm_w_fp8 ×2
+      HPB * KV::D_ROPE * (int)sizeof(bf16)                    // sm_q_rope
+      + HPB * KV::Q_NOPE_STRIDE                               // sm_q_fp8
+      + HPB * KV::NUM_SCALES * (int)sizeof(float)             // sm_q_sc
+      + DSV3_2_KV_BUF_COUNT * DSV3_2_BI * KV::KV_SMEM_STRIDE  // sm_kv_fp8 ×2 (NoPE + INLINE scales)
+      + DSV3_2_KV_BUF_COUNT * DSV3_2_BI * KV::D_ROPE * (int)sizeof(bf16)  // sm_kv_rope ×2
+      + 16                                                                // mbar align pad
+      + 4 * (int)sizeof(uint64_t)                                         // mbar_full + mbar_empty
+      + 2 * DSV3_2_N_WARPS * HPB * (int)sizeof(float)                     // sm_reduce
+      + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                      // sm_w_head_sc
+      + 2 * HPB * (DSV3_2_BI + 16);                                       // sm_w_fp8 ×2
 
   auto kernel = sparse_mla_decode_dsv3_2_kernel<NUM_HEADS, TOPK, 64>;
-  DSV3_2_CUDA_CHECK(cudaFuncSetAttribute(
-      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
+  DSV3_2_CUDA_CHECK(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
 
   // chunks_per_block heuristic identical to decode-dsv4: among cpb candidates
   // with at most CEIL_WAVES_MAX integer waves, minimize the last-wave tail
@@ -91,8 +90,7 @@ static bool launch_decode_dsv3_2_impl(
       if (ceil_w > CEIL_WAVES_MAX) continue;
       const float waves = (float)active / (float)sm_count;
       const float gap = (float)ceil_w - waves;
-      if (gap < best_gap - 1e-6f ||
-          (gap < best_gap + 1e-6f && cpb > chunks_per_block)) {
+      if (gap < best_gap - 1e-6f || (gap < best_gap + 1e-6f && cpb > chunks_per_block)) {
         best_gap = gap;
         chunks_per_block = cpb;
       }
@@ -104,38 +102,37 @@ static bool launch_decode_dsv3_2_impl(
   // wrapper allocation.
   dim3 grid1(num_tokens, H_BLOCKS, num_splits);
   dim3 block1(DSV3_2_BLOCK_THREADS);
-  kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
-      Q, KV_cache, indices, mid_out, mid_lse, topk_length,
-      num_tokens, num_splits, chunks_per_block, sm_scale, stride_kv_block);
+  kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(Q, KV_cache, indices, mid_out, mid_lse,
+                                                    topk_length, num_tokens, num_splits,
+                                                    chunks_per_block, sm_scale, stride_kv_block);
   DSV3_2_CUDA_CHECK(cudaGetLastError());
 
   // Stage 2: reuse decode-dsv4 merge kernel (D_V=512 identical for both).
   constexpr int MERGE_BLOCK_THREADS = 64;
   constexpr int MERGE_DIMS_PER_THREAD = KV::D_V / MERGE_BLOCK_THREADS;
-  auto merge_kernel = sparse_mla_decode_dsv4_merge_kernel<
-      NUM_HEADS, KV::D_V, MERGE_BLOCK_THREADS, MERGE_DIMS_PER_THREAD>;
+  auto merge_kernel = sparse_mla_decode_dsv4_merge_kernel<NUM_HEADS, KV::D_V, MERGE_BLOCK_THREADS,
+                                                          MERGE_DIMS_PER_THREAD>;
   dim3 grid2(num_tokens, NUM_HEADS);
   dim3 block2(MERGE_BLOCK_THREADS);
-  merge_kernel<<<grid2, block2, 0, stream>>>(mid_out, mid_lse, output, out_lse,
-                                             attn_sink, num_tokens, num_splits);
+  merge_kernel<<<grid2, block2, 0, stream>>>(mid_out, mid_lse, output, out_lse, attn_sink,
+                                             num_tokens, num_splits);
   DSV3_2_CUDA_CHECK(cudaGetLastError());
   return true;
 }
 
 // Public surface: V32 (DSv3.2) decode.
 // Returns false if (num_heads, topk) is outside the dispatch envelope.
-bool launch_sparse_mla_decode_dsv3_2(
-    int num_heads, int topk, int num_tokens, int num_splits, const bf16* Q,
-    const uint8_t* KV_cache, const int32_t* indices, bf16* mid_out,
-    float* mid_lse, bf16* output, float* out_lse, const int* topk_length,
-    const float* attn_sink, int chunks_per_block_override, float sm_scale,
-    size_t stride_kv_block, cudaStream_t stream) {
-#define DSV3_2_DISPATCH(H, K)                                                   \
-  if (num_heads == (H) && topk == (K)) {                                        \
-    return launch_decode_dsv3_2_impl<(H), (K)>(                                 \
-        Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse,   \
-        attn_sink, num_tokens, num_splits, chunks_per_block_override, sm_scale, \
-        stride_kv_block, stream);                                               \
+bool launch_sparse_mla_decode_dsv3_2(int num_heads, int topk, int num_tokens, int num_splits,
+                                     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+                                     bf16* mid_out, float* mid_lse, bf16* output, float* out_lse,
+                                     const int* topk_length, const float* attn_sink,
+                                     int chunks_per_block_override, float sm_scale,
+                                     size_t stride_kv_block, cudaStream_t stream) {
+#define DSV3_2_DISPATCH(H, K)                                                                  \
+  if (num_heads == (H) && topk == (K)) {                                                       \
+    return launch_decode_dsv3_2_impl<(H), (K)>(                                                \
+        Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,       \
+        num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, stream); \
   }
   DSV3_2_DISPATCH(8, 128)
   DSV3_2_DISPATCH(8, 512)

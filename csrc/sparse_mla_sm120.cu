@@ -84,11 +84,11 @@ inline int effective_stride_kv_row(const TensorView& kv) {
 }  // namespace
 
 void SparseMlaSm120PagedAttention(
-    TensorView q,           // [num_tokens, num_heads, d_qk] bf16
-    TensorView kv_cache,    // [num_pages, page_block_size, ...] paged FP8
-    TensorView indices,     // [num_tokens, topk] int32 (-1 = skip)
-    TensorView output,      // [num_tokens, num_heads, d_v] bf16 — in-place
-    TensorView out_lse,     // [num_tokens, num_heads] f32 — in-place
+    TensorView q,         // [num_tokens, num_heads, d_qk] bf16
+    TensorView kv_cache,  // [num_pages, page_block_size, ...] paged FP8
+    TensorView indices,   // [num_tokens, topk] int32 (-1 = skip)
+    TensorView output,    // [num_tokens, num_heads, d_v] bf16 — in-place
+    TensorView out_lse,   // [num_tokens, num_heads] f32 — in-place
     double sm_scale,
     Optional<TensorView> topk_length,        // [num_tokens] int32, optional
     Optional<TensorView> attn_sink,          // [num_heads] f32, optional
@@ -173,7 +173,8 @@ void SparseMlaSm120PagedAttention(
   // only handles prefill.
   TVM_FFI_ICHECK_GT(num_tokens, 64)
       << "Decode (num_tokens <= 64) must go through sparse_mla_sm120_decode_dsv3_2 "
-         "or sparse_mla_sm120_decode_dsv4; got num_tokens=" << num_tokens;
+         "or sparse_mla_sm120_decode_dsv4; got num_tokens="
+      << num_tokens;
 
   const bool ok = sparse_mla_prefill_dispatch(
       mt, num_heads, topk, page_block_size, extra_topk, extra_page_block_size, Q_ptr, KV_ptr,

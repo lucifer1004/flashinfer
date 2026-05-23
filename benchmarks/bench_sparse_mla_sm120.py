@@ -314,9 +314,7 @@ if __name__ == "__main__":
     # DSv3.2 decode-dsv3_2: topk fixed at 2048, page_block_size=1, 656 B/token.
     # Sweep is num_heads × num_tokens (with_sink off; sink is a per-head
     # epilogue scale, negligible on the bandwidth-bound critical path).
-    dsv3_2_configs = [
-        (h, t) for h in (8, 16, 32, 64, 128) for t in (1, 16, 32, 64)
-    ]
+    dsv3_2_configs = [(h, t) for h in (8, 16, 32, 64, 128) for t in (1, 16, 32, 64)]
 
     print()
     print("DSv3.2 decode-dsv3_2 path (topk=2048, page_block_size=1):")
@@ -324,4 +322,6 @@ if __name__ == "__main__":
     print("-" * len(header))
     for h, t in dsv3_2_configs:
         lat_us, kvbw, tfl = bench_sparse_mla_sm120_dsv3_2(h, t)
-        print(f"{h:>10}  {2048:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}")
+        print(
+            f"{h:>10}  {2048:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}"
+        )

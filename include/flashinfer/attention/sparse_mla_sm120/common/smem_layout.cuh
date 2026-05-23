@@ -49,8 +49,7 @@ struct SmemLayout {
   static constexpr bool BF16_Q = (CM == ComputeMode::BF16);
   static constexpr size_t SMEM_Q_NOPE =
       BF16_Q ? HPB * KV::Q_NOPE_BF16_STRIDE * sizeof(bf16) : HPB * KV::Q_NOPE_STRIDE;
-  static constexpr size_t SMEM_Q_SC =
-      BF16_Q ? 0 : HPB * KV::NUM_SCALES * sizeof(float);
+  static constexpr size_t SMEM_Q_SC = BF16_Q ? 0 : HPB * KV::NUM_SCALES * sizeof(float);
   static constexpr size_t SMEM_Q_ROPE = HPB * D_ROPE * sizeof(bf16);
 
   // KV double buffer
@@ -109,8 +108,7 @@ struct SmemLayoutMG {
   static constexpr bool BF16_Q = (CM == ComputeMode::BF16);
   static constexpr size_t SMEM_Q_NOPE =
       BF16_Q ? HPB * KV::Q_NOPE_BF16_STRIDE * sizeof(bf16) : HPB * KV::Q_NOPE_STRIDE;
-  static constexpr size_t SMEM_Q_SC =
-      BF16_Q ? 0 : HPB * KV::NUM_SCALES * sizeof(float);
+  static constexpr size_t SMEM_Q_SC = BF16_Q ? 0 : HPB * KV::NUM_SCALES * sizeof(float);
   static constexpr size_t SMEM_KV_BUF = BI * KV::KV_SMEM_STRIDE;
   static constexpr size_t SMEM_KV_SCALE_BUF =
       SmemLayout<MT, CM>::NEED_SCALE_BUF ? BI * KV::SCALE_BYTES_PER_TOKEN : 0;

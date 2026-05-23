@@ -90,4 +90,3 @@ __device__ __forceinline__ void ldmatrix_load_A_bf16(uint32_t& a0, uint32_t& a1,
   int col = (lane >> 4) * 8;
   ldmatrix_x4(a0, a1, a2, a3, smem_base + row * stride_elems + col);
 }
-

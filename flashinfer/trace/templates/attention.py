@@ -1264,7 +1264,9 @@ sparse_mla_sm120_decode_dsv4_trace = TraceTemplate(
             "({128, 512, 1024}).",
             abbrev="topk",
         ),
-        "page_block_size": Const(description="KV cache page block size (64).", abbrev="ps"),
+        "page_block_size": Const(
+            description="KV cache page block size (64).", abbrev="ps"
+        ),
         "num_pages": Var(description="Total allocated pages in the KV cache."),
         "kv_bytes_per_token": Const(
             description="Byte-packed FP8 FOOTER stride (584 = 448 nope + 128 rope + 8 scales).",

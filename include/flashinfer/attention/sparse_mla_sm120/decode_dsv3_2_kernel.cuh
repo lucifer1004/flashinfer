@@ -37,43 +37,42 @@ namespace flashinfer::sparse_mla_sm120 {
 // after mbarrier_wait_parity is required since the mbarrier wait has no
 // implicit memory fence.
 
-constexpr int DSV3_2_N_WARPS = 8;                                    // math warps
+constexpr int DSV3_2_N_WARPS = 8;  // math warps
 constexpr int DSV3_2_IO_WARPS = 1;
-constexpr int DSV3_2_N_TOTAL_WARPS = DSV3_2_N_WARPS + DSV3_2_IO_WARPS;       // 9
-constexpr int DSV3_2_BLOCK_THREADS = DSV3_2_N_TOTAL_WARPS * 32;          // 288
-constexpr int DSV3_2_MATH_THREADS = DSV3_2_N_WARPS * 32;                 // 256
-constexpr int DSV3_2_IO_THREADS = DSV3_2_IO_WARPS * 32;                  // 32
+constexpr int DSV3_2_N_TOTAL_WARPS = DSV3_2_N_WARPS + DSV3_2_IO_WARPS;  // 9
+constexpr int DSV3_2_BLOCK_THREADS = DSV3_2_N_TOTAL_WARPS * 32;         // 288
+constexpr int DSV3_2_MATH_THREADS = DSV3_2_N_WARPS * 32;                // 256
+constexpr int DSV3_2_IO_THREADS = DSV3_2_IO_WARPS * 32;                 // 32
 constexpr int DSV3_2_CAND_WINDOW = 64;
 constexpr int DSV3_2_BI = DSV3_2_CAND_WINDOW;
 constexpr int DSV3_2_KV_BUF_COUNT = 2;
-constexpr int DSV3_2_ENTRIES_PER_WARP = DSV3_2_BI / DSV3_2_N_WARPS;          // 8
-constexpr int DSV3_2_QK_N_TILES = DSV3_2_ENTRIES_PER_WARP / 8;           // 1
+constexpr int DSV3_2_ENTRIES_PER_WARP = DSV3_2_BI / DSV3_2_N_WARPS;  // 8
+constexpr int DSV3_2_QK_N_TILES = DSV3_2_ENTRIES_PER_WARP / 8;       // 1
 
 // No minBlocksPerSM hint on launch_bounds: kernel is smem-bound at 1
 // block/SM regardless.
 template <int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2_kernel(
-    const bf16* __restrict__ Q,            // [num_tokens, num_heads, d_qk=576] bf16
-    const uint8_t* __restrict__ KV_cache,  // FP8 paged (V32 INLINE layout, 656 B/token)
-    const int32_t* __restrict__ indices,   // [num_tokens, topk] int32
-    bf16* __restrict__ mid_out,            // [num_tokens, num_heads, num_splits, d_v=512] bf16
-    float* __restrict__ mid_lse,           // [num_tokens, num_heads, num_splits] f32
+    const bf16* __restrict__ Q,               // [num_tokens, num_heads, d_qk=576] bf16
+    const uint8_t* __restrict__ KV_cache,     // FP8 paged (V32 INLINE layout, 656 B/token)
+    const int32_t* __restrict__ indices,      // [num_tokens, topk] int32
+    bf16* __restrict__ mid_out,               // [num_tokens, num_heads, num_splits, d_v=512] bf16
+    float* __restrict__ mid_lse,              // [num_tokens, num_heads, num_splits] f32
     const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
-    int num_tokens, int num_splits, int chunks_per_block,
-    float sm_scale, size_t stride_kv_block) {
+    int num_tokens, int num_splits, int chunks_per_block, float sm_scale, size_t stride_kv_block) {
   using KV = KVCacheTraits<ModelType::DSV3_2>;
-  constexpr int D_NOPE = KV::D_NOPE;                             // 512
-  constexpr int D_ROPE_C = KV::D_ROPE;                           // 64
-  constexpr int D_QK = KV::D_QK;                                 // 576
-  constexpr int D_V_C = KV::D_V;                                 // 512
-  constexpr int QUANT_TILE = KV::QUANT_TILE;                     // 128
-  constexpr int NUM_SCALES = KV::NUM_SCALES;                     // 4
-  constexpr int Q_NOPE_STRIDE = KV::Q_NOPE_STRIDE;               // 528
-  constexpr int KV_SMEM_STRIDE = KV::KV_SMEM_STRIDE;             // 528
+  constexpr int D_NOPE = KV::D_NOPE;                                // 512
+  constexpr int D_ROPE_C = KV::D_ROPE;                              // 64
+  constexpr int D_QK = KV::D_QK;                                    // 576
+  constexpr int D_V_C = KV::D_V;                                    // 512
+  constexpr int QUANT_TILE = KV::QUANT_TILE;                        // 128
+  constexpr int NUM_SCALES = KV::NUM_SCALES;                        // 4
+  constexpr int Q_NOPE_STRIDE = KV::Q_NOPE_STRIDE;                  // 528
+  constexpr int KV_SMEM_STRIDE = KV::KV_SMEM_STRIDE;                // 528
   constexpr int SCALE_BYTES_PER_TOKEN = KV::SCALE_BYTES_PER_TOKEN;  // 16 (4 × FP32)
   // INLINE: bulk covers nope + scales together (528 B), rope follows at
   // gmem offset KV_ROPE_GMEM_OFFSET=528 with 128 B/entry.
-  constexpr int KV_ROPE_OFFSET = KV::KV_ROPE_GMEM_OFFSET;        // 528
+  constexpr int KV_ROPE_OFFSET = KV::KV_ROPE_GMEM_OFFSET;  // 528
   constexpr int pbs = PAGE_BLOCK_SIZE;
   // Heads actually populated per CTA tile. For NUM_HEADS=8 (small TP),
   // only the first 8 head slots carry valid data; the kernel computes a
@@ -109,11 +108,11 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     return;
   }
 
-  constexpr int V_CHUNK = QUANT_TILE;                            // 128
-  constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;                   // 4
-  constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / DSV3_2_N_WARPS;       // 2
-  constexpr int XV_KSTEPS = DSV3_2_BI / 32;                          // 2
-  constexpr int W_FP8_STRIDE = DSV3_2_BI + 16;                       // 80
+  constexpr int V_CHUNK = QUANT_TILE;                           // 128
+  constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;                  // 4
+  constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / DSV3_2_N_WARPS;  // 2
+  constexpr int XV_KSTEPS = DSV3_2_BI / 32;                     // 2
+  constexpr int W_FP8_STRIDE = DSV3_2_BI + 16;                  // 80
 
   // ── Dynamic smem layout ────────────────────────────────────────
   // Single-buffer Q/scratch + double-buffered KV bufs.
@@ -187,8 +186,8 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
 
   // ── TMA bulk constants ──
   // Per entry: NoPE+scales together (528 B) → sm_kv_fp8; RoPE (128 B) → sm_kv_rope.
-  constexpr uint32_t V2_BULK_NOPESC_BYTES = (uint32_t)KV_SMEM_STRIDE;          // 528
-  constexpr uint32_t V2_BULK_ROPE_BYTES = (uint32_t)D_ROPE_C * sizeof(bf16);   // 128
+  constexpr uint32_t V2_BULK_NOPESC_BYTES = (uint32_t)KV_SMEM_STRIDE;         // 528
+  constexpr uint32_t V2_BULK_ROPE_BYTES = (uint32_t)D_ROPE_C * sizeof(bf16);  // 128
   constexpr uint32_t V2_BULK_TX_BYTES =
       (uint32_t)DSV3_2_BI * (V2_BULK_NOPESC_BYTES + V2_BULK_ROPE_BYTES);
 
@@ -216,11 +215,11 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
       const uint8_t* data_base = KV_cache + (size_t)block_idx_g * stride_kv_block +
                                  (size_t)local_idx_g * KV::KV_GMEM_STRIDE;
       // Bulk 1: NoPE + INLINE scales (528 B) → sm_kv_fp8 slot.
-      cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE,
-                        data_base, V2_BULK_NOPESC_BYTES, mbar_full + buf);
+      cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
+                        V2_BULK_NOPESC_BYTES, mbar_full + buf);
       // Bulk 2: RoPE (128 B) → sm_kv_rope slot.
-      cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C,
-                        data_base + KV_ROPE_OFFSET, V2_BULK_ROPE_BYTES, mbar_full + buf);
+      cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + KV_ROPE_OFFSET,
+                        V2_BULK_ROPE_BYTES, mbar_full + buf);
     }
   };
 
@@ -251,8 +250,8 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
 
   // Stage 0: Q quantization.
   const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
-  quantize_q_to_smem<ModelType::DSV3_2, DSV3_2_MATH_THREADS>(
-      sm_q_fp8, sm_q_sc, sm_q_rope, q_base, sm_reduce, VALID_HPB);
+  quantize_q_to_smem<ModelType::DSV3_2, DSV3_2_MATH_THREADS>(sm_q_fp8, sm_q_sc, sm_q_rope, q_base,
+                                                             sm_reduce, VALID_HPB);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};
@@ -279,8 +278,8 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     // within each KV_SMEM_STRIDE row (FP32 power-of-2; recover UE8M0
     // exponent byte via `(__float_as_uint >> 23) & 0xFF`).
     auto kv_scale_fp32 = [&](int cand, int blk) -> float {
-      return *reinterpret_cast<const float*>(
-          sm_kv_fp8 + (size_t)cand * KV_SMEM_STRIDE + D_NOPE + (size_t)blk * sizeof(float));
+      return *reinterpret_cast<const float*>(sm_kv_fp8 + (size_t)cand * KV_SMEM_STRIDE + D_NOPE +
+                                             (size_t)blk * sizeof(float));
     };
     float qk[DSV3_2_QK_N_TILES][4] = {0};
     {
@@ -299,8 +298,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
             const float sc_fp32 = kv_scale_fp32(cand_row_base + gid, blk);
             uint8_t sfb = KV::scale_to_ue8m0(sc_fp32);
             uint32_t b0, b1;
-            ldmatrix_load_B_fp8(b0, b1,
-                                sm_kv_fp8 + (size_t)cand_row_base * KV_SMEM_STRIDE + ko,
+            ldmatrix_load_B_fp8(b0, b1, sm_kv_fp8 + (size_t)cand_row_base * KV_SMEM_STRIDE + ko,
                                 KV_SMEM_STRIDE, lane);
             MmaFp8Result r = mma_fp8_block_scaled_m16n8k32(
                 a0, a1, a2, a3, b0, b1, qk[nt][0], qk[nt][1], qk[nt][2], qk[nt][3], sfa, sfb);
@@ -327,8 +325,8 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
           const bf16* kv_rope_row = sm_kv_rope + (size_t)entry * D_ROPE_C + ks * 16;
           uint32_t b0 = *reinterpret_cast<const uint32_t*>(kv_rope_row + tid * 2);
           uint32_t b1 = *reinterpret_cast<const uint32_t*>(kv_rope_row + tid * 2 + 8);
-          MmaBf16Result r = mma_bf16_m16n8k16(
-              a0, a1, a2, a3, b0, b1, qk[nt][0], qk[nt][1], qk[nt][2], qk[nt][3]);
+          MmaBf16Result r =
+              mma_bf16_m16n8k16(a0, a1, a2, a3, b0, b1, qk[nt][0], qk[nt][1], qk[nt][2], qk[nt][3]);
           qk[nt][0] = r.d0;
           qk[nt][1] = r.d1;
           qk[nt][2] = r.d2;
@@ -428,10 +426,8 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     // Online softmax update.
     float new_gmax0 = fmaxf(global_max[0], block_local_max0);
     float new_gmax1 = fmaxf(global_max[1], block_local_max1);
-    const float alpha0 =
-        (global_max[0] > -1e29f) ? exp2f(global_max[0] - new_gmax0) : 0.f;
-    const float alpha1 =
-        (global_max[1] > -1e29f) ? exp2f(global_max[1] - new_gmax1) : 0.f;
+    const float alpha0 = (global_max[0] > -1e29f) ? exp2f(global_max[0] - new_gmax0) : 0.f;
+    const float alpha1 = (global_max[1] > -1e29f) ? exp2f(global_max[1] - new_gmax1) : 0.f;
     const float block_rescale0 = exp2f(block_local_max0 - new_gmax0);
     const float block_rescale1 = exp2f(block_local_max1 - new_gmax1);
     // Per-warp rescale: drives spurious p ≡ 1 from all-invalid warps to ~0
@@ -500,11 +496,9 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
           const float vsc0 = kv_scale_fp32(cand_e0, vc);
           const float vsc1 = kv_scale_fp32(cand_e1, vc);
           atomicMax(reinterpret_cast<int*>(&sm_w_head_sc[vc * HPB + gid]),
-                    __float_as_int(fmaxf(fabsf(w_pre[nt][0] * vsc0),
-                                         fabsf(w_pre[nt][1] * vsc1))));
+                    __float_as_int(fmaxf(fabsf(w_pre[nt][0] * vsc0), fabsf(w_pre[nt][1] * vsc1))));
           atomicMax(reinterpret_cast<int*>(&sm_w_head_sc[vc * HPB + gid + 8]),
-                    __float_as_int(fmaxf(fabsf(w_pre[nt][2] * vsc0),
-                                         fabsf(w_pre[nt][3] * vsc1))));
+                    __float_as_int(fmaxf(fabsf(w_pre[nt][2] * vsc0), fabsf(w_pre[nt][3] * vsc1))));
         }
       }
     }
@@ -552,8 +546,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
           uint32_t a0, a1, a2, a3, b0, b1;
           ldmatrix_load_A_fp8(a0, a1, a2, a3, sm_w_fp8 + ko, W_FP8_STRIDE, lane);
           d2_load_b_fp8<KV_SMEM_STRIDE>(b0, b1, sm_kv_fp8, kstep * 32, dim, lane);
-          MmaFp8Result r =
-              mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv[0], xv[1], xv[2], xv[3]);
+          MmaFp8Result r = mma_fp8_m16n8k32(a0, a1, a2, a3, b0, b1, xv[0], xv[1], xv[2], xv[3]);
           xv[0] = r.d0;
           xv[1] = r.d1;
           xv[2] = r.d2;
@@ -588,9 +581,8 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   const float inv_g0 = (global_sum[0] > 0.f) ? (1.f / global_sum[0]) : 0.f;
   const float inv_g1 = (global_sum[1] > 0.f) ? (1.f / global_sum[1]) : 0.f;
 
-  const size_t mid_o_base =
-      ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V_C +
-      (size_t)split_idx * D_V_C;
+  const size_t mid_o_base = ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V_C +
+                            (size_t)split_idx * D_V_C;
 
   // Pack adjacent (d0, d0+1) bf16 pairs into __nv_bfloat162 → STG.E.64.
 #pragma unroll
@@ -598,10 +590,10 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
 #pragma unroll
     for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
       const int d0 = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8 + tid * 2;
-      const __nv_bfloat162 pair_lo = __floats2bfloat162_rn(
-          acc_nope[vc][nt][0] * inv_g0, acc_nope[vc][nt][1] * inv_g0);
-      const __nv_bfloat162 pair_hi = __floats2bfloat162_rn(
-          acc_nope[vc][nt][2] * inv_g1, acc_nope[vc][nt][3] * inv_g1);
+      const __nv_bfloat162 pair_lo =
+          __floats2bfloat162_rn(acc_nope[vc][nt][0] * inv_g0, acc_nope[vc][nt][1] * inv_g0);
+      const __nv_bfloat162 pair_hi =
+          __floats2bfloat162_rn(acc_nope[vc][nt][2] * inv_g1, acc_nope[vc][nt][3] * inv_g1);
       *reinterpret_cast<__nv_bfloat162*>(
           &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
       if constexpr (VALID_HPB > 8) {
@@ -611,12 +603,9 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     }
   }
   if (warp_id == 0 && tid == 0) {
-    const float lse0 =
-        (global_sum[0] > 0.f) ? (log2f(global_sum[0]) + global_max[0]) : -1e30f;
-    const float lse1 =
-        (global_sum[1] > 0.f) ? (log2f(global_sum[1]) + global_max[1]) : -1e30f;
-    const size_t lse_base =
-        (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
+    const float lse0 = (global_sum[0] > 0.f) ? (log2f(global_sum[0]) + global_max[0]) : -1e30f;
+    const float lse1 = (global_sum[1] > 0.f) ? (log2f(global_sum[1]) + global_max[1]) : -1e30f;
+    const size_t lse_base = (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
     mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
     if constexpr (VALID_HPB > 8) {
       mid_lse[lse_base + (size_t)(gid + 8) * num_splits + split_idx] = lse1;

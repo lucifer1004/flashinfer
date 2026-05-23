@@ -84,24 +84,53 @@ _DECODE_MAX_TOKENS = 64
 # kernel internally pads the head tile to HPB=16 with zero-Q rows and guards
 # mid_out / mid_lse writes to NUM_HEADS, so only the 8 valid heads land in
 # the output.
-_DECODE_DSV4_DISPATCH = frozenset({
-    (8, 128), (8, 512), (8, 1024),
-    (16, 128), (16, 512), (16, 1024),
-    (32, 128), (32, 512), (32, 1024),
-    (64, 128), (64, 512), (64, 1024),
-    (128, 128), (128, 512), (128, 1024),
-})
+_DECODE_DSV4_DISPATCH = frozenset(
+    {
+        (8, 128),
+        (8, 512),
+        (8, 1024),
+        (16, 128),
+        (16, 512),
+        (16, 1024),
+        (32, 128),
+        (32, 512),
+        (32, 1024),
+        (64, 128),
+        (64, 512),
+        (64, 1024),
+        (128, 128),
+        (128, 512),
+        (128, 1024),
+    }
+)
 _DECODE_DSV4_PAGE_BLOCK_SIZE = 64
 
 # decode-dsv3_2 (V32 family, V4-style warp-spec): num_heads ∈ {8,16,32,
 # 64,128} × topk ∈ {128, 512, 1024, 2048}.
-_DECODE_DSV3_2_DISPATCH = frozenset({
-    (8, 128), (8, 512), (8, 1024), (8, 2048),
-    (16, 128), (16, 512), (16, 1024), (16, 2048),
-    (32, 128), (32, 512), (32, 1024), (32, 2048),
-    (64, 128), (64, 512), (64, 1024), (64, 2048),
-    (128, 128), (128, 512), (128, 1024), (128, 2048),
-})
+_DECODE_DSV3_2_DISPATCH = frozenset(
+    {
+        (8, 128),
+        (8, 512),
+        (8, 1024),
+        (8, 2048),
+        (16, 128),
+        (16, 512),
+        (16, 1024),
+        (16, 2048),
+        (32, 128),
+        (32, 512),
+        (32, 1024),
+        (32, 2048),
+        (64, 128),
+        (64, 512),
+        (64, 1024),
+        (64, 2048),
+        (128, 128),
+        (128, 512),
+        (128, 1024),
+        (128, 2048),
+    }
+)
 _DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 
 
@@ -117,8 +146,9 @@ def _decode_dsv3_2_dispatchable(
     )
 
 
-def _decode_dsv4_dispatchable(num_tokens: int, num_heads: int, topk: int, d_qk: int,
-                            page_block_size: int) -> bool:
+def _decode_dsv4_dispatchable(
+    num_tokens: int, num_heads: int, topk: int, d_qk: int, page_block_size: int
+) -> bool:
     """Return True iff decode-dsv4 supports this shape configuration.
 
     decode-dsv4 is DSv4-only (d_qk=512) with a fixed (num_heads, topk)
@@ -164,13 +194,12 @@ def get_sparse_mla_sm120_module():
         # otherwise fall through to decode-dsv3_2 / prefill.
         # kv_cache layout: [num_blocks, page_block_size, 1, bytes_per_token].
         kv_pbs = int(kv_cache.size(-3)) if kv_cache.ndim >= 3 else 0
-        if (kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
-                and _decode_dsv4_dispatchable(num_tokens, num_heads, topk, d_qk, kv_pbs)):
+        if kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE and _decode_dsv4_dispatchable(
+            num_tokens, num_heads, topk, d_qk, kv_pbs
+        ):
             # mid_out / mid_lse scratch is small enough to allocate per call.
             num_splits_main = (topk + _BI - 1) // _BI
-            extra_topk = (
-                int(extra_indices.size(-1)) if extra_indices is not None else 0
-            )
+            extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
             num_splits_extra = (extra_topk + _BI - 1) // _BI
             num_splits = num_splits_main + num_splits_extra
             mid_out = torch.empty(
@@ -576,7 +605,11 @@ def _decode_dsv4_map_to_token_bucket(x):
 
 def _decode_dsv4_init_q(shapes, dtype, device):
     """bf16 q ~ N(0, 0.1) clamped to [-1, 1] — matches the unit test distribution."""
-    return (torch.randn(shapes, device=device, dtype=torch.float32) / 10.0).clamp(-1, 1).to(dtype)
+    return (
+        (torch.randn(shapes, device=device, dtype=torch.float32) / 10.0)
+        .clamp(-1, 1)
+        .to(dtype)
+    )
 
 
 def _decode_dsv4_init_indices(shapes, dtype, device):
@@ -830,10 +863,9 @@ def sparse_mla_sm120_decode_dsv4(
     if not tuner.is_tuning_mode:
         T_bucket = _decode_dsv4_map_to_token_bucket(q.shape[0])
         extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-        num_splits = (
-            (indices.shape[-1] + _BI - 1) // _BI
-            + (extra_topk + _BI - 1) // _BI
-        )
+        num_splits = (indices.shape[-1] + _BI - 1) // _BI + (
+            extra_topk + _BI - 1
+        ) // _BI
         hot_key = (
             T_bucket,
             q.shape[1],
@@ -866,10 +898,9 @@ def sparse_mla_sm120_decode_dsv4(
     if int(tactic) > 0:
         T_bucket = _decode_dsv4_map_to_token_bucket(q.shape[0])
         extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-        num_splits = (
-            (indices.shape[-1] + _BI - 1) // _BI
-            + (extra_topk + _BI - 1) // _BI
-        )
+        num_splits = (indices.shape[-1] + _BI - 1) // _BI + (
+            extra_topk + _BI - 1
+        ) // _BI
         hot_key = (
             T_bucket,
             q.shape[1],
