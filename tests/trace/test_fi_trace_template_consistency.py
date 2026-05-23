@@ -388,6 +388,10 @@ _E2E_SKIP = {
     "moe_fp4_block_scale_llama4_routing",
     "moe_fp4_block_scale_renormalize_naive_routing",
     "moe_fp4_block_scale_topk_routing",
+    # Sparse-MLA SM120 paged: extra_kv_cache / extra_indices are optional inputs
+    # and their axes (extra_topk, extra_page_block_size) can't be resolved when
+    # the auto-call exercises the single-cache path.
+    "sparse_mla_sm120_paged",
 }
 
 _E2E_PAIRS = [(f, t, l) for f, t, l in _ALL_PAIRS if l not in _E2E_SKIP]
