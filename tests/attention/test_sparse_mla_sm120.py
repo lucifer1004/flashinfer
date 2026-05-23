@@ -28,16 +28,14 @@
 
 """Correctness tests for sparse-MLA paged attention on SM120.
 
-Covers DSV4 (DSv4-family, d_qk=512) decode-dsv3_2 and prefill paths against a
-PyTorch SDPA-with-sparse-mask reference. Quantization helpers port the
-FP8-packed FOOTER format from the upstream `flash_mla_sm120` repo.
+Covers both decode paths against a PyTorch SDPA-with-sparse-mask reference:
+
+* DSv4 (d_qk=512, FP8 FOOTER 584 B/token, page_block_size=64) → decode-dsv4
+* DSv3.2 (d_qk=576, FP8 INLINE 656 B/token, page_block_size=1)  → decode-dsv3_2
+
+Quantization helpers port the upstream FlashMLA packed layouts.
 
 Skipped on non-Blackwell-consumer GPUs via :func:`is_sm120a_supported`.
-
-Tests are deliberately coarse on the parametrization axis (one shape per
-(num_heads, topk) cell) — the kernel itself dispatches every num_heads ×
-topk × dual_cache combination internally; this file exercises the
-orchestrator wiring, not the kernel's combinatorial coverage.
 """
 
 from __future__ import annotations
@@ -137,6 +135,71 @@ def dequantize_kv_model1(packed: torch.Tensor) -> torch.Tensor:
         result[:, tok, d_nope:] = rope_bytes.view(torch.bfloat16).reshape(nb, d_rope)
 
     return result.view(nb, bs, 1, 512)
+
+
+# ── DSv3.2 INLINE pack (656 B/token: FP8 nope + FP32 scales + BF16 rope) ─────
+
+
+def quantize_kv_dsv3_2(kv_bf16: torch.Tensor) -> torch.Tensor:
+    """Pack bf16 KV into DSv3.2 FP8 INLINE format.
+
+    Input  shape (nb, 1, 1, 576) bf16  (d_qk = D_NOPE 512 + D_ROPE 64).
+    Output shape (nb, 1, 1, 656) uint8 — per-token layout:
+        [0   : 512)  FP8 e4m3 nope (4 tiles × 128 elements)
+        [512 : 528)  4 × FP32 power-of-2 scale (one per 128-elem tile)
+        [528 : 656)  BF16 rope (64 elements × 2B)
+    """
+    d_nope, d_rope, tile_size, num_tiles = 512, 64, 128, 4
+    scale_bytes = num_tiles * 4  # 16
+    bpt = d_nope + scale_bytes + d_rope * 2  # 656
+    nb, bs, hk, d = kv_bf16.shape
+    assert d == d_nope + d_rope and hk == 1 and bs == 1
+    kv = kv_bf16.squeeze(2).squeeze(1)  # (nb, 576)
+
+    result = torch.zeros(nb, bpt, dtype=torch.uint8, device=kv.device)
+
+    # FP8 nope tiles + FP32 power-of-2 scales (inline, not footer).
+    for ti in range(num_tiles):
+        tile = kv[:, ti * tile_size : (ti + 1) * tile_size].float()
+        amax = tile.abs().amax(dim=-1).clamp(min=1e-4)
+        scale = _cast_scale_inv_to_ue8m0(amax / 448.0)  # power-of-2 FP32
+        fp8 = (tile / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+        result[:, ti * tile_size : (ti + 1) * tile_size] = fp8.view(torch.uint8)
+        # FP32 scale → 4 bytes inline at offset 512 + ti*4.
+        result[:, d_nope + ti * 4 : d_nope + (ti + 1) * 4] = scale.view(
+            torch.float32
+        ).view(torch.uint8).view(nb, 4)
+
+    # BF16 rope tail.
+    rope = kv[:, d_nope:].to(torch.bfloat16).contiguous().view(torch.uint8)
+    result[:, d_nope + scale_bytes :] = rope.view(nb, d_rope * 2)
+    return result.view(nb, 1, 1, bpt)
+
+
+def dequantize_kv_dsv3_2(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack DSv3.2 FP8 INLINE → bf16. Inverse of :func:`quantize_kv_dsv3_2`."""
+    d_nope, d_rope, tile_size, num_tiles = 512, 64, 128, 4
+    scale_bytes = num_tiles * 4
+    nb = packed.shape[0]
+    p = packed.view(nb, -1)
+
+    result = torch.zeros(nb, d_nope + d_rope, dtype=torch.bfloat16, device=p.device)
+    for ti in range(num_tiles):
+        fp8 = p[:, ti * tile_size : (ti + 1) * tile_size].view(
+            torch.float8_e4m3fn
+        ).float()
+        scale = (
+            p[:, d_nope + ti * 4 : d_nope + (ti + 1) * 4]
+            .contiguous()
+            .view(torch.float32)
+            .squeeze(-1)
+        )
+        result[:, ti * tile_size : (ti + 1) * tile_size] = (
+            fp8 * scale.unsqueeze(-1)
+        ).to(torch.bfloat16)
+    rope_bytes = p[:, d_nope + scale_bytes :].contiguous()
+    result[:, d_nope:] = rope_bytes.view(torch.bfloat16).reshape(nb, d_rope)
+    return result.view(nb, 1, 1, d_nope + d_rope)
 
 
 # ── PyTorch SDPA-with-sparse-mask reference ───────────────────────────────────
@@ -292,6 +355,84 @@ def test_sparse_mla_sm120_decode_model1(
     assert max_err < 5e-2, (
         f"max_err={max_err:.4f} exceeds 5e-2 for "
         f"num_heads={num_heads} topk={topk} num_tokens={num_tokens} sink={with_sink}"
+    )
+
+
+_DSV3_2_DECODE_HEADS = [8, 16, 32, 64, 128]
+
+
+@pytest.mark.parametrize("num_heads", _DSV3_2_DECODE_HEADS)
+@pytest.mark.parametrize("num_tokens", [1, 16, 64])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_sparse_mla_sm120_decode_dsv3_2(
+    num_heads: int, num_tokens: int, with_sink: bool
+) -> None:
+    """DSv3.2 decode-dsv3_2 path: d_qk=576, topk=2048, page_block_size=1."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v = 576, 512
+    topk = 2048  # the only dispatched topk for decode-dsv3_2
+    page_block_size = 1
+    # Pool sized so topk valid slot ids fit; each token = one page block.
+    num_blocks = 4096
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv3_2(kv_bf16)
+    kv_dequant = dequantize_kv_dsv3_2(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, -10:] = -1  # mark some slots invalid
+
+    attn_sink = (
+        torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
+        if with_sink
+        else None
+    )
+
+    sm_scale = d_qk**-0.5
+
+    ref_out, _ref_lse = _ref_sparse_attn(
+        q, kv_dequant, indices, sm_scale, d_v, attn_sink=attn_sink
+    )
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    ws_bytes = flashinfer.compute_sparse_mla_sm120_workspace_size(
+        max_num_tokens=num_tokens, max_num_heads=num_heads, d_v=d_v, device=device
+    )
+    workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=device)
+
+    flashinfer.sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        workspace,
+        sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+    )
+
+    err = (output.float() - ref_out.float()).abs()
+    max_err = err.max().item()
+    assert max_err < 5e-2, (
+        f"max_err={max_err:.4f} exceeds 5e-2 for "
+        f"num_heads={num_heads} num_tokens={num_tokens} sink={with_sink}"
     )
 
 

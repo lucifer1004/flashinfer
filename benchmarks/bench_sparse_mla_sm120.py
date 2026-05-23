@@ -28,10 +28,13 @@
 
 """Microbenchmark for sparse-MLA paged attention on SM120.
 
-Sweeps representative DSv4 (d_qk=512) shapes across both the decode path
-(num_tokens ≤ 64) and the prefill path (num_tokens > 64). Reports median
-latency, KV-cache memory bandwidth, and analytical attention FLOPs. The
-wrapper auto-dispatches between the two paths internally on ``num_tokens``.
+Sweeps representative shapes for both decode kernels:
+
+* DSv4   (d_qk=512, page_block_size=64, 584 B/token) — decode-dsv4 path
+* DSv3.2 (d_qk=576, page_block_size=1,  656 B/token) — decode-dsv3_2 path
+
+Reports median latency, KV-cache memory bandwidth, and analytical attention
+FLOPs. The wrapper auto-dispatches on (model, num_heads, topk, num_tokens).
 
 Requires sm120a / sm121a.
 """
@@ -86,6 +89,37 @@ def quantize_kv_model1(kv_bf16: torch.Tensor) -> torch.Tensor:
         rope_off = tok * data_stride + d_nope
         result_flat[:, rope_off : rope_off + d_rope * 2] = rope[:, tok]
     return result_flat.view(nb, bs, 1, bpt)
+
+
+# ── DSv3.2 INLINE pack (656 B/token) ─────────────────────────────────────────
+
+
+def quantize_kv_dsv3_2(kv_bf16: torch.Tensor) -> torch.Tensor:
+    """Pack bf16 KV (nb, 1, 1, 576) into DSv3.2 FP8 INLINE format (656 B/token).
+
+    Per-token layout: [0:512) FP8 nope (4×128 tile), [512:528) 4×FP32
+    power-of-2 scale, [528:656) BF16 rope (64 elems).
+    """
+    d_nope, d_rope, tile_size, num_tiles = 512, 64, 128, 4
+    scale_bytes = num_tiles * 4
+    bpt = d_nope + scale_bytes + d_rope * 2  # 656
+    nb, bs, hk, d = kv_bf16.shape
+    assert d == d_nope + d_rope and hk == 1 and bs == 1
+    kv = kv_bf16.squeeze(2).squeeze(1)
+
+    result = torch.zeros(nb, bpt, dtype=torch.uint8, device=kv.device)
+    for ti in range(num_tiles):
+        tile = kv[:, ti * tile_size : (ti + 1) * tile_size].float()
+        amax = tile.abs().amax(dim=-1).clamp(min=1e-4)
+        scale = _cast_scale_inv_to_ue8m0(amax / 448.0)
+        fp8 = (tile / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+        result[:, ti * tile_size : (ti + 1) * tile_size] = fp8.view(torch.uint8)
+        result[:, d_nope + ti * 4 : d_nope + (ti + 1) * 4] = (
+            scale.view(torch.float32).view(torch.uint8).view(nb, 4)
+        )
+    rope = kv[:, d_nope:].to(torch.bfloat16).contiguous().view(torch.uint8)
+    result[:, d_nope + scale_bytes :] = rope.view(nb, d_rope * 2)
+    return result.view(nb, 1, 1, bpt)
 
 
 # ── Benchmark one config ─────────────────────────────────────────────────────
@@ -153,6 +187,67 @@ def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0)
     return ms * 1e3, kv_bw_gbps, tflops  # us, GB/s, TFLOPs
 
 
+def bench_sparse_mla_sm120_dsv3_2(num_heads, num_tokens, with_sink=False, seed=0):
+    """Returns (median_us, kv_bw_gbps, attn_tflops) for DSv3.2 decode-dsv3_2.
+
+    Fixed: topk=2048, page_block_size=1, d_qk=576, d_v=512.
+    """
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    d_qk, d_v = 576, 512
+    topk = 2048
+    page_block_size = 1
+    num_blocks = 4096  # one page per token (pbs=1); pool large enough for topk
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv3_2(kv_bf16)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    attn_sink = (
+        torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
+        if with_sink
+        else None
+    )
+
+    wrapper = flashinfer.BatchSparseMLAPagedAttentionWrapper(
+        max_num_tokens=num_tokens, max_num_heads=num_heads, d_v=d_v, device=device
+    )
+    output = torch.zeros(
+        num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
+    )
+    sm_scale = d_qk**-0.5
+
+    def fn():
+        wrapper.run(
+            q, kv_packed, indices, output, sm_scale=sm_scale, attn_sink=attn_sink
+        )
+
+    fn()
+    torch.cuda.synchronize()
+    measurements = bench_gpu_time(fn, dry_run_time_ms=100, repeat_time_ms=1000)
+    ms = float(np.median(measurements))
+
+    bpt = 656  # DSv3.2 INLINE per-token bytes
+    kv_bytes = num_tokens * topk * bpt
+    kv_bw_gbps = kv_bytes * 1e-6 / ms  # GB/s
+    flops = 2 * num_tokens * num_heads * topk * (d_qk + d_v)
+    tflops = flops * 1e-9 / ms
+
+    return ms * 1e3, kv_bw_gbps, tflops
+
+
 if __name__ == "__main__":
     if not is_sm120a_supported(torch.device("cuda")):
         raise SystemExit("Sparse-MLA SM120 requires sm120a.")
@@ -201,7 +296,7 @@ if __name__ == "__main__":
         f"{'lat (us)':>10}  {'kv BW (GB/s)':>13}  {'attn TFLOPs':>12}"
     )
 
-    print("Decode-v2 path (num_tokens ≤ 64):")
+    print("DSv4 decode-dsv4 path (num_tokens ≤ 64):")
     print(header)
     print("-" * len(header))
     for h, k, t in decode_configs:
@@ -209,9 +304,24 @@ if __name__ == "__main__":
         print(f"{h:>10}  {k:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}")
 
     print()
-    print("Prefill path (num_tokens > 64):")
+    print("DSv4 prefill path (num_tokens > 64):")
     print(header)
     print("-" * len(header))
     for h, k, t in prefill_configs:
         lat_us, kvbw, tfl = bench_sparse_mla_sm120(h, k, t)
         print(f"{h:>10}  {k:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}")
+
+    # DSv3.2 decode-dsv3_2: topk fixed at 2048, page_block_size=1, 656 B/token.
+    # Sweep is num_heads × num_tokens (with_sink off; sink is a per-head
+    # epilogue scale, negligible on the bandwidth-bound critical path).
+    dsv3_2_configs = [
+        (h, t) for h in (8, 16, 32, 64, 128) for t in (1, 16, 32, 64)
+    ]
+
+    print()
+    print("DSv3.2 decode-dsv3_2 path (topk=2048, page_block_size=1):")
+    print(header)
+    print("-" * len(header))
+    for h, t in dsv3_2_configs:
+        lat_us, kvbw, tfl = bench_sparse_mla_sm120_dsv3_2(h, t)
+        print(f"{h:>10}  {2048:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}")
