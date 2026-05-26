@@ -62,7 +62,7 @@ struct SmemLayout {
       (KV::KV_SMEM_COPY_BYTES < KV::KV_SCALE_GMEM_OFFSET + KV::SCALE_BYTES_PER_TOKEN);
   static constexpr size_t SMEM_KV_SCALE_BUF = NEED_SCALE_BUF ? BI * KV::SCALE_BYTES_PER_TOKEN : 0;
 
-  // Cross-warp reduction (O1 overlap: reduce_buf and sum_reduce_buf share memory)
+  // Cross-warp reduction; reduce_buf and sum_reduce_buf share memory.
   static constexpr size_t SMEM_REDUCE = N_MATH_WARPS * HPB * sizeof(float);
 
   // Per-head online softmax state
@@ -78,7 +78,7 @@ struct SmemLayout {
   // Mbarrier (double-buffered)
   static constexpr size_t SMEM_MBAR_KV = 2 * sizeof(uint64_t);
 
-  // Offsets — O1 overlap: reduce_buf and sum_reduce_buf share the same memory
+  // Offsets.
   static constexpr size_t OFF_Q_NOPE = 0;
   static constexpr size_t OFF_Q_SC = OFF_Q_NOPE + SMEM_Q_NOPE;
   static constexpr size_t OFF_Q_ROPE = OFF_Q_SC + SMEM_Q_SC;
@@ -87,7 +87,7 @@ struct SmemLayout {
   static constexpr size_t OFF_KV_SC0 = OFF_KV1 + SMEM_KV_BUF;
   static constexpr size_t OFF_KV_SC1 = OFF_KV_SC0 + SMEM_KV_SCALE_BUF;
   static constexpr size_t OFF_REDUCE = OFF_KV_SC1 + SMEM_KV_SCALE_BUF;
-  static constexpr size_t OFF_SUM_RED = OFF_REDUCE;  // O1: shares memory with reduce_buf
+  static constexpr size_t OFF_SUM_RED = OFF_REDUCE;  // shares memory with reduce_buf
   static constexpr size_t OFF_M = OFF_REDUCE + SMEM_REDUCE;
   static constexpr size_t OFF_L = OFF_M + SMEM_M;
   static constexpr size_t OFF_W_SC_ALL = OFF_L + SMEM_L;
@@ -98,7 +98,7 @@ struct SmemLayout {
   static_assert(TOTAL <= 101376, "SG smem exceeds 99KB per-block limit");
 };
 
-// MG (multi-group) layout: 2 head groups, reduce/sum_reduce union (O1)
+// MG (multi-group) layout: 2 head groups, shared reduce/sum_reduce buffer.
 template <ModelType MT, ComputeMode CM>
 struct SmemLayoutMG {
   using KV = KVCacheTraits<MT>;
@@ -113,15 +113,18 @@ struct SmemLayoutMG {
   static constexpr size_t SMEM_KV_SCALE_BUF =
       SmemLayout<MT, CM>::NEED_SCALE_BUF ? BI * KV::SCALE_BYTES_PER_TOKEN : 0;
 
-  // O1 overlap: reduce_buf and sum_reduce_buf share the same memory
+  // reduce_buf and sum_reduce_buf share the same memory.
   static constexpr size_t SMEM_REDUCE_MG = N_HG * N_MATH_WARPS * HPB * sizeof(float);
 
   static constexpr size_t SMEM_M = N_HG * HPB * sizeof(float);
   static constexpr size_t SMEM_L = N_HG * HPB * sizeof(float);
   static constexpr size_t SMEM_W_SC_ALL = N_HG * CT::N_V_CHUNKS * HPB * sizeof(float);
-  static constexpr size_t SMEM_W_FP8_MG = N_HG * HPB * (BI + 16);
-  // q_rope staging (O2 overlap). xv_rope weight staging reuses w_fp8.
-  static constexpr size_t SMEM_SCRATCH = N_HG * HPB * D_ROPE * sizeof(bf16);
+  // Two parities let adjacent V chunks use separate FP8 weight buffers.
+  static constexpr int W_FP8_PARITIES = 2;
+  static constexpr size_t SMEM_W_FP8_MG = W_FP8_PARITIES * N_HG * HPB * (BI + 16);
+  // q_rope is only needed before the main loop; reuse the W_FP8 region.
+  static_assert(N_HG * HPB * D_ROPE * sizeof(bf16) <= SMEM_W_FP8_MG);
+  static constexpr size_t SMEM_SCRATCH = 0;
   static constexpr size_t SMEM_MBAR_KV = 2 * sizeof(uint64_t);
 
   static constexpr size_t OFF_Q_NOPE0 = 0;
@@ -132,14 +135,14 @@ struct SmemLayoutMG {
   static constexpr size_t OFF_KV1 = OFF_KV0 + SMEM_KV_BUF;
   static constexpr size_t OFF_KV_SC0 = OFF_KV1 + SMEM_KV_BUF;
   static constexpr size_t OFF_KV_SC1 = OFF_KV_SC0 + SMEM_KV_SCALE_BUF;
-  // O1: single buffer used as both reduce and sum_reduce
+  // Single buffer used as both reduce and sum_reduce.
   static constexpr size_t OFF_REDUCE = OFF_KV_SC1 + SMEM_KV_SCALE_BUF;
   static constexpr size_t OFF_M = OFF_REDUCE + SMEM_REDUCE_MG;
   static constexpr size_t OFF_L = OFF_M + SMEM_M;
   static constexpr size_t OFF_W_SC_ALL = OFF_L + SMEM_L;
   static constexpr size_t OFF_W_FP8 = OFF_W_SC_ALL + SMEM_W_SC_ALL;
-  static constexpr size_t OFF_SCRATCH = OFF_W_FP8 + SMEM_W_FP8_MG;
-  static constexpr size_t OFF_MBAR_KV = (OFF_SCRATCH + SMEM_SCRATCH + 7) / 8 * 8;
+  static constexpr size_t OFF_SCRATCH = OFF_W_FP8;
+  static constexpr size_t OFF_MBAR_KV = (OFF_W_FP8 + SMEM_W_FP8_MG + 7) / 8 * 8;
   static constexpr size_t TOTAL = OFF_MBAR_KV + SMEM_MBAR_KV;
 
   static_assert(TOTAL <= 101376, "MG smem exceeds 99KB per-block limit");
@@ -156,47 +159,54 @@ struct SmemPtrsMG {
   static constexpr int ML_GRP_STRIDE = HPB;
   static constexpr int WSC_GRP_STRIDE = CT::N_V_CHUNKS * HPB;
   static constexpr int WFP8_GRP_SIZE = HPB * (BI + 16);
+  // Stride between W_FP8 ping-pong parities.
+  static constexpr int WFP8_PARITY_STRIDE = LMG::N_HG * WFP8_GRP_SIZE;
+
+  char* base;
+
+  __device__ static SmemPtrsMG init(char* base) { return SmemPtrsMG{base}; }
 
   // q_nope_fp8 / q_nope_bf16 alias the same OFF_Q_NOPE region; one is used
   // per ComputeMode. q_nope_sc is empty under CM=BF16.
-  uint8_t* q_nope_fp8[N_HG];
-  bf16* q_nope_bf16[N_HG];
-  float* q_nope_sc[N_HG];
-  bf16* q_rope;  // O2: both groups stored sequentially in v_trans area
-  uint8_t* kv_bufs[2];
-  uint8_t* kv_scale_bufs[2];
-  float* reduce_buf;     // [N_HG * N_MATH_WARPS * HPB]
-  float* m_smem;         // [N_HG * HPB]
-  float* l_smem;         // [N_HG * HPB]
-  float* w_head_sc_all;  // [N_HG * N_V_CHUNKS * HPB]
-  uint8_t* w_fp8;        // [N_HG * HPB * (BI+16)]
-  uint64_t* mbar_kv;
-
-  __device__ static SmemPtrsMG init(char* base) {
-    SmemPtrsMG s;
-    s.q_nope_fp8[0] = (uint8_t*)(base + LMG::OFF_Q_NOPE0);
-    s.q_nope_fp8[1] = (uint8_t*)(base + LMG::OFF_Q_NOPE1);
-    s.q_nope_bf16[0] = (bf16*)(base + LMG::OFF_Q_NOPE0);
-    s.q_nope_bf16[1] = (bf16*)(base + LMG::OFF_Q_NOPE1);
-    s.q_nope_sc[0] = (float*)(base + LMG::OFF_Q_SC0);
-    s.q_nope_sc[1] = (float*)(base + LMG::OFF_Q_SC1);
-    s.q_rope = (bf16*)(base + LMG::OFF_SCRATCH);
-    s.kv_bufs[0] = (uint8_t*)(base + LMG::OFF_KV0);
-    s.kv_bufs[1] = (uint8_t*)(base + LMG::OFF_KV1);
+  __device__ __forceinline__ uint8_t* q_nope_fp8(int g) const {
+    return reinterpret_cast<uint8_t*>(base + LMG::OFF_Q_NOPE0 + g * LMG::SMEM_Q_NOPE);
+  }
+  __device__ __forceinline__ bf16* q_nope_bf16(int g) const {
+    return reinterpret_cast<bf16*>(base + LMG::OFF_Q_NOPE0 + g * LMG::SMEM_Q_NOPE);
+  }
+  __device__ __forceinline__ float* q_nope_sc(int g) const {
+    return reinterpret_cast<float*>(base + LMG::OFF_Q_SC0 + g * LMG::SMEM_Q_SC);
+  }
+  __device__ __forceinline__ bf16* q_rope() const {
+    return reinterpret_cast<bf16*>(base + LMG::OFF_SCRATCH);
+  }
+  __device__ __forceinline__ uint8_t* kv_buf(int i) const {
+    return reinterpret_cast<uint8_t*>(base + LMG::OFF_KV0 + i * LMG::SMEM_KV_BUF);
+  }
+  __device__ __forceinline__ uint8_t* kv_scale_buf(int i) const {
     if constexpr (SmemLayout<MT, CM>::NEED_SCALE_BUF) {
-      s.kv_scale_bufs[0] = (uint8_t*)(base + LMG::OFF_KV_SC0);
-      s.kv_scale_bufs[1] = (uint8_t*)(base + LMG::OFF_KV_SC1);
+      return reinterpret_cast<uint8_t*>(base + LMG::OFF_KV_SC0 + i * LMG::SMEM_KV_SCALE_BUF);
     } else {
-      s.kv_scale_bufs[0] = nullptr;
-      s.kv_scale_bufs[1] = nullptr;
+      return nullptr;
     }
-    s.reduce_buf = (float*)(base + LMG::OFF_REDUCE);
-    s.m_smem = (float*)(base + LMG::OFF_M);
-    s.l_smem = (float*)(base + LMG::OFF_L);
-    s.w_head_sc_all = (float*)(base + LMG::OFF_W_SC_ALL);
-    s.w_fp8 = (uint8_t*)(base + LMG::OFF_W_FP8);
-    s.mbar_kv = (uint64_t*)(base + LMG::OFF_MBAR_KV);
-    return s;
+  }
+  __device__ __forceinline__ float* reduce_buf() const {
+    return reinterpret_cast<float*>(base + LMG::OFF_REDUCE);
+  }
+  __device__ __forceinline__ float* m_smem() const {
+    return reinterpret_cast<float*>(base + LMG::OFF_M);
+  }
+  __device__ __forceinline__ float* l_smem() const {
+    return reinterpret_cast<float*>(base + LMG::OFF_L);
+  }
+  __device__ __forceinline__ float* w_head_sc_all() const {
+    return reinterpret_cast<float*>(base + LMG::OFF_W_SC_ALL);
+  }
+  __device__ __forceinline__ uint8_t* w_fp8() const {
+    return reinterpret_cast<uint8_t*>(base + LMG::OFF_W_FP8);
+  }
+  __device__ __forceinline__ uint64_t* mbar_kv(int i) const {
+    return reinterpret_cast<uint64_t*>(base + LMG::OFF_MBAR_KV) + i;
   }
 };
 

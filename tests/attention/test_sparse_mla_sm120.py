@@ -34,7 +34,7 @@ prefill variant exclusive to DSv4:
 
 * DSv4 (d_qk=512, FP8 FOOTER 584 B/token, page_block_size=64)
     - decode-dsv4   (single-cache)
-    - prefill-dsv4  (single-cache + dual-cache: basic / C4A / C128A)
+    - prefill-dsv4  (single-cache + dual-cache page-size variants)
 * DSv3.2 (d_qk=576, FP8 INLINE 656 B/token, page_block_size=64)
     - decode-dsv3_2
     - prefill-dsv3_2
@@ -647,10 +647,6 @@ def test_sparse_mla_sm120_prefill_dsv4(
 
 _DSV4_PREFILL_DUAL_CONFIGS = [
     # (extra_topk, extra_pbs). Main is fixed at (topk=128, pbs=64).
-    # Covers:
-    #   (128, 64): basic dual-cache (same shape as main)
-    #   (512, 64): C4A — SWA window=128, indexer top_k=512, compress_ratio=4
-    #   (512,  2): C128A — SWA window=128, indexer top_k=512, compress_ratio=128
     (128, 64),
     (512, 64),
     (512, 2),
@@ -666,11 +662,8 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
 ) -> None:
     """DSv4 prefill (dual-cache) path: main + extra KV with disjoint slot pools.
 
-    Main cache: topk=128, pbs=64 (always). Extra cache parameterized to cover
-    basic dual, C4A (extra_topk=512, pbs=64), and C128A (extra_topk=512, pbs=2)
-    layouts. NH ∈ {16, 32, 64, 128} covers the MG dual-cache dispatch (SG has
-    no dual-cache support — NH=16 in DSv4 dual routes through MG with
-    MG_N_HG_T=1).
+    Main cache: topk=128, pbs=64. Extra cache parameters cover both secondary
+    cache page sizes. NH ∈ {16, 32, 64, 128} covers the MG dual-cache dispatch.
     """
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -761,10 +754,13 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation() -> None:
+@pytest.mark.parametrize("extra_topk_len", [0, 128, 768])
+def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
+    extra_topk_len: int,
+) -> None:
     """Dual-cache: extra_topk_length truncates the secondary window. Past-length
     extra_indices intentionally point at valid slots to verify the kernel masks
-    them out via extra_topk_length.
+    them out via extra_topk_length. Over-declared lengths clamp to extra_topk.
     """
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -773,7 +769,6 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation() -> No
     topk = 128
     main_pbs = 64
     extra_topk = 512
-    extra_topk_len = 128
     extra_pbs = 64
 
     main_num_blocks = 64
@@ -820,7 +815,8 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation() -> No
     # Reference: mask extra entries past length to -1, then build the unified
     # virtual pool / virtual_idx.
     ref_extra_idx = extra_idx.clone()
-    ref_extra_idx[:, extra_topk_len:] = -1
+    extra_topk_len_clamped = min(max(extra_topk_len, 0), extra_topk)
+    ref_extra_idx[:, extra_topk_len_clamped:] = -1
     virtual_kv = torch.cat(
         [main_dequant.reshape(-1, d_qk), extra_dequant.reshape(-1, d_qk)], dim=0
     ).reshape(-1, 1, 1, d_qk)
@@ -854,10 +850,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation() -> No
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-# Runtime topk_extra: covers C128A workloads where extra_topk = cdiv(
-# max_model_len, compress_ratio) padded to alignment 128 (e.g. 200K → 1664).
-# Pre-refactor dispatch only baked topk_extra ∈ {128, 512}; this regression
-# locks the runtime path so any compress_ratio-derived extra_topk works.
+# Runtime topk_extra should not require a dedicated template instantiation.
 @pytest.mark.parametrize("extra_topk,extra_pbs", [(1024, 2), (1664, 2), (1024, 64)])
 def test_sparse_mla_sm120_prefill_dsv4_dual_runtime_extra_topk(
     extra_topk: int, extra_pbs: int
