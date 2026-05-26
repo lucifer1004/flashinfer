@@ -41,7 +41,7 @@ prefill variant exclusive to DSv4:
 
 Quantization helpers port the upstream FlashMLA packed layouts.
 
-Skipped on non-Blackwell-consumer GPUs via :func:`is_sm120a_supported`.
+Skipped on non-SM12x GPUs via :func:`is_sm12x_supported`.
 """
 
 from __future__ import annotations
@@ -50,11 +50,11 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import is_sm120a_supported
+from flashinfer.utils import is_sm12x_supported
 
 pytestmark = pytest.mark.skipif(
-    not is_sm120a_supported(torch.device("cuda")),
-    reason="Sparse-MLA SM120 requires sm120a.",
+    not is_sm12x_supported(torch.device("cuda")),
+    reason="Sparse-MLA SM120 requires SM12x.",
 )
 
 
