@@ -50,12 +50,31 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.sparse_mla_sm120 import sparse_mla_sm120_paged_attention
 from flashinfer.utils import is_sm12x_supported
 
 pytestmark = pytest.mark.skipif(
     not is_sm12x_supported(torch.device("cuda")),
     reason="Sparse-MLA SM120 requires SM12x.",
 )
+
+
+def _make_sparse_mla_wrapper(
+    *,
+    max_num_tokens: int,
+    max_num_heads: int,
+    d_v: int,
+    device: torch.device,
+    max_hca_topk: int = 0,
+) -> flashinfer.mla.BatchMLAPagedAttentionWrapper:
+    return flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        torch.empty(1, dtype=torch.int8, device=device),
+        backend="sparse-sm120",
+        max_num_tokens=max_num_tokens,
+        max_num_heads=max_num_heads,
+        d_v=d_v,
+        max_hca_topk=max_hca_topk,
+    )
 
 
 # ── Quantization helpers (ported from flash_mla_sm120/tests/test_decode.py) ──
@@ -368,7 +387,7 @@ def test_sparse_mla_sm120_decode_dsv4(
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
     mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
 
-    flashinfer.sparse_mla_sm120_paged_attention(
+    sparse_mla_sm120_paged_attention(
         q,
         kv_packed,
         indices,
@@ -432,7 +451,7 @@ def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation() -> None:
     )
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
     mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
-    flashinfer.sparse_mla_sm120_paged_attention(
+    sparse_mla_sm120_paged_attention(
         q,
         kv_packed,
         indices,
@@ -446,6 +465,54 @@ def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation() -> None:
     )
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_decode_dsv4_routes_through_mla_functional_api() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, num_heads, topk = 16, 32, 128
+    d_qk, d_v = 512, 512
+    page_block_size = 64
+    num_blocks = 32
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    out, out_lse = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+        q.unsqueeze(1),
+        kv_packed,
+        torch.empty(1, dtype=torch.int8, device=device),
+        qk_nope_head_dim=512,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        block_tables=indices.unsqueeze(1),
+        seq_lens=torch.ones(num_tokens, dtype=torch.int32, device=device),
+        max_seq_len=s_kv,
+        sparse_mla_top_k=topk,
+        bmm1_scale=sm_scale,
+        backend="sparse-sm120",
+        return_lse=True,
+    )
+
+    torch.testing.assert_close(out.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
@@ -502,7 +569,7 @@ def test_sparse_mla_sm120_decode_dsv4_dual_more_than_32_splits() -> None:
     output = torch.zeros(
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
     )
-    wrapper = flashinfer.BatchSparseMLAPagedAttentionWrapper(
+    wrapper = _make_sparse_mla_wrapper(
         max_num_tokens=num_tokens,
         max_num_heads=num_heads,
         d_v=d_v,
@@ -511,7 +578,7 @@ def test_sparse_mla_sm120_decode_dsv4_dual_more_than_32_splits() -> None:
     mid_out, mid_lse = _make_decode_scratch(
         num_tokens, num_heads, topk, d_v, device, extra_topk=extra_topk
     )
-    out_lse = wrapper.run(
+    out_lse = wrapper.run_sparse_mla(
         q,
         main_packed,
         main_idx,
@@ -585,7 +652,7 @@ def test_sparse_mla_sm120_decode_dsv3_2(
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
     mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
 
-    flashinfer.sparse_mla_sm120_paged_attention(
+    sparse_mla_sm120_paged_attention(
         q,
         kv_packed,
         indices,
@@ -663,7 +730,7 @@ def test_sparse_mla_sm120_prefill_dsv3_2(
     )
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
 
-    flashinfer.sparse_mla_sm120_paged_attention(
+    sparse_mla_sm120_paged_attention(
         q,
         kv_packed,
         indices,
@@ -742,7 +809,7 @@ def test_sparse_mla_sm120_prefill_dsv4(
     )
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
 
-    flashinfer.sparse_mla_sm120_paged_attention(
+    sparse_mla_sm120_paged_attention(
         q,
         kv_packed,
         indices,
@@ -849,7 +916,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
     )
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
 
-    flashinfer.sparse_mla_sm120_paged_attention(
+    sparse_mla_sm120_paged_attention(
         q,
         main_packed,
         main_idx,
@@ -860,6 +927,182 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
         attn_sink=attn_sink,
         extra_kv_cache=extra_packed,
         extra_indices=extra_idx,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_prefill_dsv4_hca_local_dense() -> None:
+    """Native HCA prefill path: no extra indices, dense local HCA slots."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, num_heads = 128, 32
+    d_qk, d_v = 512, 512
+    topk, hca_topk = 128, 128
+    main_pbs, hca_pbs = 64, 2
+    main_num_blocks = 64
+    hca_num_blocks = (hca_topk + hca_pbs - 1) // hca_pbs
+    main_s_kv = main_num_blocks * main_pbs
+
+    main_bf16 = (
+        torch.randn(
+            main_num_blocks, main_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    hca_bf16 = (
+        torch.randn(
+            hca_num_blocks, hca_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    main_packed = quantize_kv_dsv4(main_bf16)
+    hca_packed = quantize_kv_dsv4(hca_bf16)
+    main_dequant = dequantize_kv_dsv4(main_packed)
+    hca_dequant = dequantize_kv_dsv4(hca_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    main_idx = torch.randint(
+        0, main_s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    hca_lengths = torch.where(
+        torch.arange(num_tokens, device=device) % 2 == 0,
+        torch.full((num_tokens,), hca_topk, device=device, dtype=torch.int32),
+        torch.full((num_tokens,), hca_topk // 2, device=device, dtype=torch.int32),
+    )
+
+    hca_pos = torch.arange(hca_topk, device=device, dtype=torch.int32).expand(
+        num_tokens, -1
+    )
+    hca_idx = torch.where(hca_pos < hca_lengths.unsqueeze(-1), hca_pos, -1)
+    hca_idx_shifted = torch.where(hca_idx < 0, hca_idx, hca_idx + main_s_kv)
+    virtual_idx = torch.cat([main_idx, hca_idx_shifted], dim=-1)
+    virtual_kv = torch.cat(
+        [main_dequant.reshape(-1, d_qk), hca_dequant.reshape(-1, d_qk)], dim=0
+    ).reshape(-1, 1, 1, d_qk)
+
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, virtual_kv, virtual_idx, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    wrapper = _make_sparse_mla_wrapper(
+        max_num_tokens=num_tokens,
+        max_num_heads=num_heads,
+        d_v=d_v,
+        max_hca_topk=hca_topk,
+        device=device,
+    )
+    out_lse = wrapper.run_sparse_mla_hca(
+        q,
+        main_packed,
+        main_idx,
+        output,
+        sm_scale,
+        hca_kv_cache=hca_packed,
+        hca_lengths=hca_lengths,
+        return_lse=True,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_decode_dsv4_hca_block_table() -> None:
+    """Native HCA decode path: compressed-cache slots via request block table."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, num_heads = 16, 32
+    d_qk, d_v = 512, 512
+    topk, hca_topk = 128, 128
+    main_pbs, hca_pbs = 64, 2
+    main_num_blocks = 32
+    num_reqs = 4
+    hca_blocks_per_req = (hca_topk + hca_pbs - 1) // hca_pbs
+    hca_num_blocks = num_reqs * hca_blocks_per_req
+    main_s_kv = main_num_blocks * main_pbs
+
+    main_bf16 = (
+        torch.randn(
+            main_num_blocks, main_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    hca_bf16 = (
+        torch.randn(
+            hca_num_blocks, hca_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    main_packed = quantize_kv_dsv4(main_bf16)
+    hca_packed = quantize_kv_dsv4(hca_bf16)
+    main_dequant = dequantize_kv_dsv4(main_packed)
+    hca_dequant = dequantize_kv_dsv4(hca_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    main_idx = torch.randint(
+        0, main_s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    hca_lengths = torch.where(
+        torch.arange(num_tokens, device=device) % 2 == 0,
+        torch.full((num_tokens,), hca_topk, device=device, dtype=torch.int32),
+        torch.full((num_tokens,), hca_topk // 2, device=device, dtype=torch.int32),
+    )
+    hca_token_to_req = (
+        torch.arange(num_tokens, device=device, dtype=torch.int32) % num_reqs
+    )
+    hca_block_table = (
+        torch.arange(hca_num_blocks, device=device, dtype=torch.int32)
+        .reshape(num_reqs, hca_blocks_per_req)
+        .contiguous()
+    )
+
+    hca_pos = torch.arange(hca_topk, device=device, dtype=torch.int32).expand(
+        num_tokens, -1
+    )
+    block_idx = hca_pos // hca_pbs
+    block_offset = hca_pos - block_idx * hca_pbs
+    hca_blocks = hca_block_table[hca_token_to_req.long()]
+    hca_idx = torch.gather(hca_blocks, 1, block_idx.long()) * hca_pbs + block_offset
+    hca_idx = torch.where(hca_pos < hca_lengths.unsqueeze(-1), hca_idx, -1)
+    hca_idx_shifted = torch.where(hca_idx < 0, hca_idx, hca_idx + main_s_kv)
+    virtual_idx = torch.cat([main_idx, hca_idx_shifted], dim=-1)
+    virtual_kv = torch.cat(
+        [main_dequant.reshape(-1, d_qk), hca_dequant.reshape(-1, d_qk)], dim=0
+    ).reshape(-1, 1, 1, d_qk)
+
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, virtual_kv, virtual_idx, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    wrapper = _make_sparse_mla_wrapper(
+        max_num_tokens=num_tokens,
+        max_num_heads=num_heads,
+        d_v=d_v,
+        max_hca_topk=hca_topk,
+        device=device,
+    )
+    out_lse = wrapper.run_sparse_mla_hca(
+        q,
+        main_packed,
+        main_idx,
+        output,
+        sm_scale,
+        hca_kv_cache=hca_packed,
+        hca_lengths=hca_lengths,
+        hca_block_table=hca_block_table,
+        hca_token_to_req_indices=hca_token_to_req,
+        return_lse=True,
     )
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
@@ -917,7 +1160,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_accepts_singleton_s_q_indices() -> N
         out_lse = torch.zeros(
             (num_tokens, num_heads), dtype=torch.float32, device=device
         )
-        flashinfer.sparse_mla_sm120_paged_attention(
+        sparse_mla_sm120_paged_attention(
             q,
             main_packed,
             indices,
@@ -1016,7 +1259,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
     )
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
-    flashinfer.sparse_mla_sm120_paged_attention(
+    sparse_mla_sm120_paged_attention(
         q,
         main_packed,
         main_idx,
@@ -1098,7 +1341,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_zero_main_topk() -> None:
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
     )
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
-    flashinfer.sparse_mla_sm120_paged_attention(
+    sparse_mla_sm120_paged_attention(
         q,
         main_packed,
         main_idx,
@@ -1138,7 +1381,7 @@ def test_sparse_mla_sm120_prefill_dsv3_2_sg_zero_topk_length() -> None:
     )
     out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=device)
 
-    flashinfer.sparse_mla_sm120_paged_attention(
+    sparse_mla_sm120_paged_attention(
         q,
         kv_cache,
         indices,
@@ -1218,7 +1461,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_runtime_extra_topk(
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
     )
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
-    flashinfer.sparse_mla_sm120_paged_attention(
+    sparse_mla_sm120_paged_attention(
         q,
         main_packed,
         main_idx,
@@ -1264,7 +1507,7 @@ def test_sparse_mla_sm120_wrapper_class_run(model: str) -> None:
     ).clamp(-1, 1)
     kv_packed = quantize(kv_bf16)
 
-    wrapper = flashinfer.BatchSparseMLAPagedAttentionWrapper(
+    wrapper = _make_sparse_mla_wrapper(
         max_num_tokens=128,
         max_num_heads=num_heads,
         d_v=d_v,
@@ -1292,7 +1535,7 @@ def test_sparse_mla_sm120_wrapper_class_run(model: str) -> None:
                 num_tokens, num_heads, topk, d_v, device
             )
         # No exception means the dispatch path is wired correctly.
-        wrapper.run(
+        wrapper.run_sparse_mla(
             q,
             kv_packed,
             indices,

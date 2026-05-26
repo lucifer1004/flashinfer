@@ -24,7 +24,11 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
                                     bf16* output, float* out_lse, const float* attn_sink,
                                     const uint8_t* extra_KV_cache, const int32_t* extra_indices,
                                     const int* extra_topk_length, int extra_topk, int pbs_extra,
-                                    size_t stride_extra_kv_block, int num_tokens, int num_splits,
+                                    size_t stride_extra_kv_block,
+                                    const int32_t* hca_block_table, int hca_block_table_stride,
+                                    int hca_block_table_cols,
+                                    const int32_t* hca_token_to_req_indices, int num_tokens,
+                                    int num_splits,
                                     int chunks_per_block_override, float sm_scale,
                                     size_t stride_kv_block, cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
@@ -110,8 +114,9 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
   dim3 block1(DSV4_BLOCK_THREADS);
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
       Q, KV_cache, indices, mid_out, mid_lse, topk_length, extra_KV_cache, extra_indices,
-      extra_topk_length, extra_topk, pbs_extra, stride_extra_kv_block, num_tokens, num_splits,
-      chunks_per_block, sm_scale, stride_kv_block);
+      extra_topk_length, extra_topk, pbs_extra, stride_extra_kv_block, hca_block_table,
+      hca_block_table_stride, hca_block_table_cols, hca_token_to_req_indices, num_tokens,
+      num_splits, chunks_per_block, sm_scale, stride_kv_block);
   CUDA_CHECK_BOOL(cudaGetLastError());
 
   // Stage 2: merge splits → final output + LSE.
@@ -141,7 +146,11 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int pa
                                    const int* topk_length, const float* attn_sink,
                                    const uint8_t* extra_KV_cache, const int32_t* extra_indices,
                                    const int* extra_topk_length, int extra_topk, int pbs_extra,
-                                   size_t stride_extra_kv_block, int chunks_per_block_override,
+                                   size_t stride_extra_kv_block,
+                                   const int32_t* hca_block_table, int hca_block_table_stride,
+                                   int hca_block_table_cols,
+                                   const int32_t* hca_token_to_req_indices,
+                                   int chunks_per_block_override,
                                    float sm_scale, size_t stride_kv_block, cudaStream_t stream) {
   if (mt != ModelType::DSV4 || page_block_size != 64) return false;
   if (num_splits <= 0) return false;
@@ -150,8 +159,9 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int pa
     return launch_decode_dsv4_impl<ModelType::DSV4, (H), (K), 64>(                          \
         Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,    \
         extra_KV_cache, extra_indices, extra_topk_length, extra_topk, pbs_extra,            \
-        stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale, \
-        stride_kv_block, stream);                                                           \
+        stride_extra_kv_block, hca_block_table, hca_block_table_stride,                     \
+        hca_block_table_cols, hca_token_to_req_indices, num_tokens, num_splits,             \
+        chunks_per_block_override, sm_scale, stride_kv_block, stream);                      \
   }
   DSV4_DISPATCH(8, 128)
   DSV4_DISPATCH(8, 512)

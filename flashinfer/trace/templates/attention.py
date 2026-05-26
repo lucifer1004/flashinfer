@@ -1135,8 +1135,8 @@ sparse_mla_sm120_paged_trace = TraceTemplate(
         "(extra_kv_cache + extra_indices + extra_topk_length) for DSv4 "
         "C4A / C128A layers, sharing a single online-softmax denominator "
         "across both caches. Auto-dispatches decode (num_tokens <= 64) vs "
-        "prefill internally. Wraps BatchSparseMLAPagedAttentionWrapper.run() "
-        "/ sparse_mla_sm120_paged_attention()."
+        "prefill internally. This is the backend trace for the SM120 sparse "
+        "MLA implementation routed by flashinfer.mla APIs."
     ),
     axes={
         "num_tokens": Var(description="Number of query tokens (batch * s_q)."),

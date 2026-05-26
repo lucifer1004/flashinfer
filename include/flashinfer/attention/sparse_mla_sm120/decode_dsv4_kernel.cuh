@@ -132,7 +132,10 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     const int* __restrict__ extra_topk_length_ptr,  // [num_tokens] or null
     int extra_topk,                                 // 0 = no extra cache
     int pbs_extra,  // page_block_size for extra cache (e.g. 2 for DSv4 C128A)
-    size_t stride_extra_kv_block, int num_tokens, int num_splits, int chunks_per_block,
+    size_t stride_extra_kv_block, const int32_t* __restrict__ hca_block_table,
+    int hca_block_table_stride, int hca_block_table_cols,
+    const int32_t* __restrict__ hca_token_to_req_indices, int num_tokens, int num_splits,
+    int chunks_per_block,
     float sm_scale, size_t stride_kv_block) {
   using KV = KVCacheTraits<MT>;
   static_assert(MT == ModelType::DSV4, "decode-dsv4 currently DSV4-only");
@@ -246,8 +249,10 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     const int section_len = is_extra ? extra_topk_len : topk_len;
     const int g_start = chunk_in_section * DSV4_CAND_WINDOW;
     const int g_end = min(g_start + DSV4_CAND_WINDOW, section_len);
+    const bool extra_dense_hca = is_extra && extra_indices == nullptr && hca_block_table != nullptr;
     const int32_t* section_idx_base =
-        is_extra ? (extra_indices + (size_t)t_idx * extra_topk) : idx_base;
+        is_extra ? (extra_dense_hca ? nullptr : extra_indices + (size_t)t_idx * extra_topk)
+                 : idx_base;
     const uint8_t* section_kv = is_extra ? extra_KV_cache : KV_cache;
     const size_t section_stride = is_extra ? stride_extra_kv_block : stride_kv_block;
     // Page block size of THIS section. Main is compile-time constexpr (typ.
@@ -257,6 +262,18 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     uint8_t* kv_fp8_dst = sm.kv_fp8(buf);
     bf16* kv_rope_dst = sm.kv_rope(buf);
     uint8_t* kv_sc_dst = sm.kv_sc(buf);
+    auto load_section_idx = [&](int cand_pos) -> int32_t {
+      if (extra_dense_hca) {
+        const int req_idx = hca_token_to_req_indices[t_idx];
+        const int block_idx = cand_pos / section_pbs;
+        const int block_offset = cand_pos - block_idx * section_pbs;
+        if (req_idx < 0 || block_idx >= hca_block_table_cols) return -1;
+        const int32_t block_number =
+            hca_block_table[(size_t)req_idx * hca_block_table_stride + block_idx];
+        return block_number * section_pbs + block_offset;
+      }
+      return section_idx_base[cand_pos];
+    };
 
 #pragma unroll
     for (int eo = 0; eo < DSV4_BI; eo += DSV4_IO_THREADS) {
@@ -264,7 +281,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       if (entry_idx >= DSV4_BI) break;
       const int cand_pos = g_start + entry_idx;
       const bool is_valid_cand = (cand_pos < g_end);
-      const int idx_raw = is_valid_cand ? section_idx_base[cand_pos] : -1;
+      const int idx_raw = is_valid_cand ? load_section_idx(cand_pos) : -1;
       uint64_t scale_word = 0;
       if (idx_raw >= 0) {
         const int idx = idx_raw;
@@ -292,7 +309,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       const int entry_idx = eo + lane;
       if (entry_idx >= DSV4_BI) break;
       const int cand_pos = g_start + entry_idx;
-      const int idx_raw = (cand_pos < g_end) ? section_idx_base[cand_pos] : -1;
+      const int idx_raw = (cand_pos < g_end) ? load_section_idx(cand_pos) : -1;
       const int idx = (idx_raw >= 0) ? idx_raw : 0;
       const int block_idx_g = idx / section_pbs;
       const int local_idx_g = idx - block_idx_g * section_pbs;
@@ -428,8 +445,24 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     // Mask invalid cands + sm_scale × LOG2E. Invalid = position past
     // section_len OR slot id = -1 (indexer-padded; IO already gathered slot 0
     // into smem with idx clamped — masking to -inf kills it in softmax).
+    const bool extra_dense_hca =
+        is_extra_chunk && extra_indices == nullptr && hca_block_table != nullptr;
     const int32_t* section_idx_base =
-        is_extra_chunk ? (extra_indices + (size_t)t_idx * extra_topk) : idx_base;
+        is_extra_chunk
+            ? (extra_dense_hca ? nullptr : extra_indices + (size_t)t_idx * extra_topk)
+            : idx_base;
+    auto load_section_idx = [&](int cand_pos) -> int32_t {
+      if (extra_dense_hca) {
+        const int req_idx = hca_token_to_req_indices[t_idx];
+        const int block_idx = cand_pos / pbs_extra;
+        const int block_offset = cand_pos - block_idx * pbs_extra;
+        if (req_idx < 0 || block_idx >= hca_block_table_cols) return -1;
+        const int32_t block_number =
+            hca_block_table[(size_t)req_idx * hca_block_table_stride + block_idx];
+        return block_number * pbs_extra + block_offset;
+      }
+      return section_idx_base[cand_pos];
+    };
     const int warp_first_cand = warp_id * DSV4_ENTRIES_PER_WARP;
 #pragma unroll
     for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
@@ -437,8 +470,8 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
       const int c1 = c0 + 1;
       const int abs_c0 = c0 + split_cand_start;
       const int abs_c1 = c1 + split_cand_start;
-      const int idx0 = (abs_c0 < section_len) ? section_idx_base[abs_c0] : -1;
-      const int idx1 = (abs_c1 < section_len) ? section_idx_base[abs_c1] : -1;
+      const int idx0 = (abs_c0 < section_len) ? load_section_idx(abs_c0) : -1;
+      const int idx1 = (abs_c1 < section_len) ? load_section_idx(abs_c1) : -1;
       if (abs_c0 >= split_cand_end || idx0 < 0) {
         qk[nt][0] = -1e30f;
         qk[nt][2] = -1e30f;

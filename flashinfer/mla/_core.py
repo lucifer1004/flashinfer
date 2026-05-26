@@ -135,6 +135,159 @@ supported_mla_layer_dimensions = [
 ]
 
 
+def _normalize_optional_mla_sink(
+    sinks: Optional[Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]],
+    backend_name: str,
+) -> Optional[torch.Tensor]:
+    if sinks is None:
+        return None
+    if isinstance(sinks, (list, tuple)):
+        if len(sinks) != 1:
+            raise ValueError(
+                f"{backend_name} expects sinks to be a single tensor or a "
+                f"length-1 list/tuple; got len={len(sinks)}."
+            )
+        return sinks[0]
+    return sinks
+
+
+def _trtllm_batch_decode_sparse_mla_sm120(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    sparse_mla_top_k: int,
+    out: Optional[torch.Tensor],
+    sm_scale: float,
+    sinks: Optional[Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]],
+    sparse_mla_top_k_lens: Optional[torch.Tensor],
+    lse: Optional[torch.Tensor],
+    return_lse: bool,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    if not is_sm12x_supported(query.device):
+        raise ValueError(
+            "SM120 sparse MLA requires SM120a (CUDA >= 12.8) or SM121a "
+            "(CUDA >= 13.0)"
+        )
+    if query.ndim != 4:
+        raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
+    if sparse_mla_top_k <= 0:
+        raise ValueError("backend='sparse-sm120' requires sparse_mla_top_k > 0")
+
+    batch_size, q_len_per_request, num_heads, head_dim = query.shape
+    if head_dim not in (512, 576):
+        raise ValueError(
+            "backend='sparse-sm120' supports DSv4 head_dim=512 or "
+            f"DSv3.2/GLM head_dim=576, got {head_dim}"
+        )
+    if num_heads > 128:
+        raise ValueError(f"Expected num_heads <= 128, got {num_heads}")
+
+    if block_tables.ndim == 3:
+        expected_indices_shape = (batch_size, q_len_per_request, sparse_mla_top_k)
+        if tuple(block_tables.shape) != expected_indices_shape:
+            raise ValueError(
+                f"Expected block_tables.shape == {expected_indices_shape} for "
+                f"backend='sparse-sm120', got {tuple(block_tables.shape)}"
+            )
+        indices = block_tables.reshape(batch_size * q_len_per_request, -1)
+    elif block_tables.ndim == 2:
+        expected_indices_shape = (batch_size * q_len_per_request, sparse_mla_top_k)
+        if tuple(block_tables.shape) != expected_indices_shape:
+            raise ValueError(
+                f"Expected flattened block_tables.shape == {expected_indices_shape} "
+                f"for backend='sparse-sm120', got {tuple(block_tables.shape)}"
+            )
+        indices = block_tables
+    else:
+        raise ValueError(
+            "backend='sparse-sm120' expects block_tables to hold sparse MLA "
+            f"indices with ndim 2 or 3, got {block_tables.ndim}"
+        )
+    if indices.dtype != torch.int32:
+        raise ValueError(f"block_tables must have dtype torch.int32, got {indices.dtype}")
+
+    if sparse_mla_top_k_lens is None:
+        topk_lens = None
+    else:
+        if sparse_mla_top_k_lens.dtype != torch.int32:
+            raise ValueError(
+                "sparse_mla_top_k_lens must have dtype torch.int32, got "
+                f"{sparse_mla_top_k_lens.dtype}"
+            )
+        if sparse_mla_top_k_lens.ndim == 2:
+            expected_lens_shape = (batch_size, q_len_per_request)
+            if tuple(sparse_mla_top_k_lens.shape) != expected_lens_shape:
+                raise ValueError(
+                    f"Expected sparse_mla_top_k_lens.shape == {expected_lens_shape}, "
+                    f"got {tuple(sparse_mla_top_k_lens.shape)}"
+                )
+            topk_lens = sparse_mla_top_k_lens.reshape(-1)
+        elif sparse_mla_top_k_lens.ndim == 1:
+            expected_lens_shape = (batch_size * q_len_per_request,)
+            if tuple(sparse_mla_top_k_lens.shape) != expected_lens_shape:
+                raise ValueError(
+                    "Expected flattened sparse_mla_top_k_lens.shape == "
+                    f"{expected_lens_shape}, got {tuple(sparse_mla_top_k_lens.shape)}"
+                )
+            topk_lens = sparse_mla_top_k_lens
+        else:
+            raise ValueError(
+                "sparse_mla_top_k_lens must have ndim 1 or 2, got "
+                f"{sparse_mla_top_k_lens.ndim}"
+            )
+
+    from ..sparse_mla_sm120 import sparse_mla_sm120_paged_attention
+
+    query_flat = query.reshape(batch_size * q_len_per_request, num_heads, head_dim)
+    expected_out_shape = (batch_size, q_len_per_request, num_heads, 512)
+    if out is None:
+        out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=query.device)
+    else:
+        check_shape_dtype_device(out, expected_out_shape, torch.bfloat16, query.device, "out")
+    out_flat = out.view(query_flat.shape[0], num_heads, 512)
+
+    if return_lse:
+        lse_shape = (query_flat.shape[0], num_heads)
+        if lse is None:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=query.device)
+        else:
+            check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
+    else:
+        lse = torch.empty(
+            (query_flat.shape[0], num_heads), dtype=torch.float32, device=query.device
+        )
+
+    mid_out = None
+    mid_lse = None
+    if query_flat.shape[0] <= 64:
+        num_splits = (sparse_mla_top_k + 63) // 64
+        mid_out = torch.empty(
+            (query_flat.shape[0], num_heads, num_splits, 512),
+            dtype=torch.bfloat16,
+            device=query.device,
+        )
+        mid_lse = torch.empty(
+            (query_flat.shape[0], num_heads, num_splits),
+            dtype=torch.float32,
+            device=query.device,
+        )
+
+    sparse_mla_sm120_paged_attention(
+        query_flat,
+        kv_cache,
+        indices,
+        out_flat,
+        lse,
+        float(sm_scale),
+        topk_length=topk_lens,
+        attn_sink=_normalize_optional_mla_sink(sinks, "backend='sparse-sm120'"),
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )
+
+    return (out, lse) if return_lse else out
+
+
 def _check_trtllm_gen_mla_shape(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -715,6 +868,11 @@ class BatchMLAPagedAttentionWrapper:
         kv_indices: Optional[torch.Tensor] = None,
         kv_len_arr: Optional[torch.Tensor] = None,
         backend: str = "auto",
+        max_num_tokens: Optional[int] = None,
+        max_num_heads: Optional[int] = None,
+        d_v: int = 512,
+        max_hca_topk: int = 0,
+        device: Optional[torch.device] = None,
     ) -> None:
         r"""Constructor for BatchMLAPagedAttentionWrapper.
 
@@ -744,12 +902,49 @@ class BatchMLAPagedAttentionWrapper:
             should be ``[batch_size]``.
             This argument is only effective when ``use_cuda_graph`` is ``True``.
         backend : str
-            The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3`` or
+            ``sparse-sm120``. Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
             device architecture and kernel availability. If ``cutlass`` is provided, the MLA
             kernels will be generated by CUTLASS and only float_workspace_buffer is required and
             other arguments are ignored.
+        max_num_tokens : Optional[int]
+            Required when ``backend="sparse-sm120"``. Maximum sparse MLA
+            tokens accepted by :meth:`run_sparse_mla`.
+        max_num_heads : Optional[int]
+            Required when ``backend="sparse-sm120"``. Maximum sparse MLA heads
+            accepted by :meth:`run_sparse_mla`.
+        max_hca_topk : int
+            Maximum HCA top-k for :meth:`run_sparse_mla_hca` when
+            ``backend="sparse-sm120"``.
         """
+        if backend == "sparse-sm120":
+            if max_num_tokens is None:
+                raise ValueError(
+                    "max_num_tokens is required when backend='sparse-sm120'"
+                )
+            if max_num_heads is None:
+                raise ValueError(
+                    "max_num_heads is required when backend='sparse-sm120'"
+                )
+            from ..sparse_mla_sm120 import BatchSparseMLAPagedAttentionWrapper
+
+            sparse_device = (
+                torch.device(device)
+                if device is not None
+                else torch.device(float_workspace_buffer.device)
+            )
+            self._backend = backend
+            self.device = sparse_device
+            self._sparse_sm120_wrapper = BatchSparseMLAPagedAttentionWrapper(
+                max_num_tokens=max_num_tokens,
+                max_num_heads=max_num_heads,
+                d_v=d_v,
+                max_hca_topk=max_hca_topk,
+                device=sparse_device,
+            )
+            return
+
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
 
@@ -867,6 +1062,82 @@ class BatchMLAPagedAttentionWrapper:
             causal,
         )
 
+    def _require_sparse_sm120_wrapper(self):
+        if getattr(self, "_backend", None) != "sparse-sm120":
+            raise ValueError(
+                "run_sparse_mla is only available when constructing "
+                "BatchMLAPagedAttentionWrapper with backend='sparse-sm120'"
+            )
+        return self._sparse_sm120_wrapper
+
+    @flashinfer_api
+    def run_sparse_mla(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        indices: torch.Tensor,
+        output: torch.Tensor,
+        sm_scale: float,
+        *,
+        topk_length: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
+        extra_kv_cache: Optional[torch.Tensor] = None,
+        extra_indices: Optional[torch.Tensor] = None,
+        extra_topk_length: Optional[torch.Tensor] = None,
+        mid_out: Optional[torch.Tensor] = None,
+        mid_lse: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
+    ) -> Optional[torch.Tensor]:
+        r"""Run SM120 sparse MLA through the standard MLA wrapper namespace."""
+        return self._require_sparse_sm120_wrapper().run(
+            q,
+            kv_cache,
+            indices,
+            output,
+            sm_scale,
+            topk_length=topk_length,
+            attn_sink=attn_sink,
+            extra_kv_cache=extra_kv_cache,
+            extra_indices=extra_indices,
+            extra_topk_length=extra_topk_length,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+            return_lse=return_lse,
+        )
+
+    @flashinfer_api
+    def run_sparse_mla_hca(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        indices: torch.Tensor,
+        output: torch.Tensor,
+        sm_scale: float,
+        *,
+        hca_kv_cache: torch.Tensor,
+        hca_lengths: torch.Tensor,
+        hca_block_table: Optional[torch.Tensor] = None,
+        hca_token_to_req_indices: Optional[torch.Tensor] = None,
+        topk_length: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
+    ) -> Optional[torch.Tensor]:
+        r"""Run DSv4 HCA sparse MLA through the standard MLA wrapper namespace."""
+        return self._require_sparse_sm120_wrapper().run_hca(
+            q,
+            kv_cache,
+            indices,
+            output,
+            sm_scale,
+            hca_kv_cache=hca_kv_cache,
+            hca_lengths=hca_lengths,
+            hca_block_table=hca_block_table,
+            hca_token_to_req_indices=hca_token_to_req_indices,
+            topk_length=topk_length,
+            attn_sink=attn_sink,
+            return_lse=return_lse,
+        )
+
     @overload
     def run(
         self,
@@ -949,6 +1220,11 @@ class BatchMLAPagedAttentionWrapper:
             When provided, ``out`` must be an FP8 tensor. Only supported with
             the ``cutlass`` backend.
         """
+        if self._backend == "sparse-sm120":
+            raise ValueError(
+                "backend='sparse-sm120' uses run_sparse_mla() or "
+                "run_sparse_mla_hca() instead of run()"
+            )
         if self._backend == "cutlass":
             if return_lse:
                 raise ValueError("return_lse does not support cutlass backend for now.")
@@ -1062,6 +1338,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     seq_lens: torch.Tensor,
     max_seq_len: int,
     sparse_mla_top_k: int = 0,
+    sparse_mla_top_k_lens: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     bmm1_scale: Union[float, torch.Tensor] = 1.0,
     bmm2_scale: Union[float, torch.Tensor] = 1.0,
@@ -1090,8 +1367,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
         When ``uses_shared_paged_kv_idx`` is False: shape ``[batch_size, 2, max_num_pages_per_seq]``
         where dim 1 distinguishes K (0) and V (1) page indices. For MLA both rows will
         typically be identical since K and V share the same compressed representation.
+        For ``backend="sparse-sm120"``, this holds sparse MLA slot IDs with
+        shape ``[batch_size, q_len_per_request, sparse_mla_top_k]`` or
+        flattened shape ``[batch_size * q_len_per_request, sparse_mla_top_k]``.
     seq_lens: query_len
     max_seq_len: max sequence length for kv_cache
+    sparse_mla_top_k_lens: optional active sparse MLA top-k length for each query token.
+        Supported by ``backend="sparse-sm120"``.
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
         When using ``trtllm-gen`` backend, it can be a ``torch.Tensor`` with dtype ``torch.float32``.
@@ -1167,8 +1449,47 @@ def trtllm_batch_decode_with_kv_cache_mla(
     When both are provided, the dynamic scale factor tensors will be used.
     """
     if backend == "auto":
-        backend = (
-            "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
+        cc = get_compute_capability(query.device)
+        if sparse_mla_top_k > 0 and cc[0] == 12:
+            backend = "sparse-sm120"
+        else:
+            backend = "trtllm-gen" if cc[0] == 10 else "xqa"
+    if backend != "sparse-sm120" and sparse_mla_top_k_lens is not None:
+        raise ValueError(
+            "sparse_mla_top_k_lens is only supported with backend='sparse-sm120'"
+        )
+    if backend == "sparse-sm120":
+        if isinstance(bmm1_scale, torch.Tensor):
+            raise ValueError(
+                "backend='sparse-sm120' expects bmm1_scale to be a float"
+            )
+        if isinstance(bmm2_scale, torch.Tensor):
+            raise ValueError(
+                "backend='sparse-sm120' expects bmm2_scale to be a float"
+            )
+        if float(bmm2_scale) != 1.0:
+            raise ValueError("backend='sparse-sm120' does not support bmm2_scale")
+        if not uses_shared_paged_kv_idx:
+            raise ValueError(
+                "backend='sparse-sm120' does not support separate KV page indices "
+                "(uses_shared_paged_kv_idx=False)"
+            )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "backend='sparse-sm120' does not support "
+                "skip_softmax_threshold_scale_factor"
+            )
+        return _trtllm_batch_decode_sparse_mla_sm120(
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            sparse_mla_top_k=sparse_mla_top_k,
+            out=out,
+            sm_scale=float(bmm1_scale),
+            sinks=sinks,
+            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+            lse=lse,
+            return_lse=return_lse,
         )
     if isinstance(bmm1_scale, torch.Tensor):
         if bmm1_scale.dtype != torch.float32:
@@ -1178,6 +1499,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         if bmm2_scale.dtype != torch.float32:
             raise TypeError("bmm2_scale tensor must have dtype torch.float32")
     if backend == "xqa":
+        if sparse_mla_top_k > 0:
+            raise ValueError("XQA MLA does not support sparse_mla_top_k")
         if not is_sm12x_supported(query.device):
             raise ValueError(
                 "XQA MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"

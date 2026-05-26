@@ -97,6 +97,10 @@ from flashinfer.prefill import (
     BatchPrefillWithRaggedKVCacheWrapper,
 )
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
+from flashinfer.sparse_mla_sm120 import (
+    sparse_mla_sm120_decode_dsv4,
+    sparse_mla_sm120_paged_attention,
+)
 
 device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
@@ -446,7 +450,7 @@ with contextlib.suppress(Exception):
     )
     smla_out = torch.zeros(smla_T, smla_H, smla_dv, dtype=torch.bfloat16, device=device)
     smla_lse = torch.zeros(smla_T, smla_H, dtype=torch.float32, device=device)
-    flashinfer.sparse_mla_sm120_paged_attention(
+    sparse_mla_sm120_paged_attention(
         smla_q,
         smla_kv,
         smla_idx,
@@ -490,7 +494,7 @@ with contextlib.suppress(Exception):
         smla4_T, smla4_H, smla4_dv, dtype=torch.bfloat16, device=device
     )
     smla4_lse = torch.zeros(smla4_T, smla4_H, dtype=torch.float32, device=device)
-    flashinfer.sparse_mla_sm120_decode_dsv4(
+    sparse_mla_sm120_decode_dsv4(
         smla4_q,
         smla4_kv,
         smla4_idx,

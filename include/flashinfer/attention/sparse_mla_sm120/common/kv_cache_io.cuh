@@ -93,6 +93,39 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t*
   }
 }
 
+template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT = false>
+__device__ __forceinline__ void io_bulk_gather_tile_dense(uint8_t* dst, int tile_base,
+                                                          const uint8_t* __restrict__ kv_ptr,
+                                                          uint64_t* mbar, int io_tid,
+                                                          size_t stride_kv_block,
+                                                          uint64_t cache_policy = 0) {
+  using KV = KVCacheTraits<MT>;
+  using IO = KVIOTraits<MT>;
+  constexpr int COPY_BYTES = KV::KV_SMEM_COPY_BYTES;
+  constexpr int SMEM_STRIDE = KV::KV_SMEM_STRIDE;
+
+  if (io_tid == 0) mbarrier_arrive_expect_tx(mbar, BI * COPY_BYTES);
+
+#pragma unroll 1
+  for (int bi = io_tid; bi < BI; bi += IO_THREADS) {
+    const int idx = tile_base + bi;
+
+    const uint8_t* src;
+    if constexpr (KV::SCALE_IN_KV_SMEM) {
+      src = kv_ptr + (size_t)idx * IO::IO_STRIDE;
+    } else {
+      constexpr int pbs = PAGE_BLOCK_SIZE;
+      int block_idx = idx / pbs;
+      int local_idx = idx % pbs;
+      src = kv_ptr + (size_t)block_idx * stride_kv_block + (size_t)local_idx * IO::IO_STRIDE;
+    }
+    if constexpr (USE_L2_HINT)
+      cp_async_bulk_g2s_l2hint(dst + bi * SMEM_STRIDE, src, COPY_BYTES, mbar, cache_policy);
+    else
+      cp_async_bulk_g2s(dst + bi * SMEM_STRIDE, src, COPY_BYTES, mbar);
+  }
+}
+
 template <ModelType MT, int PAGE_BLOCK_SIZE>
 __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, const int32_t* indices,
                                                  const uint8_t* __restrict__ kv_ptr, int io_tid,
@@ -108,6 +141,28 @@ __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, const int32
     int idx = indices[bi];
     idx = (idx >= 0) ? idx : 0;
 
+    int block_idx = idx / pbs;
+    int local_idx = idx % pbs;
+    const uint8_t* src = kv_ptr + (size_t)block_idx * stride_kv_block +
+                         (size_t)pbs * IO::IO_STRIDE + (size_t)local_idx * SCALE_BYTES;
+    *reinterpret_cast<uint64_t*>(scale_dst + bi * SCALE_BYTES) =
+        __ldg(reinterpret_cast<const uint64_t*>(src));
+  }
+}
+
+template <ModelType MT, int PAGE_BLOCK_SIZE>
+__device__ __forceinline__ void io_gather_scales_dense(uint8_t* scale_dst, int tile_base,
+                                                       const uint8_t* __restrict__ kv_ptr,
+                                                       int io_tid, size_t stride_kv_block) {
+  using KV = KVCacheTraits<MT>;
+  using IO = KVIOTraits<MT>;
+  if constexpr (KV::SCALE_IN_KV_SMEM) return;
+
+  constexpr int pbs = PAGE_BLOCK_SIZE;
+  constexpr int SCALE_BYTES = KV::SCALE_BYTES_PER_TOKEN;
+
+  for (int bi = io_tid; bi < BI; bi += IO_THREADS) {
+    const int idx = tile_base + bi;
     int block_idx = idx / pbs;
     int local_idx = idx % pbs;
     const uint8_t* src = kv_ptr + (size_t)block_idx * stride_kv_block +

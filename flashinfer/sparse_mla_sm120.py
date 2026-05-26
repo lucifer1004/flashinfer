@@ -26,17 +26,15 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Sparse-MLA paged attention for SM120.
+"""Internal Sparse-MLA paged-attention backend for SM120.
 
 Auto-dispatches between decode (num_tokens <= 64) and prefill (larger). Both
 DSv3.2 (d_qk=576) and DSv4 (d_qk=512) decode go through dedicated warp-spec
 standalone kernels; prefill is dispatched through the shared orchestrator.
 
-Two public surfaces:
-
-1. Functional API (:func:`sparse_mla_sm120_paged_attention`).
-2. Wrapper API (:class:`BatchSparseMLAPagedAttentionWrapper`) — class with a
-   pre-allocated output-LSE buffer for ``use_cuda_graph=True`` workflows.
+Public callers should route through :mod:`flashinfer.mla`. This module keeps
+the SM120-specific kernel signatures available to implementation tests and
+backend adapters without promoting them as stable attention APIs.
 """
 
 from __future__ import annotations
@@ -240,6 +238,7 @@ def get_sparse_mla_sm120_module():
         extra_kv_cache: Optional[torch.Tensor],
         extra_indices: Optional[torch.Tensor],
         extra_topk_length: Optional[torch.Tensor],
+        hca_max_topk: int,
         mid_out: Optional[torch.Tensor],
         mid_lse: Optional[torch.Tensor],
     ) -> None:
@@ -250,11 +249,18 @@ def get_sparse_mla_sm120_module():
 
         # kv_cache layout: [num_blocks, page_block_size, 1, bytes_per_token].
         kv_pbs = int(kv_cache.size(-3)) if kv_cache.ndim >= 3 else 0
-        extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
+        extra_topk = (
+            int(extra_indices.size(-1)) if extra_indices is not None else int(hca_max_topk)
+        )
         topk_length = _clamp_topk_length(topk_length, topk)
         extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
-        if kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE and _decode_dsv4_dispatchable(
-            num_tokens, num_heads, topk, d_qk, kv_pbs, extra_topk
+        native_hca = extra_indices is None and hca_max_topk > 0
+        if (
+            not native_hca
+            and kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
+            and _decode_dsv4_dispatchable(
+                num_tokens, num_heads, topk, d_qk, kv_pbs, extra_topk
+            )
         ):
             num_splits_main = (topk + _BI - 1) // _BI
             num_splits_extra = (extra_topk + _BI - 1) // _BI
@@ -315,6 +321,7 @@ def get_sparse_mla_sm120_module():
             extra_kv_cache,
             extra_indices,
             extra_topk_length,
+            hca_max_topk,
         )
 
     @register_fake_op("flashinfer::sparse_mla_sm120_paged_attention")
@@ -340,6 +347,7 @@ def sparse_mla_sm120_paged_attention(
     extra_kv_cache: Optional[torch.Tensor] = None,
     extra_indices: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    hca_max_topk: int = 0,
     mid_out: Optional[torch.Tensor] = None,
     mid_lse: Optional[torch.Tensor] = None,
 ) -> None:
@@ -404,7 +412,7 @@ def sparse_mla_sm120_paged_attention(
     _require_d_v_512(d_v)
     _check_last_dim_512(output, "output")
     topk_length = _clamp_topk_length(topk_length, indices.shape[-1])
-    extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
+    extra_topk = extra_indices.shape[-1] if extra_indices is not None else int(hca_max_topk)
     extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
 
     impl = get_sparse_mla_sm120_module()
@@ -421,13 +429,19 @@ def sparse_mla_sm120_paged_attention(
         extra_kv_cache,
         extra_indices,
         extra_topk_length,
+        int(hca_max_topk),
         mid_out,
         mid_lse,
     )
 
 
 class BatchSparseMLAPagedAttentionWrapper:
-    """Sparse-MLA paged attention wrapper for SM120 with cudagraph support.
+    """Backend sparse-MLA paged attention wrapper for SM120.
+
+    Public callers should construct
+    :class:`flashinfer.mla.BatchMLAPagedAttentionWrapper` with
+    ``backend="sparse-sm120"`` and call ``run_sparse_mla`` or
+    ``run_sparse_mla_hca``.
 
     Pre-allocates an LSE buffer at construction. Decode split-K scratch must be
     supplied by the caller via ``run(mid_out=..., mid_lse=...)`` so serving
@@ -445,12 +459,6 @@ class BatchSparseMLAPagedAttentionWrapper:
     device : Optional[torch.device]
         Allocation target. Defaults to the current CUDA device.
 
-    Example
-    -------
-    >>> wrapper = BatchSparseMLAPagedAttentionWrapper(
-    ...     max_num_tokens=4096, max_num_heads=128
-    ... )
-    >>> wrapper.run(q, kv_cache, indices, output, sm_scale=...)
     """
 
     @supported_compute_capability([120, 121])
@@ -461,6 +469,7 @@ class BatchSparseMLAPagedAttentionWrapper:
         max_num_heads: int,
         *,
         d_v: int = _D_V,
+        max_hca_topk: int = 0,
         device: Optional[torch.device] = None,
     ) -> None:
         if max_num_tokens <= 0:
@@ -475,6 +484,7 @@ class BatchSparseMLAPagedAttentionWrapper:
         self._max_num_tokens = max_num_tokens
         self._max_num_heads = max_num_heads
         self._d_v = d_v
+        self._max_hca_topk = int(max_hca_topk)
 
         # Pre-allocated LSE buffer; sliced to actual shape on run(). Sized
         # for prefill worst case since prefill writes here too.
@@ -483,6 +493,26 @@ class BatchSparseMLAPagedAttentionWrapper:
             dtype=torch.float32,
             device=self._device,
         )
+        self._mid_out: Optional[torch.Tensor] = None
+        self._mid_lse: Optional[torch.Tensor] = None
+        if self._max_hca_topk > 0:
+            # Native HCA owns decode scratch internally; regular run() still
+            # uses caller-supplied scratch so serving stacks can share it.
+            decode_t_max = min(max_num_tokens, _DECODE_MAX_TOKENS)
+            decode_topk_max = max(topk for _, topk in _DECODE_DSV4_DISPATCH)
+            decode_max_splits = (decode_topk_max + _BI - 1) // _BI + (
+                self._max_hca_topk + _BI - 1
+            ) // _BI
+            self._mid_out = torch.empty(
+                (decode_t_max, max_num_heads, decode_max_splits, d_v),
+                dtype=torch.bfloat16,
+                device=self._device,
+            )
+            self._mid_lse = torch.empty(
+                (decode_t_max, max_num_heads, decode_max_splits),
+                dtype=torch.float32,
+                device=self._device,
+            )
 
     # Trace fires on the inner sparse_mla_sm120_paged_attention call;
     # wrapper.run owns out_lse internally so no separate template is needed.
@@ -556,8 +586,136 @@ class BatchSparseMLAPagedAttentionWrapper:
             extra_kv_cache=extra_kv_cache,
             extra_indices=extra_indices,
             extra_topk_length=extra_topk_length,
+            hca_max_topk=0,
             mid_out=mid_out,
             mid_lse=mid_lse,
+        )
+        return out_lse_view if return_lse else None
+
+    @flashinfer_api
+    def run_hca(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        indices: torch.Tensor,
+        output: torch.Tensor,
+        sm_scale: float,
+        *,
+        hca_kv_cache: torch.Tensor,
+        hca_lengths: torch.Tensor,
+        hca_block_table: Optional[torch.Tensor] = None,
+        hca_token_to_req_indices: Optional[torch.Tensor] = None,
+        topk_length: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
+    ) -> Optional[torch.Tensor]:
+        """Run DSv4 HCA as SWA plus a dense compressed-cache segment.
+
+        This experimental native-HCA surface lets the kernel derive
+        compressed-cache slot IDs from per-token HCA lengths, avoiding C128A
+        top-k metadata in the caller. Passing ``hca_block_table`` enables
+        decode/global-paged mapping; omitting it uses local dense slots for
+        prefill workspaces.
+        """
+        if self._max_hca_topk <= 0:
+            raise ValueError(
+                "run_hca requires max_hca_topk > 0 when constructing the wrapper"
+            )
+        if q.dim() == 4:
+            if q.size(1) != 1:
+                raise ValueError(
+                    f"4-D q is only supported with s_q=1, got q.shape={tuple(q.shape)}"
+                )
+            q_for_shape = q.squeeze(1)
+        else:
+            q_for_shape = q
+        if output.dim() == 4:
+            if output.size(1) != 1:
+                raise ValueError(
+                    f"4-D output is only supported with s_q=1, got "
+                    f"output.shape={tuple(output.shape)}"
+                )
+            output_for_call = output.squeeze(1)
+        else:
+            output_for_call = output
+        num_tokens = q_for_shape.shape[0]
+        num_heads = q_for_shape.shape[1]
+        if num_tokens > self._max_num_tokens:
+            raise ValueError(
+                f"num_tokens ({num_tokens}) exceeds max_num_tokens "
+                f"({self._max_num_tokens})"
+            )
+        if num_heads > self._max_num_heads:
+            raise ValueError(
+                f"num_heads ({num_heads}) exceeds max_num_heads ({self._max_num_heads})"
+            )
+        if hca_lengths.shape[0] != num_tokens:
+            raise ValueError(
+                f"hca_lengths must have shape [{num_tokens}], got "
+                f"{tuple(hca_lengths.shape)}"
+            )
+        hca_lengths = _clamp_topk_length(hca_lengths, self._max_hca_topk)
+
+        if (
+            hca_block_table is not None
+            and hca_token_to_req_indices is not None
+            and _decode_dsv4_dispatchable(
+                num_tokens,
+                num_heads,
+                indices.shape[-1],
+                q_for_shape.shape[-1],
+                int(kv_cache.size(-3)),
+                self._max_hca_topk,
+            )
+        ):
+            num_splits = (indices.shape[-1] + _BI - 1) // _BI + (
+                self._max_hca_topk + _BI - 1
+            ) // _BI
+            mid_out_view, mid_lse_view = _decode_scratch_views(
+                self._mid_out,
+                self._mid_lse,
+                num_tokens,
+                num_heads,
+                num_splits,
+                self._d_v,
+            )
+            out_lse_view = self._out_lse[:num_tokens, :num_heads]
+            sparse_mla_sm120_decode_dsv4(
+                q_for_shape,
+                kv_cache,
+                indices,
+                mid_out_view,
+                mid_lse_view,
+                output_for_call,
+                out_lse_view,
+                sm_scale,
+                topk_length=topk_length,
+                attn_sink=attn_sink,
+                extra_kv_cache=hca_kv_cache,
+                extra_topk_length=hca_lengths,
+                hca_block_table=hca_block_table,
+                hca_token_to_req_indices=hca_token_to_req_indices,
+                hca_max_topk=self._max_hca_topk,
+                chunks_per_block=-1,
+            )
+            return out_lse_view if return_lse else None
+
+        out_lse_view = self._out_lse[:num_tokens, :num_heads]
+        sparse_mla_sm120_paged_attention(
+            q_for_shape,
+            kv_cache,
+            indices,
+            output_for_call,
+            out_lse_view,
+            sm_scale,
+            d_v=self._d_v,
+            topk_length=topk_length,
+            attn_sink=attn_sink,
+            extra_kv_cache=hca_kv_cache,
+            extra_topk_length=hca_lengths,
+            hca_max_topk=self._max_hca_topk,
+            mid_out=self._mid_out,
+            mid_lse=self._mid_lse,
         )
         return out_lse_view if return_lse else None
 
@@ -611,6 +769,9 @@ def _get_sparse_mla_decode_dsv4_module():
             sm_scale = kwargs["sm_scale"]
             kv_cache = kwargs["kv_cache"]
             extra_kv_cache = kwargs.get("extra_kv_cache")
+            hca_block_table = kwargs.get("hca_block_table")
+            hca_token_to_req_indices = kwargs.get("hca_token_to_req_indices")
+            hca_max_topk = int(kwargs.get("hca_max_topk", 0) or 0)
             if len(inputs) > 6:
                 (
                     topk_length,
@@ -624,7 +785,9 @@ def _get_sparse_mla_decode_dsv4_module():
                 extra_indices = kwargs.get("extra_indices")
                 extra_topk_length = kwargs.get("extra_topk_length")
             topk = indices.shape[-1]  # 2D [T, topk] or 3D [T, 1, topk]
-            extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
+            extra_topk = (
+                extra_indices.shape[-1] if extra_indices is not None else hca_max_topk
+            )
             num_splits = (topk + _BI - 1) // _BI + (extra_topk + _BI - 1) // _BI
             cpb_override = tactic if tactic > 0 else -1
             module.sparse_mla_sm120_decode_dsv4(
@@ -642,6 +805,9 @@ def _get_sparse_mla_decode_dsv4_module():
                 extra_kv_cache,
                 extra_indices,
                 extra_topk_length,
+                hca_block_table,
+                hca_token_to_req_indices,
+                hca_max_topk,
                 cpb_override,
             )
             return output
@@ -845,6 +1011,9 @@ def sparse_mla_sm120_decode_dsv4(
     extra_kv_cache: Optional[torch.Tensor] = None,
     extra_indices: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    hca_block_table: Optional[torch.Tensor] = None,
+    hca_token_to_req_indices: Optional[torch.Tensor] = None,
+    hca_max_topk: int = 0,
     chunks_per_block: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Sparse-MLA paged decode (DSv4 standalone kernel) on SM120.
@@ -896,7 +1065,7 @@ def sparse_mla_sm120_decode_dsv4(
     _check_last_dim_512(output, "output")
     _check_last_dim_512(mid_out, "mid_out")
     topk_length = _clamp_topk_length(topk_length, indices.shape[-1])
-    extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
+    extra_topk = extra_indices.shape[-1] if extra_indices is not None else int(hca_max_topk)
     extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
 
     runner = _decode_dsv4_runner_singleton()
@@ -917,7 +1086,13 @@ def sparse_mla_sm120_decode_dsv4(
         "sm_scale": sm_scale,
         "kv_cache": kv_cache,
         "extra_kv_cache": extra_kv_cache,
+        "hca_block_table": hca_block_table,
+        "hca_token_to_req_indices": hca_token_to_req_indices,
+        "hca_max_topk": int(hca_max_topk),
     }
+
+    if hca_max_topk > 0 and chunks_per_block is None:
+        chunks_per_block = -1
 
     if chunks_per_block is not None:
         # Explicit user override — skip AutoTuner entirely.
