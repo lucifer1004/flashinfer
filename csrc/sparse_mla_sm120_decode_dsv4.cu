@@ -79,7 +79,9 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
     chunks_per_block = chunks_per_block_override;
   } else {
     int sm_count = 0;
-    CUDA_CHECK_BOOL(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0));
+    int device = 0;
+    CUDA_CHECK_BOOL(cudaGetDevice(&device));
+    CUDA_CHECK_BOOL(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
     constexpr int CEIL_WAVES_MAX = 3;
     const int per_token_head = num_tokens * H_BLOCKS;
     chunks_per_block = 1;

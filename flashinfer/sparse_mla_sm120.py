@@ -132,6 +132,26 @@ _DECODE_DSV3_2_DISPATCH = frozenset(
 _DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 
 
+def _require_d_v_512(d_v: int) -> None:
+    if int(d_v) != _D_V:
+        raise ValueError(f"SM120 sparse-MLA requires d_v == {_D_V}, got {d_v}")
+
+
+def _check_last_dim_512(tensor: torch.Tensor, name: str) -> None:
+    if tensor.shape[-1] != _D_V:
+        raise ValueError(
+            f"{name} last dimension must be {_D_V}, got shape {tuple(tensor.shape)}"
+        )
+
+
+def _clamp_topk_length(
+    topk_length: Optional[torch.Tensor], max_topk: int
+) -> Optional[torch.Tensor]:
+    if topk_length is None:
+        return None
+    return torch.clamp(topk_length, min=0, max=int(max_topk))
+
+
 def _decode_dsv3_2_dispatchable(
     num_tokens: int, num_heads: int, topk: int, d_qk: int, page_block_size: int
 ) -> bool:
@@ -239,10 +259,14 @@ def get_sparse_mla_sm120_module():
     ) -> None:
         num_tokens, num_heads, d_qk = q.shape
         topk = indices.shape[-1]
+        _require_d_v_512(d_v)
+        _check_last_dim_512(output, "output")
 
         # kv_cache layout: [num_blocks, page_block_size, 1, bytes_per_token].
         kv_pbs = int(kv_cache.size(-3)) if kv_cache.ndim >= 3 else 0
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
+        topk_length = _clamp_topk_length(topk_length, topk)
+        extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
         if kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE and _decode_dsv4_dispatchable(
             num_tokens, num_heads, topk, d_qk, kv_pbs, extra_topk
         ):
@@ -388,6 +412,12 @@ def sparse_mla_sm120_paged_attention(
     -----
     Requires SM120a / SM121a (block-scaled MXFP8 MMA + cp.async.bulk TMA).
     """
+    _require_d_v_512(d_v)
+    _check_last_dim_512(output, "output")
+    topk_length = _clamp_topk_length(topk_length, indices.shape[-1])
+    extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
+    extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
+
     impl = get_sparse_mla_sm120_module()
     impl.paged_attention(
         q,
@@ -447,6 +477,7 @@ class BatchSparseMLAPagedAttentionWrapper:
             raise ValueError(f"max_num_tokens must be > 0, got {max_num_tokens}")
         if max_num_heads <= 0 or max_num_heads > 128:
             raise ValueError(f"max_num_heads must be in (0, 128], got {max_num_heads}")
+        _require_d_v_512(d_v)
 
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -880,6 +911,12 @@ def sparse_mla_sm120_decode_dsv4(
     output : torch.Tensor
         The mutated output tensor (for chaining).
     """
+    _check_last_dim_512(output, "output")
+    _check_last_dim_512(mid_out, "mid_out")
+    topk_length = _clamp_topk_length(topk_length, indices.shape[-1])
+    extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
+    extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
+
     runner = _decode_dsv4_runner_singleton()
     inputs = [
         q,

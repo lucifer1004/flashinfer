@@ -488,11 +488,15 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     float il0, il1;
     if (cold.attn_sink != nullptr) {
       float s0 = __ldg(cold.attn_sink + h_start + gid) * LOG2E;
-      float s1 = __ldg(cold.attn_sink + h_start + gid + 8) * LOG2E;
       float denom0 = sm.l_smem[gid] + exp2f(s0 - sm.m_smem[gid]);
-      float denom1 = sm.l_smem[gid + 8] + exp2f(s1 - sm.m_smem[gid + 8]);
       il0 = (denom0 > 0.f) ? (1.f / denom0) : 0.f;
-      il1 = (denom1 > 0.f) ? (1.f / denom1) : 0.f;
+      if constexpr (VALID_HPB > 8) {
+        float s1 = __ldg(cold.attn_sink + h_start + gid + 8) * LOG2E;
+        float denom1 = sm.l_smem[gid + 8] + exp2f(s1 - sm.m_smem[gid + 8]);
+        il1 = (denom1 > 0.f) ? (1.f / denom1) : 0.f;
+      } else {
+        il1 = 0.f;
+      }
     } else {
       il0 = (sm.l_smem[gid] > 0.f) ? (1.f / sm.l_smem[gid]) : 0.f;
       il1 = (sm.l_smem[gid + 8] > 0.f) ? (1.f / sm.l_smem[gid + 8]) : 0.f;

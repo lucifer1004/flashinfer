@@ -99,11 +99,15 @@ void SparseMlaSm120PagedAttention(
   // kv_cache: CUDA + last-dim contiguous only; padded block stride is OK.
   CHECK_CUDA(kv_cache);
   CHECK_LAST_DIM_CONTIGUOUS(kv_cache);
+  CHECK_INPUT_TYPE(kv_cache, dl_uint8);
   CHECK_INPUT_AND_TYPE(indices, dl_int32);
   CHECK_INPUT_AND_TYPE(output, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(out_lse, dl_float32);
 
   CHECK_DIM(3, q);
+  TVM_FFI_ICHECK_EQ(kv_cache.ndim(), 4)
+      << "kv_cache must be [num_pages, page_block_size, 1, bytes_per_token]";
+  TVM_FFI_ICHECK_EQ(indices.ndim(), 2) << "indices must be [num_tokens, topk]";
 
   const int num_tokens = static_cast<int>(q.size(0));
   const int num_heads = static_cast<int>(q.size(1));
@@ -113,10 +117,27 @@ void SparseMlaSm120PagedAttention(
 
   TVM_FFI_ICHECK_GT(num_heads, 0);
   TVM_FFI_ICHECK_LE(num_heads, 128);
+  TVM_FFI_ICHECK_GT(topk, 0);
   TVM_FFI_ICHECK_GT(page_block_size, 0);
+  TVM_FFI_ICHECK_EQ(kv_cache.size(-2), 1) << "kv_cache h_kv axis must be 1";
+  TVM_FFI_ICHECK_EQ(indices.size(0), num_tokens) << "indices must be [num_tokens, topk]";
+  TVM_FFI_ICHECK_EQ(output.ndim(), 3) << "output must be [num_tokens, num_heads, 512]";
+  TVM_FFI_ICHECK_EQ(output.size(0), num_tokens);
+  TVM_FFI_ICHECK_EQ(output.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(output.size(2), 512) << "SM120 sparse-MLA requires d_v == 512";
+  TVM_FFI_ICHECK_EQ(out_lse.ndim(), 2) << "out_lse must be [num_tokens, num_heads]";
+  TVM_FFI_ICHECK_EQ(out_lse.size(0), num_tokens);
+  TVM_FFI_ICHECK_EQ(out_lse.size(1), num_heads);
 
   const ModelType mt = infer_model_type(d_qk);
   const int stride_kv_row = effective_stride_kv_row(kv_cache);
+
+  if (topk_length.has_value()) {
+    const auto& tl = topk_length.value();
+    CHECK_INPUT_AND_TYPE(tl, dl_int32);
+    TVM_FFI_ICHECK_EQ(tl.ndim(), 1) << "topk_length must be [num_tokens]";
+    TVM_FFI_ICHECK_EQ(tl.size(0), num_tokens);
+  }
 
   // attn_sink (per-head bias added pre-softmax).
   const float* attn_sink_ptr = nullptr;
@@ -134,6 +155,10 @@ void SparseMlaSm120PagedAttention(
   int extra_page_block_size = 0;
   int extra_stride_kv_row = 0;
   int extra_topk = 0;
+  TVM_FFI_ICHECK(!extra_indices.has_value() || extra_kv_cache.has_value())
+      << "extra_indices requires extra_kv_cache";
+  TVM_FFI_ICHECK(!extra_topk_length.has_value() || extra_kv_cache.has_value())
+      << "extra_topk_length requires extra_kv_cache";
   if (extra_kv_cache.has_value()) {
     TVM_FFI_ICHECK(extra_indices.has_value()) << "extra_kv_cache requires extra_indices";
     const auto& ekv = extra_kv_cache.value();
@@ -141,12 +166,26 @@ void SparseMlaSm120PagedAttention(
     // Same relaxation as the main kv_cache: padded block stride is OK.
     CHECK_CUDA(ekv);
     CHECK_LAST_DIM_CONTIGUOUS(ekv);
+    CHECK_INPUT_TYPE(ekv, dl_uint8);
     CHECK_INPUT_AND_TYPE(eidx, dl_int32);
+    TVM_FFI_ICHECK_EQ(ekv.ndim(), 4)
+        << "extra_kv_cache must be [num_pages, page_block_size, 1, bytes_per_token]";
+    TVM_FFI_ICHECK_EQ(ekv.size(-2), 1) << "extra_kv_cache h_kv axis must be 1";
+    TVM_FFI_ICHECK_EQ(eidx.ndim(), 2) << "extra_indices must be [num_tokens, extra_topk]";
+    TVM_FFI_ICHECK_EQ(eidx.size(0), num_tokens);
     extra_kv_ptr = static_cast<const uint8_t*>(ekv.data_ptr());
     extra_idx_ptr = static_cast<const int32_t*>(eidx.data_ptr());
     extra_page_block_size = static_cast<int>(ekv.size(-3));
     extra_stride_kv_row = effective_stride_kv_row(ekv);
     extra_topk = static_cast<int>(eidx.size(-1));
+    TVM_FFI_ICHECK_GT(extra_page_block_size, 0);
+    TVM_FFI_ICHECK_GT(extra_topk, 0);
+    if (extra_topk_length.has_value()) {
+      const auto& etl = extra_topk_length.value();
+      CHECK_INPUT_AND_TYPE(etl, dl_int32);
+      TVM_FFI_ICHECK_EQ(etl.ndim(), 1) << "extra_topk_length must be [num_tokens]";
+      TVM_FFI_ICHECK_EQ(etl.size(0), num_tokens);
+    }
   }
 
   const int* tl_ptr =

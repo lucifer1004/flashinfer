@@ -37,6 +37,7 @@ enum class ModelType { DSV3_2, DSV4 };
 //   FP8:  QK and XV use UE8M0 block-scaled FP8 MMA; Q is quantized to FP8
 //         on the fly; KV stays FP8 in smem. Highest throughput.
 //   BF16: QK and XV use BF16 MMA; FP8 KV is dequantized to BF16 in smem.
-//         Lower throughput but higher accuracy. Currently not exercised
-//         by any dispatch site.
+//         Lower throughput but higher accuracy. Current dispatch sites use
+//         ComputeMode::BF16 for the DSV4 prefill path when topk == 128,
+//         including dual-cache variants.
 enum class ComputeMode { FP8, BF16 };

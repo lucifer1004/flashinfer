@@ -77,7 +77,9 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
     chunks_per_block = chunks_per_block_override;
   } else {
     int sm_count = 0;
-    DSV3_2_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0));
+    int device = 0;
+    DSV3_2_CUDA_CHECK(cudaGetDevice(&device));
+    DSV3_2_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
     if (sm_count <= 0) sm_count = 188;
     constexpr int CEIL_WAVES_MAX = 3;
     const int per_token_head = num_tokens * H_BLOCKS;
@@ -128,6 +130,7 @@ bool launch_sparse_mla_decode_dsv3_2(int num_heads, int topk, int num_tokens, in
                                      const int* topk_length, const float* attn_sink,
                                      int chunks_per_block_override, float sm_scale,
                                      size_t stride_kv_block, cudaStream_t stream) {
+  if (num_splits > DSV4_MAX_SPLITS) return false;
 #define DSV3_2_DISPATCH(H, K)                                                                  \
   if (num_heads == (H) && topk == (K)) {                                                       \
     return launch_decode_dsv3_2_impl<(H), (K)>(                                                \

@@ -112,6 +112,7 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   int pbs_extra_arg = 0;
   size_t stride_extra_kv_block = 0;
   if (extra_kv_cache.has_value()) {
+    TVM_FFI_ICHECK(extra_indices.has_value()) << "extra_kv_cache requires extra_indices";
     const auto& ekv = extra_kv_cache.value();
     extra_topk_arg = static_cast<int>(extra_indices.value().size(-1));
     if (ekv.ndim() >= 3) {

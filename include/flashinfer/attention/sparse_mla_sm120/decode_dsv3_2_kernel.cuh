@@ -374,14 +374,16 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
       local_max[0] = fmaxf(local_max[0], __shfl_xor_sync(0xffffffff, local_max[0], s));
       local_max[1] = fmaxf(local_max[1], __shfl_xor_sync(0xffffffff, local_max[1], s));
     }
+    const bool valid_half0 = local_max[0] > -1e29f;
+    const bool valid_half1 = local_max[1] > -1e29f;
     float local_sum[2] = {0.f, 0.f};
     float p[DSV3_2_QK_N_TILES][4];
 #pragma unroll
     for (int nt = 0; nt < DSV3_2_QK_N_TILES; nt++) {
-      p[nt][0] = exp2f(qk[nt][0] - local_max[0]);
-      p[nt][1] = exp2f(qk[nt][1] - local_max[0]);
-      p[nt][2] = exp2f(qk[nt][2] - local_max[1]);
-      p[nt][3] = exp2f(qk[nt][3] - local_max[1]);
+      p[nt][0] = valid_half0 ? exp2f(qk[nt][0] - local_max[0]) : 0.f;
+      p[nt][1] = valid_half0 ? exp2f(qk[nt][1] - local_max[0]) : 0.f;
+      p[nt][2] = valid_half1 ? exp2f(qk[nt][2] - local_max[1]) : 0.f;
+      p[nt][3] = valid_half1 ? exp2f(qk[nt][3] - local_max[1]) : 0.f;
       local_sum[0] += p[nt][0] + p[nt][1];
       local_sum[1] += p[nt][2] + p[nt][3];
     }

@@ -43,6 +43,18 @@
       "type": "var",
       "description": "Total allocated pages in the KV cache."
     },
+    "extra_num_pages": {
+      "type": "var",
+      "description": "Pages in the optional secondary KV cache (dual-cache mode)."
+    },
+    "extra_topk": {
+      "type": "const",
+      "description": "Top-K width for the secondary cache."
+    },
+    "extra_page_block_size": {
+      "type": "const",
+      "description": "Page block size of the secondary cache."
+    },
     "kv_bytes_per_token": {
       "type": "const",
       "value": 584,
@@ -59,7 +71,10 @@
     "kv_cache.shape[1] == page_block_size",
     "head_dim_qk == 512",
     "head_dim_v == 512",
-    "topk in (128, 512, 1024)"
+    "topk in (128, 512, 1024)",
+    "extra_indices.shape[0] == num_tokens",
+    "extra_indices.shape[-1] == extra_topk",
+    "extra_kv_cache.shape[1] == extra_page_block_size"
   ],
   "inputs": {
     "q": {
@@ -75,7 +90,7 @@
       "shape": [
         "num_pages",
         "page_block_size",
-        1,
+        "1",
         "kv_bytes_per_token"
       ],
       "dtype": "uint8",
@@ -137,6 +152,34 @@
       "dtype": "unknown",
       "optional": true,
       "description": "Effective top-k length per query token."
+    },
+    "extra_kv_cache": {
+      "shape": [
+        "extra_num_pages",
+        "extra_page_block_size",
+        "1",
+        "kv_bytes_per_token"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Optional secondary KV cache, FP8 FOOTER layout."
+    },
+    "extra_indices": {
+      "shape": [
+        "num_tokens",
+        "extra_topk"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Paged slot IDs for the secondary cache."
+    },
+    "extra_topk_length": {
+      "shape": [
+        "num_tokens"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Effective top-k length per query token for the secondary cache."
     },
     "attn_sink": {
       "shape": [

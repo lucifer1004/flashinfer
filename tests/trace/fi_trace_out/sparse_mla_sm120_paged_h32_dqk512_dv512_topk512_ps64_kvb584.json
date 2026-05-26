@@ -53,7 +53,7 @@
     "indices.shape[0] == num_tokens",
     "indices.shape[-1] == topk",
     "kv_cache.shape[1] == page_block_size",
-    "head_dim_qk in (512, 576)",
+    "head_dim_qk == 512",
     "head_dim_v == 512"
   ],
   "inputs": {

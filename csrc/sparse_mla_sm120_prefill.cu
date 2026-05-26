@@ -46,6 +46,27 @@ namespace flashinfer::sparse_mla_sm120 {
 
 namespace {
 
+constexpr int kMaxCachedCudaDevices = 32;
+
+template <typename Kernel>
+void configure_dynamic_smem_per_device(Kernel kernel, size_t smem_bytes,
+                                       bool (&configured)[kMaxCachedCudaDevices]) {
+  if (smem_bytes <= 48 * 1024) return;
+
+  int device = 0;
+  CUDA_CHECK(cudaGetDevice(&device));
+  const bool cacheable_device = device >= 0 && device < kMaxCachedCudaDevices;
+  if (cacheable_device && configured[device]) return;
+
+  const cudaError_t rc = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                              static_cast<int>(smem_bytes));
+  if (rc == cudaSuccess) {
+    if (cacheable_device) configured[device] = true;
+    return;
+  }
+  CUDA_CHECK(rc);
+}
+
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
 void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                        const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
@@ -58,11 +79,8 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
   dim3 block(BLOCK_THREADS);
 
   auto kernel = sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
-  static bool configured = false;
-  if (!configured && smem_bytes > 48 * 1024) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-    configured = true;
-  }
+  static bool configured[kMaxCachedCudaDevices] = {};
+  configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
 
   // SG is single-cache only.
   PrefillColdParams cold{sm_scale,
@@ -96,11 +114,8 @@ void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
   dim3 block(BLOCK_THREADS);
 
   auto kernel = sparse_mla_prefill_mg_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE, MG_N_HG_T>;
-  static bool configured = false;
-  if (!configured && smem_bytes > 48 * 1024) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-    configured = true;
-  }
+  static bool configured[kMaxCachedCudaDevices] = {};
+  configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
 
   PrefillColdParams cold{sm_scale,
                          num_tokens,
@@ -136,11 +151,8 @@ void launch_prefill_mg_dual_fulltile(const bf16* Q, const uint8_t* KV_cache, con
 
   auto kernel = sparse_mla_prefill_mg_dual_fulltile_kernel<MT, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE,
                                                            PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T>;
-  static bool configured = false;
-  if (!configured && smem_bytes > 48 * 1024) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-    configured = true;
-  }
+  static bool configured[kMaxCachedCudaDevices] = {};
+  configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
 
   PrefillColdParams cold{sm_scale,
                          num_tokens,
@@ -181,11 +193,8 @@ void launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cache, const int32_
 
   auto kernel = sparse_mla_prefill_mg_dual_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE,
                                                   PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T>;
-  static bool configured = false;
-  if (!configured && smem_bytes > 48 * 1024) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-    configured = true;
-  }
+  static bool configured[kMaxCachedCudaDevices] = {};
+  configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
 
   PrefillColdParams cold{sm_scale,   num_tokens, stride_kv_block, stride_kv_block_extra,
                          topk_extra, attn_sink,  topk_length_ptr, topk_length_extra_ptr};
