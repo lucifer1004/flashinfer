@@ -116,9 +116,53 @@ void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-// Dual-cache MG dispatcher. `topk_extra` is runtime (no template per value);
-// only PAGE_BLOCK_SIZE_EXTRA stays template since C4A (pbs=64) and C128A
-// (pbs=2) have distinct gmem stride layouts.
+// Dual-cache MG dispatcher. `topk_extra` is runtime; PAGE_BLOCK_SIZE_EXTRA
+// stays template because it changes the KV stride.
+template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, int PAGE_BLOCK_SIZE_EXTRA,
+          int MG_N_HG_T = MG_N_HG_DEFAULT>
+void launch_prefill_mg_dual_fulltile(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+                                     const uint8_t* KV_cache_extra, const int32_t* indices_extra,
+                                     const float* attn_sink, bf16* output, float* out_lse,
+                                     float sm_scale, int num_tokens, int topk_extra,
+                                     size_t stride_kv_block, size_t stride_kv_block_extra,
+                                     cudaStream_t stream) {
+  constexpr size_t smem_bytes = SmemLayoutMG<MT, ComputeMode::BF16>::TOTAL;
+  constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
+  static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0,
+                "NUM_HEADS must be a multiple of MG_N_HG_T * HPB");
+  constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA_LOCAL;
+  dim3 grid(num_tokens * REPLICATE_H);
+  dim3 block(BLOCK_THREADS);
+
+  auto kernel = sparse_mla_prefill_mg_dual_fulltile_kernel<MT, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE,
+                                                           PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T>;
+  static bool configured = false;
+  if (!configured && smem_bytes > 48 * 1024) {
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    configured = true;
+  }
+
+  PrefillColdParams cold{sm_scale,
+                         num_tokens,
+                         stride_kv_block,
+                         stride_kv_block_extra,
+                         topk_extra,
+                         attn_sink,
+                         /*topk_length=*/(const int*)nullptr,
+                         /*topk_length_extra=*/(const int*)nullptr};
+  cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
+  void* args[] = {(void*)&Q,
+                  (void*)&KV_cache,
+                  (void*)&indices,
+                  (void*)&KV_cache_extra,
+                  (void*)&indices_extra,
+                  (void*)&output,
+                  (void*)&out_lse,
+                  (void*)&attn_sink,
+                  (void*)&cold};
+  CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
+}
+
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
           int PAGE_BLOCK_SIZE_EXTRA, int MG_N_HG_T = MG_N_HG_DEFAULT>
 void launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
@@ -212,15 +256,8 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
       Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block, \
       topk_length_ptr, stream)
 
-// NH=16 routes through MG with MG_N_HG_T=1 (HEADS_PER_CTA=16, same shape
-// as SG) to side-step a SG-BF16-QK smem hazard at multi-wave launches:
-// q_nope_bf16 unions with w_fp8, so the next iter's BF16 Q-load races the
-// current iter's w_fp8 ldmatrix across warps. MG-BF16 is racecheck-clean
-// because it uses separate smem regions.
-// TODO(sparse-mla-sm120): fix the SG-BF16-QK race (e.g. break the
-// q_nope_bf16 / w_fp8 union or add a per-iter barrier) and drop the NH=16
-// MG fallback so SG can serve all NH ≤ HPB shapes without the smem-waste
-// MG_N_HG_T=1 layout incurs.
+// NH=16 routes through MG with MG_N_HG_T=1 to avoid SG BF16-QK smem aliasing
+// between Q staging and FP8 weight staging at multi-wave launches.
 #define DISPATCH_BY_NH_CM(CM, TK)       \
   do {                                  \
     switch (num_heads) {                \
@@ -266,9 +303,44 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
                                int num_tokens, size_t stride_kv_block, size_t stride_kv_block_extra,
                                const int* topk_length_ptr, const int* topk_length_extra_ptr,
                                cudaStream_t stream) {
-// topk_extra is runtime — no enumeration by value. Only extra_page_block_size
-// stays template (C4A: pbs=64, C128A: pbs=2). NH=16 uses MG_N_HG_T=1; SG has
-// no dual-cache support.
+  if (topk == 128 && topk_length_ptr == nullptr && topk_length_extra_ptr == nullptr &&
+      topk_extra % BI == 0 && (extra_page_block_size == 64 || extra_page_block_size == 2)) {
+#define DISPATCH_DUAL_MG_FULLTILE(NH, TK, PBSX, NHG)                                         \
+  launch_prefill_mg_dual_fulltile<ModelType::DSV4, NH, TK, 64, PBSX, NHG>(                   \
+      Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, \
+      topk_extra, stride_kv_block, stride_kv_block_extra, stream)
+
+#define DISPATCH_FULLTILE_BY_NH_PBSX(PBSX)            \
+  do {                                                \
+    switch (num_heads) {                              \
+      case 16:                                        \
+        DISPATCH_DUAL_MG_FULLTILE(16, 128, PBSX, 1);  \
+        return true;                                  \
+      case 32:                                        \
+        DISPATCH_DUAL_MG_FULLTILE(32, 128, PBSX, 2);  \
+        return true;                                  \
+      case 64:                                        \
+        DISPATCH_DUAL_MG_FULLTILE(64, 128, PBSX, 2);  \
+        return true;                                  \
+      case 128:                                       \
+        DISPATCH_DUAL_MG_FULLTILE(128, 128, PBSX, 2); \
+        return true;                                  \
+      default:                                        \
+        return false;                                 \
+    }                                                 \
+  } while (0)
+
+    if (extra_page_block_size == 64) {
+      DISPATCH_FULLTILE_BY_NH_PBSX(64);
+    } else {
+      DISPATCH_FULLTILE_BY_NH_PBSX(2);
+    }
+#undef DISPATCH_FULLTILE_BY_NH_PBSX
+#undef DISPATCH_DUAL_MG_FULLTILE
+  }
+
+// topk_extra is runtime; extra_page_block_size stays template because it
+// changes the KV stride. NH=16 uses MG_N_HG_T=1.
 #define DISPATCH_DUAL_MG_CM(CM, NH, TK, PBSX, NHG)                                                \
   launch_prefill_mg_dual<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, PBSX, NHG>(                \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens,      \

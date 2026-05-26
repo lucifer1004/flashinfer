@@ -73,6 +73,18 @@ __device__ __forceinline__ void ldmatrix_load_A_fp8(uint32_t& a0, uint32_t& a1, 
   ldmatrix_x4(a0, a1, a2, a3, smem_base + row * stride + col);
 }
 
+__device__ __forceinline__ int wfp8_row_xor(int row) { return row ^ (row >> 3); }
+
+template <bool ROW_XOR>
+__device__ __forceinline__ void ldmatrix_load_A_fp8_layout(uint32_t& a0, uint32_t& a1, uint32_t& a2,
+                                                           uint32_t& a3, const uint8_t* smem_base,
+                                                           int stride, int lane) {
+  int row = (lane & 7) + ((lane >> 3) & 1) * 8;
+  if constexpr (ROW_XOR) row = wfp8_row_xor(row);
+  int col = (lane >> 4) * 16;
+  ldmatrix_x4(a0, a1, a2, a3, smem_base + row * stride + col);
+}
+
 // FP8 B operand [8×32]
 __device__ __forceinline__ void ldmatrix_load_B_fp8(uint32_t& b0, uint32_t& b1,
                                                     const uint8_t* smem_base, int stride,
