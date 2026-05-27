@@ -124,8 +124,9 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
                                                           MERGE_DIMS_PER_THREAD>;
   dim3 grid2(num_tokens, NUM_HEADS);
   dim3 block2(MERGE_BLOCK_THREADS);
-  merge_kernel<<<grid2, block2, 0, stream>>>(mid_out, mid_lse, output, out_lse, attn_sink,
-                                             num_tokens, num_splits);
+  const size_t merge_smem_bytes = (size_t)num_splits * sizeof(float);
+  merge_kernel<<<grid2, block2, merge_smem_bytes, stream>>>(mid_out, mid_lse, output, out_lse,
+                                                            attn_sink, num_tokens, num_splits);
   CUDA_CHECK_BOOL(cudaGetLastError());
   return true;
 }
@@ -143,9 +144,7 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int pa
                                    size_t stride_extra_kv_block, int chunks_per_block_override,
                                    float sm_scale, size_t stride_kv_block, cudaStream_t stream) {
   if (mt != ModelType::DSV4 || page_block_size != 64) return false;
-  // merge_kernel statically allocates sm_lse[DSV4_MAX_SPLITS]; reject any
-  // launch whose num_splits would overflow it.
-  if (num_splits > DSV4_MAX_SPLITS) return false;
+  if (num_splits <= 0) return false;
 #define DSV4_DISPATCH(H, K)                                                                 \
   if (num_heads == (H) && topk == (K)) {                                                    \
     return launch_decode_dsv4_impl<ModelType::DSV4, (H), (K), 64>(                          \

@@ -273,6 +273,30 @@ def _ref_sparse_attn(
     return out_f.to(torch.bfloat16), lse_log2
 
 
+def _make_decode_scratch(
+    num_tokens: int,
+    num_heads: int,
+    topk: int,
+    d_v: int,
+    device: torch.device,
+    *,
+    extra_topk: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_splits = (topk + 63) // 64 + (extra_topk + 63) // 64
+    return (
+        torch.empty(
+            (num_tokens, num_heads, num_splits, d_v),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        torch.empty(
+            (num_tokens, num_heads, num_splits),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
+
+
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 _DSV4_DECODE_CONFIGS = [
@@ -342,6 +366,7 @@ def test_sparse_mla_sm120_decode_dsv4(
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
     )
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
 
     flashinfer.sparse_mla_sm120_paged_attention(
         q,
@@ -352,6 +377,8 @@ def test_sparse_mla_sm120_decode_dsv4(
         sm_scale,
         d_v=d_v,
         attn_sink=attn_sink,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
     )
 
     # FP8 KV + BF16 output tolerance. Matches the repo convention for FP8
@@ -404,6 +431,7 @@ def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation() -> None:
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
     )
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
     flashinfer.sparse_mla_sm120_paged_attention(
         q,
         kv_packed,
@@ -413,6 +441,87 @@ def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation() -> None:
         sm_scale,
         d_v=d_v,
         topk_length=topk_length,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_decode_dsv4_dual_more_than_32_splits() -> None:
+    """Dual-cache decode must handle split counts above the old merge bound."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, num_heads = 1, 16
+    topk, extra_topk = 128, 2176  # 2 + 34 = 36 splits.
+    d_qk, d_v = 512, 512
+    main_pbs, extra_pbs = 64, 2
+    main_num_blocks = 16
+    extra_num_blocks = (extra_topk + extra_pbs - 1) // extra_pbs
+    main_s_kv = main_num_blocks * main_pbs
+    extra_s_kv = extra_num_blocks * extra_pbs
+
+    main_bf16 = (
+        torch.randn(
+            main_num_blocks, main_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    extra_bf16 = (
+        torch.randn(
+            extra_num_blocks, extra_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    main_packed = quantize_kv_dsv4(main_bf16)
+    extra_packed = quantize_kv_dsv4(extra_bf16)
+    main_dequant = dequantize_kv_dsv4(main_packed)
+    extra_dequant = dequantize_kv_dsv4(extra_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    main_idx = torch.randint(
+        0, main_s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    extra_idx = torch.randint(
+        0, extra_s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
+    )
+
+    sm_scale = d_qk**-0.5
+    virtual_kv = torch.cat(
+        [main_dequant.reshape(-1, d_qk), extra_dequant.reshape(-1, d_qk)], dim=0
+    ).reshape(-1, 1, 1, d_qk)
+    virtual_idx = torch.cat(
+        [main_idx, torch.where(extra_idx < 0, extra_idx, extra_idx + main_s_kv)], dim=-1
+    )
+    ref_out, ref_lse = _ref_sparse_attn(q, virtual_kv, virtual_idx, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    wrapper = flashinfer.BatchSparseMLAPagedAttentionWrapper(
+        max_num_tokens=num_tokens,
+        max_num_heads=num_heads,
+        d_v=d_v,
+        device=device,
+    )
+    mid_out, mid_lse = _make_decode_scratch(
+        num_tokens, num_heads, topk, d_v, device, extra_topk=extra_topk
+    )
+    out_lse = wrapper.run(
+        q,
+        main_packed,
+        main_idx,
+        output,
+        sm_scale=sm_scale,
+        extra_kv_cache=extra_packed,
+        extra_indices=extra_idx,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+        return_lse=True,
     )
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
@@ -474,6 +583,7 @@ def test_sparse_mla_sm120_decode_dsv3_2(
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
     )
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
 
     flashinfer.sparse_mla_sm120_paged_attention(
         q,
@@ -484,6 +594,8 @@ def test_sparse_mla_sm120_decode_dsv3_2(
         sm_scale,
         d_v=d_v,
         attn_sink=attn_sink,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
     )
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
@@ -1173,5 +1285,19 @@ def test_sparse_mla_sm120_wrapper_class_run(model: str) -> None:
         output = torch.zeros(
             (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
         )
+        mid_out = None
+        mid_lse = None
+        if num_tokens <= 64:
+            mid_out, mid_lse = _make_decode_scratch(
+                num_tokens, num_heads, topk, d_v, device
+            )
         # No exception means the dispatch path is wired correctly.
-        wrapper.run(q, kv_packed, indices, output, sm_scale=d_qk**-0.5)
+        wrapper.run(
+            q,
+            kv_packed,
+            indices,
+            output,
+            sm_scale=d_qk**-0.5,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+        )

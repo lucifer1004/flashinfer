@@ -100,9 +100,6 @@ _DECODE_DSV4_DISPATCH = frozenset(
     }
 )
 _DECODE_DSV4_PAGE_BLOCK_SIZE = 64
-# Mirrors DSV4_MAX_SPLITS in include/.../decode_dsv4_kernel.cuh; the merge
-# kernel's sm_lse smem is statically sized to this bound.
-_DECODE_DSV4_MAX_SPLITS = 32
 
 # decode-dsv3_2 instantiation set.
 _DECODE_DSV3_2_DISPATCH = frozenset(
@@ -174,17 +171,14 @@ def _decode_dsv4_dispatchable(
 ) -> bool:
     """True iff decode-dsv4 supports this shape configuration.
 
-    The merge kernel's per-split LSE smem caps total num_splits at
-    _DECODE_DSV4_MAX_SPLITS; if the dual-cache sum exceeds that, fall through
-    to prefill rather than dispatching.
+    The split count only affects scratch size; the merge kernel stores per-split
+    LSE in dynamic shared memory.
     """
-    num_splits = (topk + _BI - 1) // _BI + (extra_topk + _BI - 1) // _BI
     return (
         num_tokens <= _DECODE_MAX_TOKENS
         and d_qk == 512
         and page_block_size == _DECODE_DSV4_PAGE_BLOCK_SIZE
         and (num_heads, topk) in _DECODE_DSV4_DISPATCH
-        and num_splits <= _DECODE_DSV4_MAX_SPLITS
     )
 
 
@@ -195,23 +189,15 @@ def _decode_scratch_views(
     num_heads: int,
     num_splits: int,
     d_v: int,
-    device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Resolve scratch buffers for the split-K decode kernels. Returns views
-    of caller-supplied buffers when present, else fresh allocations.
-    """
+    """Resolve caller-supplied scratch buffers for split-K decode kernels."""
     if mid_out is None or mid_lse is None:
-        mid_out = torch.empty(
-            (num_tokens, num_heads, num_splits, d_v),
-            dtype=torch.bfloat16,
-            device=device,
+        raise ValueError(
+            "SM120 sparse-MLA decode requires caller-supplied mid_out and "
+            "mid_lse scratch. Allocate shapes "
+            f"[{num_tokens}, {num_heads}, {num_splits}, {d_v}] bf16 and "
+            f"[{num_tokens}, {num_heads}, {num_splits}] fp32."
         )
-        mid_lse = torch.empty(
-            (num_tokens, num_heads, num_splits),
-            dtype=torch.float32,
-            device=device,
-        )
-        return mid_out, mid_lse
     need_out = (num_tokens, num_heads, num_splits, d_v)
     need_lse = (num_tokens, num_heads, num_splits)
     if any(mid_out.size(d) < need_out[d] for d in range(4)):
@@ -274,7 +260,7 @@ def get_sparse_mla_sm120_module():
             num_splits_extra = (extra_topk + _BI - 1) // _BI
             num_splits = num_splits_main + num_splits_extra
             mid_out_view, mid_lse_view = _decode_scratch_views(
-                mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v, q.device
+                mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
             )
             # FFI binding extracts the true block stride from kv_cache.stride(0),
             # so paged layouts with padded strides and microbench 2-D layouts
@@ -299,7 +285,7 @@ def get_sparse_mla_sm120_module():
         if _decode_dsv3_2_dispatchable(num_tokens, num_heads, topk, d_qk, kv_pbs):
             num_splits = (topk + _BI - 1) // _BI
             mid_out_view, mid_lse_view = _decode_scratch_views(
-                mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v, q.device
+                mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
             )
             module.sparse_mla_sm120_decode_dsv3_2(
                 q,
@@ -404,11 +390,12 @@ def sparse_mla_sm120_paged_attention(
     mid_out : Optional[torch.Tensor]
         Pre-allocated split-K partial-output scratch, shape
         ``[>=num_tokens, >=num_heads, >=num_splits, >=d_v]``, dtype bf16. Only
-        consumed by the decode path; ``None`` lets the kernel allocate per call.
+        consumed by the decode path; required when the call dispatches to a
+        decode kernel.
     mid_lse : Optional[torch.Tensor]
         Pre-allocated split-K LSE scratch, shape
         ``[>=num_tokens, >=num_heads, >=num_splits]``, dtype float32. Pair with
-        ``mid_out``.
+        ``mid_out`` when the call dispatches to a decode kernel.
 
     Notes
     -----
@@ -442,8 +429,9 @@ def sparse_mla_sm120_paged_attention(
 class BatchSparseMLAPagedAttentionWrapper:
     """Sparse-MLA paged attention wrapper for SM120 with cudagraph support.
 
-    Pre-allocates an LSE buffer at construction so :meth:`run` is
-    allocation-free and safe to capture inside a CUDA graph.
+    Pre-allocates an LSE buffer at construction. Decode split-K scratch must be
+    supplied by the caller via ``run(mid_out=..., mid_lse=...)`` so serving
+    stacks can share a single workspace across layers.
 
     Parameters
     ----------
@@ -496,20 +484,6 @@ class BatchSparseMLAPagedAttentionWrapper:
             device=self._device,
         )
 
-        # Pre-allocated split-K scratch for the decode kernels. Only used when
-        # num_tokens <= _DECODE_MAX_TOKENS; prefill writes output directly.
-        decode_t_max = min(max_num_tokens, _DECODE_MAX_TOKENS)
-        self._mid_out = torch.empty(
-            (decode_t_max, max_num_heads, _DECODE_DSV4_MAX_SPLITS, d_v),
-            dtype=torch.bfloat16,
-            device=self._device,
-        )
-        self._mid_lse = torch.empty(
-            (decode_t_max, max_num_heads, _DECODE_DSV4_MAX_SPLITS),
-            dtype=torch.float32,
-            device=self._device,
-        )
-
     # Trace fires on the inner sparse_mla_sm120_paged_attention call;
     # wrapper.run owns out_lse internally so no separate template is needed.
     @flashinfer_api
@@ -526,6 +500,8 @@ class BatchSparseMLAPagedAttentionWrapper:
         extra_kv_cache: Optional[torch.Tensor] = None,
         extra_indices: Optional[torch.Tensor] = None,
         extra_topk_length: Optional[torch.Tensor] = None,
+        mid_out: Optional[torch.Tensor] = None,
+        mid_lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
     ) -> Optional[torch.Tensor]:
         """Run sparse-MLA paged attention.
@@ -536,7 +512,8 @@ class BatchSparseMLAPagedAttentionWrapper:
 
         Accepts ``q``/``output`` either as 3-D ``[num_tokens, num_heads, head_dim]``
         or as 4-D ``[num_tokens, 1, num_heads, head_dim]`` (some callers carry
-        a singleton s_q dim); the 4-D form is squeezed in place.
+        a singleton s_q dim); the 4-D form is squeezed in place. Calls that
+        dispatch to a decode kernel must pass ``mid_out`` and ``mid_lse``.
         """
         if q.dim() == 4:
             if q.size(1) != 1:
@@ -562,6 +539,9 @@ class BatchSparseMLAPagedAttentionWrapper:
                 f"num_heads ({num_heads}) exceeds max_num_heads ({self._max_num_heads})"
             )
 
+        if (mid_out is None) != (mid_lse is None):
+            raise ValueError("mid_out and mid_lse must be passed together")
+
         out_lse_view = self._out_lse[:num_tokens, :num_heads]
         sparse_mla_sm120_paged_attention(
             q,
@@ -576,8 +556,8 @@ class BatchSparseMLAPagedAttentionWrapper:
             extra_kv_cache=extra_kv_cache,
             extra_indices=extra_indices,
             extra_topk_length=extra_topk_length,
-            mid_out=self._mid_out,
-            mid_lse=self._mid_lse,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
         )
         return out_lse_view if return_lse else None
 
@@ -894,7 +874,7 @@ def sparse_mla_sm120_decode_dsv4(
         marks invalid slots.
     mid_out : torch.Tensor
         Scratch, ``[T, num_heads, num_splits, d_v]`` bf16. ``num_splits =
-        ceil(topk / 64)``.
+        ceil(topk / 64) + ceil(extra_topk / 64)``.
     mid_lse : torch.Tensor
         Scratch, ``[T, num_heads, num_splits]`` float32.
     output : torch.Tensor

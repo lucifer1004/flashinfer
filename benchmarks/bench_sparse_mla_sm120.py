@@ -170,10 +170,18 @@ def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0)
         num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
     )
     sm_scale = d_qk**-0.5
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
 
     def fn():
         wrapper.run(
-            q, kv_packed, indices, output, sm_scale=sm_scale, attn_sink=attn_sink
+            q,
+            kv_packed,
+            indices,
+            output,
+            sm_scale=sm_scale,
+            attn_sink=attn_sink,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
         )
 
     # Warm + measure.
@@ -214,6 +222,24 @@ def _actual_extra_topk(topk_extra, extra_topk_length):
     if extra_topk_length is None:
         return topk_extra
     return min(max(extra_topk_length, 0), topk_extra)
+
+
+def _make_decode_scratch(num_tokens, num_heads, topk, d_v, device, extra_topk=0):
+    if num_tokens > 64:
+        return None, None
+    num_splits = (topk + 63) // 64 + (extra_topk + 63) // 64
+    return (
+        torch.empty(
+            (num_tokens, num_heads, num_splits, d_v),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        torch.empty(
+            (num_tokens, num_heads, num_splits),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
 
 
 def bench_sparse_mla_sm120_dsv4_dual(
@@ -273,6 +299,9 @@ def bench_sparse_mla_sm120_dsv4_dual(
         num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
     )
     sm_scale = d_qk**-0.5
+    mid_out, mid_lse = _make_decode_scratch(
+        num_tokens, num_heads, topk_main, d_v, device, extra_topk=topk_extra
+    )
 
     def fn():
         wrapper.run(
@@ -285,6 +314,8 @@ def bench_sparse_mla_sm120_dsv4_dual(
             extra_kv_cache=kv_extra,
             extra_indices=indices_extra,
             extra_topk_length=extra_topk_length_tensor,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
         )
 
     fn()
@@ -345,10 +376,18 @@ def bench_sparse_mla_sm120_dsv3_2(num_heads, num_tokens, with_sink=False, seed=0
         num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
     )
     sm_scale = d_qk**-0.5
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
 
     def fn():
         wrapper.run(
-            q, kv_packed, indices, output, sm_scale=sm_scale, attn_sink=attn_sink
+            q,
+            kv_packed,
+            indices,
+            output,
+            sm_scale=sm_scale,
+            attn_sink=attn_sink,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
         )
 
     fn()
