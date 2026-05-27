@@ -79,12 +79,27 @@ inline int effective_stride_kv_row(const TensorView& kv) {
   return block_stride_bytes / page_block_size;
 }
 
+inline int check_dense_indices_2d_or_s_q_3d(const TensorView& idx, const char* name,
+                                            int num_tokens) {
+  TVM_FFI_ICHECK(idx.ndim() == 2 || idx.ndim() == 3)
+      << name << " must be [num_tokens, topk] or [num_tokens, 1, topk]; got ndim=" << idx.ndim();
+  const int width = static_cast<int>(idx.size(-1));
+  TVM_FFI_ICHECK_EQ(idx.size(0), num_tokens) << name << " leading dimension must match num_tokens";
+  if (idx.ndim() == 3) {
+    TVM_FFI_ICHECK_EQ(idx.size(1), 1) << name << " middle dimension must be singleton";
+  }
+  TVM_FFI_ICHECK_EQ(idx.stride(-1), 1) << name << " last dimension must be contiguous";
+  TVM_FFI_ICHECK_EQ(idx.stride(0), width)
+      << name << " must be dense row-major over the token dimension";
+  return width;
+}
+
 }  // namespace
 
 void SparseMlaSm120PagedAttention(
     TensorView q,         // [num_tokens, num_heads, d_qk] bf16
     TensorView kv_cache,  // [num_pages, page_block_size, ...] paged FP8
-    TensorView indices,   // [num_tokens, topk] int32 (-1 = skip)
+    TensorView indices,   // [num_tokens, topk] or [num_tokens, 1, topk] int32 (-1 = skip)
     TensorView output,    // [num_tokens, num_heads, d_v] bf16 — in-place
     TensorView out_lse,   // [num_tokens, num_heads] f32 — in-place
     double sm_scale,
@@ -107,12 +122,11 @@ void SparseMlaSm120PagedAttention(
   CHECK_DIM(3, q);
   TVM_FFI_ICHECK_EQ(kv_cache.ndim(), 4)
       << "kv_cache must be [num_pages, page_block_size, 1, bytes_per_token]";
-  TVM_FFI_ICHECK_EQ(indices.ndim(), 2) << "indices must be [num_tokens, topk]";
 
   const int num_tokens = static_cast<int>(q.size(0));
   const int num_heads = static_cast<int>(q.size(1));
   const int d_qk = static_cast<int>(q.size(2));
-  const int topk = static_cast<int>(indices.size(-1));
+  const int topk = check_dense_indices_2d_or_s_q_3d(indices, "indices", num_tokens);
   const int page_block_size = static_cast<int>(kv_cache.size(-3));
 
   TVM_FFI_ICHECK_GT(num_heads, 0);
@@ -120,7 +134,6 @@ void SparseMlaSm120PagedAttention(
   TVM_FFI_ICHECK_GT(topk, 0);
   TVM_FFI_ICHECK_GT(page_block_size, 0);
   TVM_FFI_ICHECK_EQ(kv_cache.size(-2), 1) << "kv_cache h_kv axis must be 1";
-  TVM_FFI_ICHECK_EQ(indices.size(0), num_tokens) << "indices must be [num_tokens, topk]";
   TVM_FFI_ICHECK_EQ(output.ndim(), 3) << "output must be [num_tokens, num_heads, 512]";
   TVM_FFI_ICHECK_EQ(output.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(output.size(1), num_heads);
@@ -171,15 +184,13 @@ void SparseMlaSm120PagedAttention(
     TVM_FFI_ICHECK_EQ(ekv.ndim(), 4)
         << "extra_kv_cache must be [num_pages, page_block_size, 1, bytes_per_token]";
     TVM_FFI_ICHECK_EQ(ekv.size(-2), 1) << "extra_kv_cache h_kv axis must be 1";
-    TVM_FFI_ICHECK_EQ(eidx.ndim(), 2) << "extra_indices must be [num_tokens, extra_topk]";
-    TVM_FFI_ICHECK_EQ(eidx.size(0), num_tokens);
-    extra_kv_ptr = static_cast<const uint8_t*>(ekv.data_ptr());
-    extra_idx_ptr = static_cast<const int32_t*>(eidx.data_ptr());
     extra_page_block_size = static_cast<int>(ekv.size(-3));
     extra_stride_kv_row = effective_stride_kv_row(ekv);
-    extra_topk = static_cast<int>(eidx.size(-1));
+    extra_topk = check_dense_indices_2d_or_s_q_3d(eidx, "extra_indices", num_tokens);
     TVM_FFI_ICHECK_GT(extra_page_block_size, 0);
     TVM_FFI_ICHECK_GT(extra_topk, 0);
+    extra_kv_ptr = static_cast<const uint8_t*>(ekv.data_ptr());
+    extra_idx_ptr = static_cast<const int32_t*>(eidx.data_ptr());
     if (extra_topk_length.has_value()) {
       const auto& etl = extra_topk_length.value();
       CHECK_INPUT_AND_TYPE(etl, dl_int32);

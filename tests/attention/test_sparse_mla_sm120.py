@@ -754,6 +754,78 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
+def test_sparse_mla_sm120_prefill_dsv4_dual_accepts_singleton_s_q_indices() -> None:
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_heads, num_tokens = 32, 128
+    d_qk, d_v = 512, 512
+    topk, extra_topk = 128, 128
+    main_pbs, extra_pbs = 64, 64
+
+    main_num_blocks, extra_num_blocks = 64, 64
+    main_s_kv = main_num_blocks * main_pbs
+    extra_s_kv = extra_num_blocks * extra_pbs
+
+    main_bf16 = (
+        torch.randn(
+            main_num_blocks, main_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    extra_bf16 = (
+        torch.randn(
+            extra_num_blocks, extra_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    main_packed = quantize_kv_dsv4(main_bf16)
+    extra_packed = quantize_kv_dsv4(extra_bf16)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    main_idx = torch.randint(
+        0, main_s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    extra_idx = torch.randint(
+        0, extra_s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
+    )
+    main_idx[:, topk // 2 :] = -1
+    extra_idx[:, extra_topk // 2 :] = -1
+    attn_sink = torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
+    sm_scale = d_qk**-0.5
+
+    def run(
+        indices: torch.Tensor, extra_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output = torch.zeros(
+            (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+        )
+        out_lse = torch.zeros(
+            (num_tokens, num_heads), dtype=torch.float32, device=device
+        )
+        flashinfer.sparse_mla_sm120_paged_attention(
+            q,
+            main_packed,
+            indices,
+            output,
+            out_lse,
+            sm_scale,
+            d_v=d_v,
+            attn_sink=attn_sink,
+            extra_kv_cache=extra_packed,
+            extra_indices=extra_indices,
+        )
+        return output, out_lse
+
+    out_2d, lse_2d = run(main_idx, extra_idx)
+    out_3d, lse_3d = run(main_idx.unsqueeze(1), extra_idx.unsqueeze(1))
+
+    torch.testing.assert_close(out_3d, out_2d, atol=0, rtol=0)
+    torch.testing.assert_close(lse_3d, lse_2d, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("extra_topk_len", [0, 128, 768])
 def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
     extra_topk_len: int,

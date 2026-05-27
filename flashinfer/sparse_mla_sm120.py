@@ -372,8 +372,9 @@ def sparse_mla_sm120_paged_attention(
         Paged main KV cache, shape ``[num_blocks, page_block_size, 1, bytes]``
         with byte-packed FP8 inner dim.
     indices : torch.Tensor
-        Paged slot IDs per query token, shape ``[num_tokens, topk]``, dtype
-        int32. ``-1`` marks invalid / out-of-window slots (kernel skips).
+        Paged slot IDs per query token, shape ``[num_tokens, topk]`` or
+        ``[num_tokens, 1, topk]``, dtype int32. ``-1`` marks invalid /
+        out-of-window slots (kernel skips).
     output : torch.Tensor
         In-place output, shape ``[num_tokens, num_heads, d_v]``, dtype bf16.
     out_lse : torch.Tensor
@@ -395,7 +396,8 @@ def sparse_mla_sm120_paged_attention(
         ``extra_indices`` must also be passed. DSV4-only.
     extra_indices : Optional[torch.Tensor]
         Paged slot IDs for the secondary cache, shape
-        ``[num_tokens, extra_topk]``, dtype int32.
+        ``[num_tokens, extra_topk]`` or ``[num_tokens, 1, extra_topk]``,
+        dtype int32.
     extra_topk_length : Optional[torch.Tensor]
         Effective top-k length per query token for the secondary cache,
         shape ``[num_tokens]``, dtype int32.
