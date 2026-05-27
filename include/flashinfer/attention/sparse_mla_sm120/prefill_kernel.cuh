@@ -105,7 +105,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
   const int h_start = h_tile * HPB;
   if (s_i >= num_tokens) return;
 
-  const int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : TOPK;
+  int topk_len = cold.topk_length ? __ldg(cold.topk_length + s_i) : TOPK;
+  topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
   const int actual_ni = (topk_len + BI - 1) / BI;
 
   const int warp_rank = threadIdx.x / 32;
@@ -133,11 +134,13 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     // warps wake on mbar_kv, so reversing the order would race scales vs
     // math reads. threadfence_block ensures scale stores are visible to all
     // threads before the bulk completion event.
-    io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid,
-                                          stride_kv_block);
-    __threadfence_block();
-    io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
-        sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid, stride_kv_block, kv_l2_policy);
+    if (actual_ni > 0) {
+      io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_bufs[0], idx_base, KV_cache, io_tid,
+                                            stride_kv_block);
+      __threadfence_block();
+      io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+          sm.kv_bufs[0], idx_base, KV_cache, sm.mbar_kv + 0, io_tid, stride_kv_block, kv_l2_policy);
+    }
 
 #pragma unroll 1
     for (int ti = 0; ti < actual_ni; ti++) {
@@ -183,7 +186,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     float warp_l[2] = {0.f, 0.f};
 
     bar_sync_t<2, MATH_THREADS>();
-    mbarrier_wait_parity(sm.mbar_kv + 0, 0);
+    if (actual_ni > 0) mbarrier_wait_parity(sm.mbar_kv + 0, 0);
 
 // ── Main loop — QK + softmax + XV ───────────────────────────
 #pragma unroll 1
@@ -625,14 +628,18 @@ __device__ __forceinline__ void prefill_mg_impl(
   const int h_start = h_tile * MG_HEADS_PER_CTA;
   if (s_i >= num_tokens) return;
 
-  [[maybe_unused]] const int topk_len =
+  [[maybe_unused]] int topk_len =
       ASSUME_FULL_TILES ? TOPK : (cold.topk_length ? __ldg(cold.topk_length + s_i) : TOPK);
+  if constexpr (!ASSUME_FULL_TILES) {
+    topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
+  }
   const int actual_ni = ASSUME_FULL_TILES ? NI : ((topk_len + BI - 1) / BI);
+  const int main_ni = ASSUME_FULL_TILES ? NI : actual_ni;
 
   // Dual-cache runtime lengths.
   [[maybe_unused]] int topk_len_extra = 0;
   [[maybe_unused]] int topk_extra_declared = 0;
-  int ni_total = NI;
+  int ni_total = main_ni;
   if constexpr (DUAL_CACHE) {
     topk_extra_declared = cold.topk_extra;
     if constexpr (ASSUME_FULL_TILES) {
@@ -645,9 +652,10 @@ __device__ __forceinline__ void prefill_mg_impl(
               ? 0
               : (topk_len_extra > topk_extra_declared ? topk_extra_declared : topk_len_extra);
     }
-    ni_total = NI + (topk_len_extra + BI - 1) / BI;
+    ni_total = main_ni + (topk_len_extra + BI - 1) / BI;
   }
-  // Dual: main uses declared TOPK; extra may short-circuit to runtime length.
+  // Runtime-length variants skip empty main rows before switching to the
+  // secondary cache; fulltile variants intentionally consume all declared rows.
   const int loop_bound = DUAL_CACHE ? ni_total : actual_ni;
 
   const int warp_rank = threadIdx.x / 32;
@@ -674,50 +682,88 @@ __device__ __forceinline__ void prefill_mg_impl(
     }
     const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
-    // Prologue: gather tile 0 (always main cache; idx_base + 0). Scales first
-    // (plain stores, no mbar signal) + threadfence_block, then bulk gather
-    // (cp.async.bulk signals mbar_kv on completion). Reversing the order would
-    // race scales vs math reads on wake.
-    io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf(0), idx_base, KV_cache, io_tid,
-                                          stride_kv_block);
-    __threadfence_block();
-    io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf(0), idx_base, KV_cache, sm.mbar_kv(0),
-                                                   io_tid, stride_kv_block, kv_l2_policy);
-
+    if constexpr (ASSUME_FULL_TILES) {
+      io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf(0), idx_base, KV_cache, io_tid,
+                                            stride_kv_block);
+      __threadfence_block();
+      io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(
+          sm.kv_buf(0), idx_base, KV_cache, sm.mbar_kv(0), io_tid, stride_kv_block, kv_l2_policy);
 #pragma unroll 1
-    for (int ti = 0; ti < loop_bound; ti++) {
-      if (ti + 1 < loop_bound) {
-        if constexpr (DUAL_CACHE) {
-          const bool next_main = (ti + 1) < NI;
-          const int32_t* next_idx =
-              next_main ? (idx_base + (ti + 1) * BI) : (idx_base_extra + (ti + 1 - NI) * BI);
-          if (next_main) {
+      for (int ti = 0; ti < loop_bound; ti++) {
+        if (ti + 1 < loop_bound) {
+          if constexpr (DUAL_CACHE) {
+            const bool next_main = (ti + 1) < NI;
+            const int32_t* next_idx =
+                next_main ? (idx_base + (ti + 1) * BI) : (idx_base_extra + (ti + 1 - NI) * BI);
+            if (next_main) {
+              io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf((ti + 1) & 1), next_idx,
+                                                    KV_cache, io_tid, stride_kv_block);
+              __threadfence_block();
+              io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf((ti + 1) & 1), next_idx,
+                                                             KV_cache, sm.mbar_kv((ti + 1) & 1),
+                                                             io_tid, stride_kv_block, kv_l2_policy);
+            } else {
+              io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(sm.kv_scale_buf((ti + 1) & 1), next_idx,
+                                                          KV_cache_extra, io_tid,
+                                                          stride_kv_block_extra);
+              __threadfence_block();
+              io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
+                  sm.kv_buf((ti + 1) & 1), next_idx, KV_cache_extra, sm.mbar_kv((ti + 1) & 1),
+                  io_tid, stride_kv_block_extra, kv_l2_policy);
+            }
+          } else {
+            const int32_t* next_idx = idx_base + (ti + 1) * BI;
             io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf((ti + 1) & 1), next_idx, KV_cache,
                                                   io_tid, stride_kv_block);
             __threadfence_block();
             io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf((ti + 1) & 1), next_idx,
                                                            KV_cache, sm.mbar_kv((ti + 1) & 1),
                                                            io_tid, stride_kv_block, kv_l2_policy);
+          }
+        }
+        bar_sync_t<1, BLOCK_THREADS>();
+      }
+    } else {
+      auto issue_tile = [&](int logical_ti, int buf) {
+        if constexpr (DUAL_CACHE) {
+          const bool is_main_tile = logical_ti < main_ni;
+          const int32_t* tile_idx = is_main_tile ? (idx_base + logical_ti * BI)
+                                                 : (idx_base_extra + (logical_ti - main_ni) * BI);
+          if (is_main_tile) {
+            io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf(buf), tile_idx, KV_cache, io_tid,
+                                                  stride_kv_block);
+            __threadfence_block();
+            io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf(buf), tile_idx, KV_cache,
+                                                           sm.mbar_kv(buf), io_tid, stride_kv_block,
+                                                           kv_l2_policy);
           } else {
-            io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(sm.kv_scale_buf((ti + 1) & 1), next_idx,
-                                                        KV_cache_extra, io_tid,
-                                                        stride_kv_block_extra);
+            io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
+                sm.kv_scale_buf(buf), tile_idx, KV_cache_extra, io_tid, stride_kv_block_extra);
             __threadfence_block();
             io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
-                sm.kv_buf((ti + 1) & 1), next_idx, KV_cache_extra, sm.mbar_kv((ti + 1) & 1), io_tid,
+                sm.kv_buf(buf), tile_idx, KV_cache_extra, sm.mbar_kv(buf), io_tid,
                 stride_kv_block_extra, kv_l2_policy);
           }
         } else {
-          const int32_t* next_idx = idx_base + (ti + 1) * BI;
-          io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf((ti + 1) & 1), next_idx, KV_cache,
-                                                io_tid, stride_kv_block);
+          const int32_t* tile_idx = idx_base + logical_ti * BI;
+          io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf(buf), tile_idx, KV_cache, io_tid,
+                                                stride_kv_block);
           __threadfence_block();
-          io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf((ti + 1) & 1), next_idx,
-                                                         KV_cache, sm.mbar_kv((ti + 1) & 1), io_tid,
-                                                         stride_kv_block, kv_l2_policy);
+          io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf(buf), tile_idx, KV_cache,
+                                                         sm.mbar_kv(buf), io_tid, stride_kv_block,
+                                                         kv_l2_policy);
         }
+      };
+
+      if (loop_bound > 0) issue_tile(0, 0);
+
+#pragma unroll 1
+      for (int ti = 0; ti < loop_bound; ti++) {
+        if (ti + 1 < loop_bound) {
+          issue_tile(ti + 1, (ti + 1) & 1);
+        }
+        bar_sync_t<1, BLOCK_THREADS>();
       }
-      bar_sync_t<1, BLOCK_THREADS>();
     }
 
     // ── Math warps ──────────────────────────────────────────────────
@@ -774,7 +820,11 @@ __device__ __forceinline__ void prefill_mg_impl(
     float warp_l_partial[MG_N_HG][2] = {};
 
     bar_sync_t<2, MATH_THREADS>();
-    mbarrier_wait_parity(sm.mbar_kv(0), 0);
+    if constexpr (ASSUME_FULL_TILES) {
+      mbarrier_wait_parity(sm.mbar_kv(0), 0);
+    } else {
+      if (loop_bound > 0) mbarrier_wait_parity(sm.mbar_kv(0), 0);
+    }
 
     // ── Main loop ───────────────────────────────────────────────
 #pragma unroll 1
@@ -789,8 +839,8 @@ __device__ __forceinline__ void prefill_mg_impl(
       size_t stride_kv_block_now;
       bool is_main = true;
       if constexpr (DUAL_CACHE) {
-        is_main = (ti < NI);
-        ib = is_main ? (idx_base + ti * BI) : (idx_base_extra + (ti - NI) * BI);
+        is_main = (ti < main_ni);
+        ib = is_main ? (idx_base + ti * BI) : (idx_base_extra + (ti - main_ni) * BI);
         kv_global = is_main ? KV_cache : KV_cache_extra;
         stride_kv_block_now = is_main ? stride_kv_block : stride_kv_block_extra;
       } else {
@@ -910,7 +960,7 @@ __device__ __forceinline__ void prefill_mg_impl(
                   }
                 }
               } else {
-                int a0 = (ti - NI) * BI + e0, a1 = (ti - NI) * BI + e1;
+                int a0 = (ti - main_ni) * BI + e0, a1 = (ti - main_ni) * BI + e1;
                 if (a0 >= topk_len_extra) {
                   qk[0] = -1e30f;
                   qk[2] = -1e30f;
@@ -1023,8 +1073,8 @@ __device__ __forceinline__ void prefill_mg_impl(
           compute_qk_rope(qk, q_rope_regs[g], rope_pf);
 
           // Invalid index masking + topk_length overflow. Dual splits per phase
-          // (main: absolute ti*BI+e vs topk_len; extra: relative (ti-NI)*BI+e
-          // vs topk_len_extra).
+          // (main: absolute ti*BI+e vs topk_len; extra: relative
+          // (ti-main_ni)*BI+e vs topk_len_extra).
           {
             int e0 = qk_nb + tid * 2, e1 = e0 + 1;
             if (ib[e0] < 0) {
@@ -1049,7 +1099,7 @@ __device__ __forceinline__ void prefill_mg_impl(
                   }
                 }
               } else {
-                int a0 = (ti - NI) * BI + e0, a1 = (ti - NI) * BI + e1;
+                int a0 = (ti - main_ni) * BI + e0, a1 = (ti - main_ni) * BI + e1;
                 if (a0 >= topk_len_extra) {
                   qk[0] = -1e30f;
                   qk[2] = -1e30f;

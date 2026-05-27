@@ -850,6 +850,126 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
+def test_sparse_mla_sm120_prefill_dsv4_dual_zero_main_topk() -> None:
+    """When main topk_length is zero, main indices past the runtime length may be
+    uninitialized by callers and must not be read by the dual-cache prefill path.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_heads, num_tokens = 32, 128
+    d_qk, d_v = 512, 512
+    topk = 128
+    main_pbs = 64
+    extra_topk = 128
+    extra_pbs = 2
+
+    main_num_blocks = 4
+    main_s_kv = main_num_blocks * main_pbs
+    extra_num_blocks = (extra_topk + extra_pbs - 1) // extra_pbs + 8
+    extra_s_kv = extra_num_blocks * extra_pbs
+
+    main_bf16 = (
+        torch.randn(
+            main_num_blocks, main_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    main_packed = quantize_kv_dsv4(main_bf16)
+    main_dequant = dequantize_kv_dsv4(main_packed)
+
+    extra_bf16 = (
+        torch.randn(
+            extra_num_blocks, extra_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    extra_packed = quantize_kv_dsv4(extra_bf16)
+    extra_dequant = dequantize_kv_dsv4(extra_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    main_idx = torch.full(
+        (num_tokens, topk), main_s_kv + 1_000_000, device=device, dtype=torch.int32
+    )
+    extra_idx = torch.randint(
+        0, extra_s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
+    )
+    topk_length = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    extra_topk_length = torch.full(
+        (num_tokens,), extra_topk, dtype=torch.int32, device=device
+    )
+    sm_scale = d_qk**-0.5
+
+    virtual_kv = torch.cat(
+        [main_dequant.reshape(-1, d_qk), extra_dequant.reshape(-1, d_qk)], dim=0
+    ).reshape(-1, 1, 1, d_qk)
+    main_idx_ref = torch.full_like(main_idx, -1)
+    extra_idx_shifted = extra_idx + main_s_kv
+    virtual_idx = torch.cat([main_idx_ref, extra_idx_shifted], dim=-1)
+    ref_out, ref_lse = _ref_sparse_attn(q, virtual_kv, virtual_idx, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    flashinfer.sparse_mla_sm120_paged_attention(
+        q,
+        main_packed,
+        main_idx,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        topk_length=topk_length,
+        extra_kv_cache=extra_packed,
+        extra_indices=extra_idx,
+        extra_topk_length=extra_topk_length,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_prefill_dsv3_2_sg_zero_topk_length() -> None:
+    """SG prefill must not prefetch tile 0 when runtime topk_length is zero."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, num_heads = 128, 8
+    d_qk, d_v = 576, 512
+    topk = 2048
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    kv_cache = torch.empty((1, 64, 1, 656), dtype=torch.uint8, device=device)
+    indices = torch.full(
+        (num_tokens, topk), 1_000_000, dtype=torch.int32, device=device
+    )
+    topk_length = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    output = torch.empty(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=device)
+
+    flashinfer.sparse_mla_sm120_paged_attention(
+        q,
+        kv_cache,
+        indices,
+        output,
+        out_lse,
+        d_qk**-0.5,
+        d_v=d_v,
+        topk_length=topk_length,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, torch.zeros_like(output))
+    torch.testing.assert_close(out_lse, torch.full_like(out_lse, -1e30))
+
+
 # Runtime topk_extra should not require a dedicated template instantiation.
 @pytest.mark.parametrize("extra_topk,extra_pbs", [(1024, 2), (1664, 2), (1024, 64)])
 def test_sparse_mla_sm120_prefill_dsv4_dual_runtime_extra_topk(
