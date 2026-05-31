@@ -933,11 +933,10 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_prefill_dsv4_hca_local_dense() -> None:
-    """Native HCA prefill path: no extra indices, dense local HCA slots."""
+def _run_sparse_mla_sm120_dsv4_hca_local_dense(num_tokens: int) -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
-    num_tokens, num_heads = 128, 32
+    num_heads = 32
     d_qk, d_v = 512, 512
     topk, hca_topk = 128, 128
     main_pbs, hca_pbs = 64, 2
@@ -1011,6 +1010,16 @@ def test_sparse_mla_sm120_prefill_dsv4_hca_local_dense() -> None:
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_decode_dsv4_hca_local_dense() -> None:
+    """Native HCA decode path: no extra indices, dense local HCA slots."""
+    _run_sparse_mla_sm120_dsv4_hca_local_dense(num_tokens=8)
+
+
+def test_sparse_mla_sm120_prefill_dsv4_hca_local_dense() -> None:
+    """Native HCA prefill path: no extra indices, dense local HCA slots."""
+    _run_sparse_mla_sm120_dsv4_hca_local_dense(num_tokens=128)
 
 
 def test_sparse_mla_sm120_decode_dsv4_hca_block_table() -> None:

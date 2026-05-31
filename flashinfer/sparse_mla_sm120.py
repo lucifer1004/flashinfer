@@ -254,10 +254,8 @@ def get_sparse_mla_sm120_module():
         )
         topk_length = _clamp_topk_length(topk_length, topk)
         extra_topk_length = _clamp_topk_length(extra_topk_length, extra_topk)
-        native_hca = extra_indices is None and hca_max_topk > 0
         if (
-            not native_hca
-            and kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
+            kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE
             and _decode_dsv4_dispatchable(
                 num_tokens, num_heads, topk, d_qk, kv_pbs, extra_topk
             )
@@ -285,6 +283,7 @@ def get_sparse_mla_sm120_module():
                 extra_kv_cache=extra_kv_cache,
                 extra_indices=extra_indices,
                 extra_topk_length=extra_topk_length,
+                hca_max_topk=hca_max_topk,
             )
             return
 
@@ -656,10 +655,13 @@ class BatchSparseMLAPagedAttentionWrapper:
             )
         hca_lengths = _clamp_topk_length(hca_lengths, self._max_hca_topk)
 
+        if (hca_block_table is None) != (hca_token_to_req_indices is None):
+            raise ValueError(
+                "hca_block_table and hca_token_to_req_indices must be passed together"
+            )
+
         if (
-            hca_block_table is not None
-            and hca_token_to_req_indices is not None
-            and _decode_dsv4_dispatchable(
+            _decode_dsv4_dispatchable(
                 num_tokens,
                 num_heads,
                 indices.shape[-1],

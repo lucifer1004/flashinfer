@@ -249,9 +249,9 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     const int section_len = is_extra ? extra_topk_len : topk_len;
     const int g_start = chunk_in_section * DSV4_CAND_WINDOW;
     const int g_end = min(g_start + DSV4_CAND_WINDOW, section_len);
-    const bool extra_dense_hca = is_extra && extra_indices == nullptr && hca_block_table != nullptr;
+    const bool extra_native_hca = is_extra && extra_indices == nullptr;
     const int32_t* section_idx_base =
-        is_extra ? (extra_dense_hca ? nullptr : extra_indices + (size_t)t_idx * extra_topk)
+        is_extra ? (extra_native_hca ? nullptr : extra_indices + (size_t)t_idx * extra_topk)
                  : idx_base;
     const uint8_t* section_kv = is_extra ? extra_KV_cache : KV_cache;
     const size_t section_stride = is_extra ? stride_extra_kv_block : stride_kv_block;
@@ -263,7 +263,8 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     bf16* kv_rope_dst = sm.kv_rope(buf);
     uint8_t* kv_sc_dst = sm.kv_sc(buf);
     auto load_section_idx = [&](int cand_pos) -> int32_t {
-      if (extra_dense_hca) {
+      if (extra_native_hca) {
+        if (hca_block_table == nullptr) return cand_pos;
         const int req_idx = hca_token_to_req_indices[t_idx];
         const int block_idx = cand_pos / section_pbs;
         const int block_offset = cand_pos - block_idx * section_pbs;
@@ -445,14 +446,14 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     // Mask invalid cands + sm_scale × LOG2E. Invalid = position past
     // section_len OR slot id = -1 (indexer-padded; IO already gathered slot 0
     // into smem with idx clamped — masking to -inf kills it in softmax).
-    const bool extra_dense_hca =
-        is_extra_chunk && extra_indices == nullptr && hca_block_table != nullptr;
+    const bool extra_native_hca = is_extra_chunk && extra_indices == nullptr;
     const int32_t* section_idx_base =
         is_extra_chunk
-            ? (extra_dense_hca ? nullptr : extra_indices + (size_t)t_idx * extra_topk)
+            ? (extra_native_hca ? nullptr : extra_indices + (size_t)t_idx * extra_topk)
             : idx_base;
     auto load_section_idx = [&](int cand_pos) -> int32_t {
-      if (extra_dense_hca) {
+      if (extra_native_hca) {
+        if (hca_block_table == nullptr) return cand_pos;
         const int req_idx = hca_token_to_req_indices[t_idx];
         const int block_idx = cand_pos / pbs_extra;
         const int block_offset = cand_pos - block_idx * pbs_extra;

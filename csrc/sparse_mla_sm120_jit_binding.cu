@@ -127,24 +127,27 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
     if (extra_indices.has_value()) {
       extra_topk_arg = static_cast<int>(extra_indices.value().size(-1));
     } else {
-      TVM_FFI_ICHECK(hca_block_table.has_value())
-          << "extra_kv_cache without extra_indices requires hca_block_table";
-      TVM_FFI_ICHECK(hca_token_to_req_indices.has_value())
-          << "extra_kv_cache without extra_indices requires hca_token_to_req_indices";
       TVM_FFI_ICHECK_GT(hca_max_topk, 0)
           << "extra_kv_cache without extra_indices requires hca_max_topk > 0";
-      const auto& hbt = hca_block_table.value();
-      const auto& hreq = hca_token_to_req_indices.value();
-      CHECK_INPUT_AND_TYPE(hbt, dl_int32);
-      CHECK_INPUT_AND_TYPE(hreq, dl_int32);
-      CHECK_DIM(2, hbt);
-      CHECK_DIM(1, hreq);
-      TVM_FFI_ICHECK_EQ(hreq.size(0), num_tokens);
       extra_topk_arg = static_cast<int>(hca_max_topk);
-      hca_block_table_ptr = static_cast<const int32_t*>(hbt.data_ptr());
-      hca_token_to_req_ptr = static_cast<const int32_t*>(hreq.data_ptr());
-      hca_block_table_stride = static_cast<int>(hbt.stride(0));
-      hca_block_table_cols = static_cast<int>(hbt.size(1));
+      if (hca_block_table.has_value()) {
+        TVM_FFI_ICHECK(hca_token_to_req_indices.has_value())
+            << "hca_block_table requires hca_token_to_req_indices";
+        const auto& hbt = hca_block_table.value();
+        const auto& hreq = hca_token_to_req_indices.value();
+        CHECK_INPUT_AND_TYPE(hbt, dl_int32);
+        CHECK_INPUT_AND_TYPE(hreq, dl_int32);
+        CHECK_DIM(2, hbt);
+        CHECK_DIM(1, hreq);
+        TVM_FFI_ICHECK_EQ(hreq.size(0), num_tokens);
+        hca_block_table_ptr = static_cast<const int32_t*>(hbt.data_ptr());
+        hca_token_to_req_ptr = static_cast<const int32_t*>(hreq.data_ptr());
+        hca_block_table_stride = static_cast<int>(hbt.stride(0));
+        hca_block_table_cols = static_cast<int>(hbt.size(1));
+      } else {
+        TVM_FFI_ICHECK(!hca_token_to_req_indices.has_value())
+            << "hca_token_to_req_indices requires hca_block_table";
+      }
     }
     if (ekv.ndim() >= 3) {
       pbs_extra_arg = static_cast<int>(ekv.size(-3));
