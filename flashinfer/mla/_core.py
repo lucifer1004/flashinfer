@@ -871,7 +871,6 @@ class BatchMLAPagedAttentionWrapper:
         max_num_tokens: Optional[int] = None,
         max_num_heads: Optional[int] = None,
         d_v: int = 512,
-        max_hca_topk: int = 0,
         device: Optional[torch.device] = None,
     ) -> None:
         r"""Constructor for BatchMLAPagedAttentionWrapper.
@@ -914,9 +913,6 @@ class BatchMLAPagedAttentionWrapper:
         max_num_heads : Optional[int]
             Required when ``backend="sparse-sm120"``. Maximum sparse MLA heads
             accepted by :meth:`run_sparse_mla`.
-        max_hca_topk : int
-            Maximum HCA top-k for :meth:`run_sparse_mla_hca` when
-            ``backend="sparse-sm120"``.
         """
         if backend == "sparse-sm120":
             if max_num_tokens is None:
@@ -940,7 +936,6 @@ class BatchMLAPagedAttentionWrapper:
                 max_num_tokens=max_num_tokens,
                 max_num_heads=max_num_heads,
                 d_v=d_v,
-                max_hca_topk=max_hca_topk,
                 device=sparse_device,
             )
             return
@@ -1105,39 +1100,6 @@ class BatchMLAPagedAttentionWrapper:
             return_lse=return_lse,
         )
 
-    @flashinfer_api
-    def run_sparse_mla_hca(
-        self,
-        q: torch.Tensor,
-        kv_cache: torch.Tensor,
-        indices: torch.Tensor,
-        output: torch.Tensor,
-        sm_scale: float,
-        *,
-        hca_kv_cache: torch.Tensor,
-        hca_lengths: torch.Tensor,
-        hca_block_table: Optional[torch.Tensor] = None,
-        hca_token_to_req_indices: Optional[torch.Tensor] = None,
-        topk_length: Optional[torch.Tensor] = None,
-        attn_sink: Optional[torch.Tensor] = None,
-        return_lse: bool = False,
-    ) -> Optional[torch.Tensor]:
-        r"""Run DSv4 HCA sparse MLA through the standard MLA wrapper namespace."""
-        return self._require_sparse_sm120_wrapper().run_hca(
-            q,
-            kv_cache,
-            indices,
-            output,
-            sm_scale,
-            hca_kv_cache=hca_kv_cache,
-            hca_lengths=hca_lengths,
-            hca_block_table=hca_block_table,
-            hca_token_to_req_indices=hca_token_to_req_indices,
-            topk_length=topk_length,
-            attn_sink=attn_sink,
-            return_lse=return_lse,
-        )
-
     @overload
     def run(
         self,
@@ -1222,8 +1184,7 @@ class BatchMLAPagedAttentionWrapper:
         """
         if self._backend == "sparse-sm120":
             raise ValueError(
-                "backend='sparse-sm120' uses run_sparse_mla() or "
-                "run_sparse_mla_hca() instead of run()"
+                "backend='sparse-sm120' uses run_sparse_mla() instead of run()"
             )
         if self._backend == "cutlass":
             if return_lse:

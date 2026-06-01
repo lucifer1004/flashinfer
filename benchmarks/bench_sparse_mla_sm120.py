@@ -53,16 +53,6 @@ _D_QK_DSV4 = 512
 _D_V = 512
 
 
-def _make_sparse_mla_wrapper(num_tokens, num_heads, d_v, device):
-    return flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        torch.empty(1, dtype=torch.int8, device=device),
-        backend="sparse-sm120",
-        max_num_tokens=num_tokens,
-        max_num_heads=num_heads,
-        d_v=d_v,
-    )
-
-
 # ── FP8 FOOTER pack (DSV4) ───────────────────────────────────────────────────
 
 
@@ -173,7 +163,9 @@ def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0)
         else None
     )
 
-    wrapper = _make_sparse_mla_wrapper(num_tokens, num_heads, d_v, device)
+    wrapper = flashinfer.BatchSparseMLAPagedAttentionWrapper(
+        max_num_tokens=num_tokens, max_num_heads=num_heads, d_v=d_v, device=device
+    )
     output = torch.zeros(
         num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
     )
@@ -181,7 +173,7 @@ def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0)
     mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
 
     def fn():
-        wrapper.run_sparse_mla(
+        wrapper.run(
             q,
             kv_packed,
             indices,
@@ -300,7 +292,9 @@ def bench_sparse_mla_sm120_dsv4_dual(
             (num_tokens,), extra_topk_length, device=device, dtype=torch.int32
         )
 
-    wrapper = _make_sparse_mla_wrapper(num_tokens, num_heads, d_v, device)
+    wrapper = flashinfer.BatchSparseMLAPagedAttentionWrapper(
+        max_num_tokens=num_tokens, max_num_heads=num_heads, d_v=d_v, device=device
+    )
     output = torch.zeros(
         num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
     )
@@ -310,7 +304,7 @@ def bench_sparse_mla_sm120_dsv4_dual(
     )
 
     def fn():
-        wrapper.run_sparse_mla(
+        wrapper.run(
             q,
             kv_main,
             indices,
@@ -375,7 +369,9 @@ def bench_sparse_mla_sm120_dsv3_2(num_heads, num_tokens, with_sink=False, seed=0
         else None
     )
 
-    wrapper = _make_sparse_mla_wrapper(num_tokens, num_heads, d_v, device)
+    wrapper = flashinfer.BatchSparseMLAPagedAttentionWrapper(
+        max_num_tokens=num_tokens, max_num_heads=num_heads, d_v=d_v, device=device
+    )
     output = torch.zeros(
         num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
     )
@@ -383,7 +379,7 @@ def bench_sparse_mla_sm120_dsv3_2(num_heads, num_tokens, with_sink=False, seed=0
     mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
 
     def fn():
-        wrapper.run_sparse_mla(
+        wrapper.run(
             q,
             kv_packed,
             indices,

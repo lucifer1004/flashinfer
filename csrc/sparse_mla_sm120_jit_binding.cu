@@ -20,7 +20,7 @@ void SparseMlaSm120PagedAttention(TensorView q, TensorView kv_cache, TensorView 
                                   Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
                                   Optional<TensorView> extra_kv_cache,
                                   Optional<TensorView> extra_indices,
-                                  Optional<TensorView> extra_topk_length, int64_t hca_max_topk);
+                                  Optional<TensorView> extra_topk_length);
 
 bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int page_block_size,
                                    int num_tokens, int num_splits, const bf16* Q,
@@ -29,11 +29,7 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int pa
                                    const int* topk_length, const float* attn_sink,
                                    const uint8_t* extra_KV_cache, const int32_t* extra_indices,
                                    const int* extra_topk_length, int extra_topk, int pbs_extra,
-                                   size_t stride_extra_kv_block,
-                                   const int32_t* hca_block_table, int hca_block_table_stride,
-                                   int hca_block_table_cols,
-                                   const int32_t* hca_token_to_req_indices,
-                                   int chunks_per_block_override,
+                                   size_t stride_extra_kv_block, int chunks_per_block_override,
                                    float sm_scale, size_t stride_kv_block, cudaStream_t stream);
 
 bool launch_sparse_mla_decode_dsv3_2(int num_heads, int topk, int num_tokens, int num_splits,
@@ -53,9 +49,6 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
                               Optional<TensorView> extra_kv_cache,
                               Optional<TensorView> extra_indices,
                               Optional<TensorView> extra_topk_length,
-                              Optional<TensorView> hca_block_table,
-                              Optional<TensorView> hca_token_to_req_indices,
-                              int64_t hca_max_topk,
                               int64_t chunks_per_block_override) {
   TVM_FFI_ICHECK_EQ(q.ndim(), 3) << "q must be [T, H, D_QK]";
   TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2) << "kv_cache must be 2D [num_blocks, page_bytes] or 4D "
@@ -118,37 +111,10 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   int extra_topk_arg = 0;
   int pbs_extra_arg = 0;
   size_t stride_extra_kv_block = 0;
-  const int32_t* hca_block_table_ptr = nullptr;
-  const int32_t* hca_token_to_req_ptr = nullptr;
-  int hca_block_table_stride = 0;
-  int hca_block_table_cols = 0;
   if (extra_kv_cache.has_value()) {
+    TVM_FFI_ICHECK(extra_indices.has_value()) << "extra_kv_cache requires extra_indices";
     const auto& ekv = extra_kv_cache.value();
-    if (extra_indices.has_value()) {
-      extra_topk_arg = static_cast<int>(extra_indices.value().size(-1));
-    } else {
-      TVM_FFI_ICHECK_GT(hca_max_topk, 0)
-          << "extra_kv_cache without extra_indices requires hca_max_topk > 0";
-      extra_topk_arg = static_cast<int>(hca_max_topk);
-      if (hca_block_table.has_value()) {
-        TVM_FFI_ICHECK(hca_token_to_req_indices.has_value())
-            << "hca_block_table requires hca_token_to_req_indices";
-        const auto& hbt = hca_block_table.value();
-        const auto& hreq = hca_token_to_req_indices.value();
-        CHECK_INPUT_AND_TYPE(hbt, dl_int32);
-        CHECK_INPUT_AND_TYPE(hreq, dl_int32);
-        CHECK_DIM(2, hbt);
-        CHECK_DIM(1, hreq);
-        TVM_FFI_ICHECK_EQ(hreq.size(0), num_tokens);
-        hca_block_table_ptr = static_cast<const int32_t*>(hbt.data_ptr());
-        hca_token_to_req_ptr = static_cast<const int32_t*>(hreq.data_ptr());
-        hca_block_table_stride = static_cast<int>(hbt.stride(0));
-        hca_block_table_cols = static_cast<int>(hbt.size(1));
-      } else {
-        TVM_FFI_ICHECK(!hca_token_to_req_indices.has_value())
-            << "hca_token_to_req_indices requires hca_block_table";
-      }
-    }
+    extra_topk_arg = static_cast<int>(extra_indices.value().size(-1));
     if (ekv.ndim() >= 3) {
       pbs_extra_arg = static_cast<int>(ekv.size(-3));
       // Use stride(0) to capture true block stride including any padding.
@@ -159,10 +125,6 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
       stride_extra_kv_block = static_cast<size_t>(ekv.size(1));
       pbs_extra_arg = static_cast<int>(stride_extra_kv_block / BPT_DSV4);
     }
-  } else {
-    TVM_FFI_ICHECK(!hca_block_table.has_value()) << "hca_block_table requires extra_kv_cache";
-    TVM_FFI_ICHECK(!hca_token_to_req_indices.has_value())
-        << "hca_token_to_req_indices requires extra_kv_cache";
   }
 
   cudaStream_t stream = get_stream(q.device());
@@ -173,7 +135,6 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
       static_cast<float*>(mid_lse.data_ptr()), static_cast<bf16*>(output.data_ptr()),
       static_cast<float*>(out_lse.data_ptr()), topk_len_ptr, attn_sink_ptr, extra_kv_ptr,
       extra_indices_ptr, extra_topk_len_ptr, extra_topk_arg, pbs_extra_arg, stride_extra_kv_block,
-      hca_block_table_ptr, hca_block_table_stride, hca_block_table_cols, hca_token_to_req_ptr,
       static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale), stride_kv_block,
       stream);
   TVM_FFI_ICHECK(ok) << "decode-dsv4 launch failed (unsupported shape or kernel error)";

@@ -677,9 +677,8 @@ __device__ __forceinline__ void prefill_mg_impl(
     const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
     const int32_t* idx_base = indices + (size_t)s_i * TOPK;
     [[maybe_unused]] const int32_t* idx_base_extra = nullptr;
-    [[maybe_unused]] const bool extra_dense = DUAL_CACHE && (indices_extra == nullptr);
     if constexpr (DUAL_CACHE) {
-      if (!extra_dense) idx_base_extra = indices_extra + (size_t)s_i * topk_extra_declared;
+      idx_base_extra = indices_extra + (size_t)s_i * topk_extra_declared;
     }
     const uint64_t kv_l2_policy = create_l2_evict_first_policy();
 
@@ -693,26 +692,17 @@ __device__ __forceinline__ void prefill_mg_impl(
       for (int ti = 0; ti < loop_bound; ti++) {
         if (ti + 1 < loop_bound) {
           if constexpr (DUAL_CACHE) {
-            const bool next_main = (ti + 1) < main_ni;
+            const bool next_main = (ti + 1) < NI;
+            const int32_t* next_idx =
+                next_main ? (idx_base + (ti + 1) * BI) : (idx_base_extra + (ti + 1 - NI) * BI);
             if (next_main) {
-              const int32_t* next_idx = idx_base + (ti + 1) * BI;
               io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf((ti + 1) & 1), next_idx,
                                                     KV_cache, io_tid, stride_kv_block);
               __threadfence_block();
               io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf((ti + 1) & 1), next_idx,
                                                              KV_cache, sm.mbar_kv((ti + 1) & 1),
                                                              io_tid, stride_kv_block, kv_l2_policy);
-            } else if (extra_dense) {
-              const int tile_base_extra = (ti + 1 - main_ni) * BI;
-              io_gather_scales_dense<MT, PAGE_BLOCK_SIZE_EXTRA>(
-                  sm.kv_scale_buf((ti + 1) & 1), tile_base_extra, KV_cache_extra, io_tid,
-                  stride_kv_block_extra);
-              __threadfence_block();
-              io_bulk_gather_tile_dense<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
-                  sm.kv_buf((ti + 1) & 1), tile_base_extra, KV_cache_extra,
-                  sm.mbar_kv((ti + 1) & 1), io_tid, stride_kv_block_extra, kv_l2_policy);
             } else {
-              const int32_t* next_idx = idx_base_extra + (ti + 1 - main_ni) * BI;
               io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(sm.kv_scale_buf((ti + 1) & 1), next_idx,
                                                           KV_cache_extra, io_tid,
                                                           stride_kv_block_extra);
@@ -737,24 +727,16 @@ __device__ __forceinline__ void prefill_mg_impl(
       auto issue_tile = [&](int logical_ti, int buf) {
         if constexpr (DUAL_CACHE) {
           const bool is_main_tile = logical_ti < main_ni;
+          const int32_t* tile_idx = is_main_tile ? (idx_base + logical_ti * BI)
+                                                 : (idx_base_extra + (logical_ti - main_ni) * BI);
           if (is_main_tile) {
-            const int32_t* tile_idx = idx_base + logical_ti * BI;
             io_gather_scales<MT, PAGE_BLOCK_SIZE>(sm.kv_scale_buf(buf), tile_idx, KV_cache, io_tid,
                                                   stride_kv_block);
             __threadfence_block();
             io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true>(sm.kv_buf(buf), tile_idx, KV_cache,
                                                            sm.mbar_kv(buf), io_tid, stride_kv_block,
                                                            kv_l2_policy);
-          } else if (extra_dense) {
-            const int tile_base_extra = (logical_ti - main_ni) * BI;
-            io_gather_scales_dense<MT, PAGE_BLOCK_SIZE_EXTRA>(
-                sm.kv_scale_buf(buf), tile_base_extra, KV_cache_extra, io_tid, stride_kv_block_extra);
-            __threadfence_block();
-            io_bulk_gather_tile_dense<MT, PAGE_BLOCK_SIZE_EXTRA, true>(
-                sm.kv_buf(buf), tile_base_extra, KV_cache_extra, sm.mbar_kv(buf), io_tid,
-                stride_kv_block_extra, kv_l2_policy);
           } else {
-            const int32_t* tile_idx = idx_base_extra + (logical_ti - main_ni) * BI;
             io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA>(
                 sm.kv_scale_buf(buf), tile_idx, KV_cache_extra, io_tid, stride_kv_block_extra);
             __threadfence_block();
@@ -794,9 +776,8 @@ __device__ __forceinline__ void prefill_mg_impl(
     const float sm_scale_log2e = sm_scale * LOG2E;
     const int32_t* idx_base = indices + (size_t)s_i * TOPK;
     [[maybe_unused]] const int32_t* idx_base_extra = nullptr;
-    [[maybe_unused]] const bool extra_dense = DUAL_CACHE && (indices_extra == nullptr);
     if constexpr (DUAL_CACHE) {
-      if (!extra_dense) idx_base_extra = indices_extra + (size_t)s_i * topk_extra_declared;
+      idx_base_extra = indices_extra + (size_t)s_i * topk_extra_declared;
     }
 
     // ── Quantize Q for both groups ─────────────────────────────
@@ -856,13 +837,10 @@ __device__ __forceinline__ void prefill_mg_impl(
       const int32_t* ib;
       const uint8_t* kv_global;
       size_t stride_kv_block_now;
-      int dense_tile_base = 0;
       bool is_main = true;
       if constexpr (DUAL_CACHE) {
         is_main = (ti < main_ni);
-        dense_tile_base = (ti - main_ni) * BI;
-        ib = is_main ? (idx_base + ti * BI)
-                     : (extra_dense ? nullptr : (idx_base_extra + dense_tile_base));
+        ib = is_main ? (idx_base + ti * BI) : (idx_base_extra + (ti - main_ni) * BI);
         kv_global = is_main ? KV_cache : KV_cache_extra;
         stride_kv_block_now = is_main ? stride_kv_block : stride_kv_block_extra;
       } else {
@@ -874,8 +852,7 @@ __device__ __forceinline__ void prefill_mg_impl(
       // Entry base: only gid's entry needed (rope prefetch + QK rope)
       const uint8_t* entry_base_gid;
       {
-        const bool dense_tile_now = DUAL_CACHE && !is_main && extra_dense;
-        const int idx = dense_tile_now ? (dense_tile_base + qk_nb + gid) : ib[qk_nb + gid];
+        const int idx = ib[qk_nb + gid];
         if constexpr (DUAL_CACHE) {
           if (is_main) {
             entry_base_gid =
@@ -960,13 +937,12 @@ __device__ __forceinline__ void prefill_mg_impl(
           compute_qk_rope(qk, q_rope_regs[g], rope_pf);
 
           {
-            const bool dense_tile_now = DUAL_CACHE && !is_main && extra_dense;
             int e0 = qk_nb + tid * 2, e1 = e0 + 1;
-            if (!dense_tile_now && ib[e0] < 0) {
+            if (ib[e0] < 0) {
               qk[0] = -1e30f;
               qk[2] = -1e30f;
             }
-            if (!dense_tile_now && ib[e1] < 0) {
+            if (ib[e1] < 0) {
               qk[1] = -1e30f;
               qk[3] = -1e30f;
             }
@@ -1100,13 +1076,12 @@ __device__ __forceinline__ void prefill_mg_impl(
           // (main: absolute ti*BI+e vs topk_len; extra: relative
           // (ti-main_ni)*BI+e vs topk_len_extra).
           {
-            const bool dense_tile_now = DUAL_CACHE && !is_main && extra_dense;
             int e0 = qk_nb + tid * 2, e1 = e0 + 1;
-            if (!dense_tile_now && ib[e0] < 0) {
+            if (ib[e0] < 0) {
               qk[0] = -1e30f;
               qk[2] = -1e30f;
             }
-            if (!dense_tile_now && ib[e1] < 0) {
+            if (ib[e1] < 0) {
               qk[1] = -1e30f;
               qk[3] = -1e30f;
             }
@@ -1387,10 +1362,6 @@ __device__ __forceinline__ void prefill_mg_impl(
             xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE, MG_N_HG>(acc_rope, w_grp, ib, kv_global, mwarp,
                                                          lane, stride_kv_block_now,
                                                          reinterpret_cast<bf16*>(sm.w_fp8()));
-          } else if (extra_dense) {
-            xv_rope_mma_mg_dense<MT, PAGE_BLOCK_SIZE_EXTRA, MG_N_HG>(
-                acc_rope, w_grp, dense_tile_base, topk_len_extra, kv_global, mwarp, lane,
-                stride_kv_block_now, reinterpret_cast<bf16*>(sm.w_fp8()));
           } else {
             xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE_EXTRA, MG_N_HG>(acc_rope, w_grp, ib, kv_global,
                                                                mwarp, lane, stride_kv_block_now,

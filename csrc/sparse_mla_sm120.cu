@@ -107,8 +107,7 @@ void SparseMlaSm120PagedAttention(
     Optional<TensorView> attn_sink,          // [num_heads] f32, optional
     Optional<TensorView> extra_kv_cache,     // optional dual cache
     Optional<TensorView> extra_indices,      // optional dual cache indices
-    Optional<TensorView> extra_topk_length,  // [num_tokens] int32, optional
-    int64_t hca_max_topk)                    // native HCA dense extra width, 0 = disabled
+    Optional<TensorView> extra_topk_length)  // [num_tokens] int32, optional
 {
   // ── Input validation ───────────────────────────────────────────────
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
@@ -174,31 +173,24 @@ void SparseMlaSm120PagedAttention(
   TVM_FFI_ICHECK(!extra_topk_length.has_value() || extra_kv_cache.has_value())
       << "extra_topk_length requires extra_kv_cache";
   if (extra_kv_cache.has_value()) {
+    TVM_FFI_ICHECK(extra_indices.has_value()) << "extra_kv_cache requires extra_indices";
     const auto& ekv = extra_kv_cache.value();
+    const auto& eidx = extra_indices.value();
     // Same relaxation as the main kv_cache: padded block stride is OK.
     CHECK_CUDA(ekv);
     CHECK_LAST_DIM_CONTIGUOUS(ekv);
     CHECK_INPUT_TYPE(ekv, dl_uint8);
+    CHECK_INPUT_AND_TYPE(eidx, dl_int32);
     TVM_FFI_ICHECK_EQ(ekv.ndim(), 4)
         << "extra_kv_cache must be [num_pages, page_block_size, 1, bytes_per_token]";
     TVM_FFI_ICHECK_EQ(ekv.size(-2), 1) << "extra_kv_cache h_kv axis must be 1";
-    extra_kv_ptr = static_cast<const uint8_t*>(ekv.data_ptr());
     extra_page_block_size = static_cast<int>(ekv.size(-3));
     extra_stride_kv_row = effective_stride_kv_row(ekv);
-    if (extra_indices.has_value()) {
-      const auto& eidx = extra_indices.value();
-      CHECK_INPUT_AND_TYPE(eidx, dl_int32);
-      extra_topk = check_dense_indices_2d_or_s_q_3d(eidx, "extra_indices", num_tokens);
-      extra_idx_ptr = static_cast<const int32_t*>(eidx.data_ptr());
-    } else {
-      TVM_FFI_ICHECK_GT(hca_max_topk, 0)
-          << "extra_kv_cache without extra_indices requires hca_max_topk > 0";
-      TVM_FFI_ICHECK(extra_topk_length.has_value())
-          << "native HCA requires extra_topk_length to carry per-token HCA lengths";
-      extra_topk = static_cast<int>(hca_max_topk);
-    }
+    extra_topk = check_dense_indices_2d_or_s_q_3d(eidx, "extra_indices", num_tokens);
     TVM_FFI_ICHECK_GT(extra_page_block_size, 0);
     TVM_FFI_ICHECK_GT(extra_topk, 0);
+    extra_kv_ptr = static_cast<const uint8_t*>(ekv.data_ptr());
+    extra_idx_ptr = static_cast<const int32_t*>(eidx.data_ptr());
     if (extra_topk_length.has_value()) {
       const auto& etl = extra_topk_length.value();
       CHECK_INPUT_AND_TYPE(etl, dl_int32);
