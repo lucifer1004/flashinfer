@@ -4483,3 +4483,184 @@ def test_sparse_mla_sm120_envelope_consistency(
     else:
         with pytest.raises(RuntimeError, match="sparse-MLA"):
             call()
+
+
+@pytest.mark.parametrize("layout", ["3d", "nhd", "hnd"])
+@pytest.mark.parametrize(
+    "num_tokens,num_heads,impl",
+    [
+        (1, 32, None),
+        (6, 64, None),
+        (65, 32, None),
+        (65, 8, None),
+        (65, 64, "mg"),
+        (65, 64, "swapab"),
+    ],
+)
+def test_glm53_compact_rows_match_padded_rows(layout, num_tokens, num_heads, impl):
+    """Compaction preserves payload bits, attention, LSE and graph replay."""
+    torch.manual_seed(53)
+    device = torch.device("cuda")
+    pages, page_size, topk = 32, 64, 2176
+    kv = torch.randn(pages, page_size, 1, 512, device=device, dtype=torch.bfloat16) / 10
+    padded = quantize_kv_glm53_nope(kv)
+    compact = padded[..., :528].contiguous()
+    assert compact.numel() * 656 == padded.numel() * 528
+    # Poison the unused padded bytes. Neither layout may use them as values.
+    padded[..., 528:] = 255
+    q = (
+        torch.randn(num_tokens, num_heads, 512, device=device, dtype=torch.bfloat16)
+        / 10
+    )
+    indices = torch.randint(
+        pages * page_size, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, 0] = pages * page_size - 1
+    counts = torch.arange(num_tokens, device=device, dtype=torch.int32) % 3
+    lengths = torch.where(counts == 0, 1, torch.where(counts == 1, 70, topk)).to(
+        torch.int32
+    )
+    indices.masked_fill_(
+        torch.arange(topk, device=device)[None, :] >= lengths[:, None], -1
+    )
+    scratch = (
+        _make_decode_scratch(num_tokens, num_heads, topk, 512, device)
+        if num_tokens <= 64
+        else (None, None)
+    )
+
+    def reshape(cache):
+        if layout == "3d":
+            return cache.squeeze(2)
+        if layout == "hnd":
+            return cache.transpose(1, 2)
+        return cache
+
+    def run(cache, out, lse):
+        sparse_mla_sm120_paged_attention(
+            q,
+            reshape(cache),
+            indices,
+            out,
+            lse,
+            512**-0.5,
+            d_v=512,
+            kv_scale_format="arbitrary_fp32",
+            prefill_impl=impl,
+            topk_length=lengths,
+            mid_out=scratch[0],
+            mid_lse=scratch[1],
+        )
+
+    a, b = torch.empty_like(q), torch.empty_like(q)
+    la = torch.empty((num_tokens, num_heads), device=device, dtype=torch.float32)
+    lb = torch.empty_like(la)
+    run(padded, a, la)
+    run(compact, b, lb)
+    torch.testing.assert_close(b, a, rtol=0, atol=0)
+    torch.testing.assert_close(lb, la, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(compact, b, lb)
+    q.mul_(0.75)
+    graph.replay()
+    run(padded, a, la)
+    torch.testing.assert_close(b, a, rtol=0, atol=0)
+    torch.testing.assert_close(lb, la, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("layout", [528, 656])
+@pytest.mark.parametrize(
+    "num_tokens,num_heads,impl",
+    [
+        (1, 8, None),
+        (4, 8, None),
+        (1, 32, None),
+        (1, 64, None),
+        (65, 8, "mg"),
+        (65, 32, "mg"),
+        (65, 64, "swapab"),
+        (65, 128, "swapab"),
+    ],
+)
+@pytest.mark.parametrize("pattern", ["partial", "holes", "bounded", "empty"])
+def test_glm53_masked_cache_rows_ignore_poisoned_slot_zero(
+    layout, num_tokens, num_heads, impl, pattern
+):
+    from flashinfer.mla import SparseMLASm120Wrapper
+
+    kv = torch.full((1, 64, 1, 512), 0.5, device="cuda", dtype=torch.bfloat16)
+    packed = quantize_kv_glm53_nope(kv)[..., :layout].contiguous()
+    q = torch.zeros((num_tokens, num_heads, 512), device="cuda", dtype=torch.bfloat16)
+    indices = torch.full((num_tokens, 2176), -1, device="cuda", dtype=torch.int32)
+    lengths = torch.ones(num_tokens, device="cuda", dtype=torch.int32)
+    if pattern == "empty":
+        lengths.zero_()
+    else:
+        indices[:, 0] = 1
+        if pattern == "holes":
+            indices[:, 2048:2051] = torch.tensor(
+                [2, 3, 4], device="cuda", dtype=torch.int32
+            )
+            lengths.fill_(2051)
+        elif pattern == "bounded":
+            # Even non-negative candidates beyond topk_length must be ignored.
+            indices[:, 1:] = 0
+    wrapper = SparseMLASm120Wrapper(
+        max_num_tokens=num_tokens,
+        max_num_heads=num_heads,
+        d_v=512,
+        kv_scale_format="arbitrary_fp32",
+        device="cuda",
+    )
+    clean, poisoned = torch.empty_like(q), torch.empty_like(q)
+    clean_lse = torch.empty((num_tokens, num_heads), device="cuda", dtype=torch.float32)
+    poisoned_lse = torch.empty_like(clean_lse)
+    wrapper.run(
+        q,
+        packed,
+        indices,
+        clean,
+        512**-0.5,
+        topk_length=lengths,
+        prefill_impl=impl,
+        out_lse=clean_lse,
+    )
+    expected = torch.full_like(clean, 0.0 if pattern == "empty" else 0.5)
+    torch.testing.assert_close(clean, expected, atol=1e-3, rtol=1e-3)
+    # E4M3 0x7f is NaN. Cache slot zero is never a valid candidate here.
+    packed.reshape(-1, layout)[0, :512] = 0x7F
+    wrapper.run(
+        q,
+        packed,
+        indices,
+        poisoned,
+        512**-0.5,
+        topk_length=lengths,
+        prefill_impl=impl,
+        out_lse=poisoned_lse,
+    )
+    assert torch.isfinite(poisoned).all()
+    torch.testing.assert_close(poisoned, clean, atol=0, rtol=0)
+    torch.testing.assert_close(poisoned_lse, clean_lse, atol=0, rtol=0)
+
+    if pattern == "holes":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            wrapper.run(
+                q,
+                packed,
+                indices,
+                poisoned,
+                512**-0.5,
+                topk_length=lengths,
+                prefill_impl=impl,
+                out_lse=poisoned_lse,
+            )
+        # Preserve addresses while changing valid payloads between replays.
+        packed.copy_(quantize_kv_glm53_nope(kv * 0.5)[..., :layout])
+        packed.reshape(-1, layout)[0, :512] = 0x7F
+        graph.replay()
+        torch.testing.assert_close(
+            poisoned, torch.full_like(poisoned, 0.25), atol=1e-3, rtol=1e-3
+        )
