@@ -2128,6 +2128,52 @@ def test_sparse_mla_sm120_decode_dsv4_1(
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize("num_heads", [8, 24, 64])
+@pytest.mark.parametrize("valid_column", [0, 64])
+def test_sparse_mla_sm120_decode_dsv4_1_preserves_every_scale_group(
+    num_heads: int, valid_column: int
+) -> None:
+    """A single candidate exposes lost or exchanged XV folds without averaging.
+
+    Force two chunks through one CTA and put the valid candidate on either
+    side of the chunk boundary, with the other chunk entirely masked.
+    """
+    from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
+
+    device = torch.device("cuda")
+    num_tokens, topk, d_v = 4, 128, 512
+    values = (
+        torch.arange(1, 17, device=device, dtype=torch.bfloat16)
+        .repeat_interleave(32)
+        .div(16)
+    )
+    kv = torch.zeros(1, 64, 1, d_v, dtype=torch.bfloat16, device=device)
+    kv[0, 1, 0] = values
+    packed = quantize_kv_dsv4_1(kv)
+    expected = dequantize_kv_dsv4_1(packed)[0, 1, 0]
+    assert torch.unique(expected).numel() == 16
+    q = torch.zeros(num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device)
+    indices = torch.full((num_tokens, topk), -1, dtype=torch.int32, device=device)
+    indices[:, valid_column] = 1
+    output = torch.empty_like(q)
+    lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+    sparse_mla_sm120_decode_dsv4(
+        q,
+        packed,
+        indices,
+        mid_out,
+        mid_lse,
+        output,
+        lse,
+        d_v**-0.5,
+        chunks_per_block=2,
+        model_type=_MODEL_TYPE_DSV4_1,
+    )
+    torch.testing.assert_close(output, expected.expand_as(output), atol=0, rtol=0)
+    torch.testing.assert_close(lse, torch.zeros_like(lse), atol=1e-5, rtol=0)
+
+
 @pytest.mark.parametrize("num_heads", [16, 64])
 def test_sparse_mla_sm120_prefill_dsv4_1(num_heads: int) -> None:
     """DeepSeek-V4.1 prefill: SG-only on the BI=32 producer/consumer tile;
@@ -3983,7 +4029,7 @@ def test_sparse_mla_sm120_cache_alignment_rejected(
 
 @pytest.mark.parametrize("layout", ["3d", "hnd", "nhd"])
 @pytest.mark.parametrize(
-    "bpt,scale_format,impl", [(584, "auto", "mg"), (528, "ue8m0_g32", "sg")]
+    "bpt,scale_format,impl", [(584, "auto", "mg"), (528, "ue8m0_g32", "auto")]
 )
 def test_sparse_mla_sm120_prefill_footer_row_gap_rejected(
     layout: str, bpt: int, scale_format: str, impl: str
