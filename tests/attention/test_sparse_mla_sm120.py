@@ -1880,16 +1880,23 @@ def test_sparse_mla_sm120_prefill_glm53_nope_swapab(num_heads: int) -> None:
 
 
 @pytest.mark.parametrize("num_tokens,num_heads", [(4, 32), (65, 32), (128, 64)])
+@pytest.mark.parametrize("row_stride", [656, 672])
+@pytest.mark.parametrize("layout", ["3d", "hnd", "nhd"])
 def test_sparse_mla_sm120_glm53_nope_compact_rows(
-    num_tokens: int, num_heads: int
+    num_tokens: int, num_heads: int, row_stride: int, layout: str
 ) -> None:
     """GLM53_NOPE reads only the 528B payload; the gmem row advance is runtime.
 
-    A legacy 656B pool, a packed 528B cache, and a 528B slice of the 656B
-    pool (row stride 656, non-contiguous) must produce bitwise-identical
-    outputs. Shapes cover decode (T=4), prefill MG (T=65, H=32) and prefill
-    swapAB (T=128, H=64).
+    Packed and padded rows, including sliced views with an aligned storage
+    offset, must produce bitwise-identical outputs. The 672B stride checks
+    that padding is independent of the legacy 656B layout. Shapes cover
+    decode, prefill MG, and prefill swapAB in each supported 3D/4D layout.
     """
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _MODEL_TYPE_GLM53_NOPE,
+        sparse_mla_sm120_decode_dsv3_2,
+    )
+
     torch.manual_seed(5)
     device = torch.device("cuda")
     d_qk = d_v = 512
@@ -1904,7 +1911,15 @@ def test_sparse_mla_sm120_glm53_nope_compact_rows(
     ).clamp(-1, 1)
     packed_656 = quantize_kv_glm53_nope(kv_bf16)  # [nb, pbs, 1, 656]
     packed_528 = packed_656[..., :528].contiguous()
-    sliced_528 = packed_656[..., :528]  # 528-wide view, row stride stays 656
+    storage = torch.full(
+        (num_blocks * page_block_size * row_stride + 16,),
+        0xFF,
+        dtype=torch.uint8,
+        device=device,
+    )
+    padded = storage[16:].view(num_blocks, page_block_size, 1, row_stride)
+    padded[..., :528] = packed_528
+    sliced_528 = padded[..., :528]  # Keep the padded row stride and aligned offset.
 
     q = (
         torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
@@ -1924,22 +1939,44 @@ def test_sparse_mla_sm120_glm53_nope_compact_rows(
             (num_tokens, num_heads), dtype=torch.float32, device=device
         )
         mid = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
-        sparse_mla_sm120_paged_attention(
-            q,
-            kv_cache,
-            indices,
-            output,
-            out_lse,
-            sm_scale,
-            d_v=d_v,
-            kv_scale_format="arbitrary_fp32",
-            mid_out=mid[0],
-            mid_lse=mid[1],
-        )
+        if layout == "3d":
+            kv_cache = kv_cache.squeeze(2)
+        elif layout == "hnd":
+            kv_cache = kv_cache.transpose(1, 2)
+        if num_tokens <= 64:
+            sparse_mla_sm120_decode_dsv3_2(
+                q,
+                kv_cache,
+                indices,
+                mid[0],
+                mid[1],
+                output,
+                out_lse,
+                sm_scale,
+                model_type=_MODEL_TYPE_GLM53_NOPE,
+                chunks_per_block=1,
+            )
+        else:
+            sparse_mla_sm120_paged_attention(
+                q,
+                kv_cache,
+                indices,
+                output,
+                out_lse,
+                sm_scale,
+                d_v=d_v,
+                kv_scale_format="arbitrary_fp32",
+                mid_out=mid[0],
+                mid_lse=mid[1],
+            )
         return output, out_lse
 
     ref_out, ref_lse = run(packed_656)
-    for name, kv in (("packed-528", packed_528), ("sliced-528", sliced_528)):
+    for name, kv in (
+        ("packed-528", packed_528),
+        ("padded", padded),
+        ("sliced-528", sliced_528),
+    ):
         out, lse = run(kv)
         assert torch.equal(out, ref_out), f"{name} output diverged from the 656B pool"
         assert torch.equal(lse, ref_lse), f"{name} LSE diverged from the 656B pool"
@@ -3861,14 +3898,189 @@ def test_sparse_mla_sm120_inline_scale_rejects_padded_block_stride() -> None:
         )
 
 
-@pytest.mark.parametrize("num_tokens,num_heads", [(128, 64), (16, 64)])
+@pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize("model_type,bpt", [(1, 584), (3, 528)])
+@pytest.mark.parametrize("layout", ["2d", "3d"])
+@pytest.mark.parametrize("misaligned", ["origin", "block"])
+def test_sparse_mla_sm120_cache_alignment_rejected(
+    prefill: bool, model_type: int, bpt: int, layout: str, misaligned: str
+) -> None:
+    """Aligned row strides alone do not make sliced cache addresses safe."""
+    from flashinfer.mla._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
+
+    block_stride = 64 * bpt + (8 if misaligned == "block" else 0)
+    storage = torch.zeros(2 * block_stride + 1, dtype=torch.uint8, device="cuda")
+    offset = 1 if misaligned == "origin" else 0
+    kv = storage.as_strided((2, 64, bpt), (block_stride, bpt, 1), offset)
+    if layout == "2d":
+        kv = kv.view(2, 64 * bpt)
+    q = torch.zeros(1, 64, 512, dtype=torch.bfloat16, device="cuda")
+    indices = torch.full((1, 64), 64, dtype=torch.int32, device="cuda")
+    output = torch.empty_like(q)
+    lse = torch.empty(1, 64, dtype=torch.float32, device="cuda")
+    mid_out, mid_lse = _make_decode_scratch(1, 64, 64, 512, q.device)
+    module = _get_sparse_mla_sm120_decode_module()
+    message = "data pointer" if misaligned == "origin" else "block stride"
+    with pytest.raises(RuntimeError, match=message + ".*16B-aligned"):
+        if prefill:
+            module.sparse_mla_sm120_paged_attention(
+                q,
+                kv,
+                indices,
+                output,
+                lse,
+                512**-0.5,
+                model_type,
+                2,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        elif model_type == 3:
+            module.sparse_mla_sm120_decode_dsv3_2(
+                q,
+                kv,
+                indices,
+                mid_out,
+                mid_lse,
+                output,
+                lse,
+                1,
+                512**-0.5,
+                None,
+                None,
+                model_type,
+                -1,
+            )
+        else:
+            module.sparse_mla_sm120_decode_dsv4(
+                q,
+                kv,
+                indices,
+                mid_out,
+                mid_lse,
+                output,
+                lse,
+                1,
+                512**-0.5,
+                None,
+                None,
+                None,
+                None,
+                None,
+                -1,
+            )
+
+
+@pytest.mark.parametrize("layout", ["3d", "hnd", "nhd"])
+def test_sparse_mla_sm120_prefill_footer_row_gap_rejected(layout: str) -> None:
+    """A payload-width view must not hide row padding from footer validation."""
+    kv = torch.zeros(2, 64, 600, dtype=torch.uint8, device="cuda")[..., :584]
+    if layout == "hnd":
+        kv = kv.unsqueeze(1)
+    elif layout == "nhd":
+        kv = kv.unsqueeze(2)
+    q = torch.zeros(65, 64, 512, dtype=torch.bfloat16, device="cuda")
+    indices = torch.zeros(65, 128, dtype=torch.int32, device="cuda")
+    output = torch.empty_like(q)
+    lse = torch.empty(65, 64, dtype=torch.float32, device="cuda")
+    with pytest.raises(RuntimeError, match="footer-scale rows must stay packed"):
+        sparse_mla_sm120_paged_attention(
+            q, kv, indices, output, lse, 512**-0.5, d_v=512, prefill_impl="mg"
+        )
+
+
+@pytest.mark.parametrize("num_tokens", [4, 65])
+@pytest.mark.parametrize("dual_cache", [False, True])
+def test_sparse_mla_sm120_footer_flat_block_stride(
+    num_tokens: int, dual_cache: bool
+) -> None:
+    """Flat cache views preserve aligned gaps between main and extra pages."""
+    from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
+
+    torch.manual_seed(13)
+    device = torch.device("cuda")
+    q = torch.randn(num_tokens, 64, 512, dtype=torch.bfloat16, device=device) / 10
+    packed = quantize_kv_dsv4(
+        torch.randn(4, 64, 1, 512, dtype=torch.bfloat16, device=device) / 10
+    ).view(4, 64 * 584)
+    extra = quantize_kv_dsv4(
+        torch.randn(4, 2, 1, 512, dtype=torch.bfloat16, device=device) / 10
+    ).view(4, 2 * 584)
+
+    def padded_blocks(cache: torch.Tensor) -> torch.Tensor:
+        storage = torch.full(
+            (cache.shape[0], cache.shape[1] + 16),
+            0xFF,
+            dtype=torch.uint8,
+            device=device,
+        )
+        view = storage[:, : cache.shape[1]]
+        view.copy_(cache)
+        return view
+
+    indices = torch.randint(
+        64, 256, (num_tokens, 128), dtype=torch.int32, device=device
+    )
+    extra_indices = torch.randint(
+        2, 8, (num_tokens, 64), dtype=torch.int32, device=device
+    )
+    mid = _make_decode_scratch(
+        num_tokens, 64, 128, 512, device, extra_topk=64 if dual_cache else 0
+    )
+
+    def run(cache: torch.Tensor, extra_cache: torch.Tensor):
+        output = torch.empty_like(q)
+        lse = torch.empty(num_tokens, 64, dtype=torch.float32, device=device)
+        if num_tokens <= 64:
+            # Bypass crossover calibration so both binding parsers are exercised.
+            sparse_mla_sm120_decode_dsv4(
+                q,
+                cache,
+                indices,
+                mid[0],
+                mid[1],
+                output,
+                lse,
+                512**-0.5,
+                extra_kv_cache=extra_cache if dual_cache else None,
+                extra_indices=extra_indices if dual_cache else None,
+                chunks_per_block=1,
+            )
+        else:
+            sparse_mla_sm120_paged_attention(
+                q,
+                cache,
+                indices,
+                output,
+                lse,
+                512**-0.5,
+                d_v=512,
+                mid_out=mid[0],
+                mid_lse=mid[1],
+                extra_kv_cache=extra_cache if dual_cache else None,
+                extra_indices=extra_indices if dual_cache else None,
+            )
+        return output, lse
+
+    expected = run(packed, extra)
+    for actual, reference in zip(
+        run(padded_blocks(packed), padded_blocks(extra)), expected, strict=True
+    ):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_heads", [(65, 8), (65, 32), (128, 64), (16, 64)]
+)
 def test_sparse_mla_sm120_inline_scale_prefill_accepts_padded_rows(
     num_tokens: int, num_heads: int
 ) -> None:
-    """Padded-row inline-scale caches work in both prefill and decode: the
-    kernels take the gmem row advance as a runtime stride and read only the
-    packed payload at the row start. num_tokens=16 additionally exercises the
-    decode-form path (the same runtime-stride addressing)."""
+    """Padded RoPE rows work in SG, MG, swapAB, and standalone decode."""
+    from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv3_2
+
     q, kv_packed, indices, sm_scale, d_v, ref_out, ref_lse = _make_dsv3_2_prefill_case(
         num_heads, num_tokens=num_tokens
     )
@@ -3887,17 +4099,30 @@ def test_sparse_mla_sm120_inline_scale_prefill_accepts_padded_rows(
     mid_out, mid_lse = _make_decode_scratch(
         num_tokens, num_heads, indices.shape[-1], d_v, q.device
     )
-    sparse_mla_sm120_paged_attention(
-        q,
-        kv,
-        indices,
-        output,
-        out_lse,
-        sm_scale,
-        d_v=d_v,
-        mid_out=mid_out,
-        mid_lse=mid_lse,
-    )
+    if num_tokens <= 64:
+        sparse_mla_sm120_decode_dsv3_2(
+            q,
+            kv,
+            indices,
+            mid_out,
+            mid_lse,
+            output,
+            out_lse,
+            sm_scale,
+            chunks_per_block=1,
+        )
+    else:
+        sparse_mla_sm120_paged_attention(
+            q,
+            kv,
+            indices,
+            output,
+            out_lse,
+            sm_scale,
+            d_v=d_v,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+        )
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
@@ -4567,6 +4792,56 @@ def test_glm53_compact_rows_match_padded_rows(layout, num_tokens, num_heads, imp
     run(padded, a, la)
     torch.testing.assert_close(b, a, rtol=0, atol=0)
     torch.testing.assert_close(lb, la, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4])
+def test_glm53_eight_head_decode_preserves_scratch_guards(num_tokens: int) -> None:
+    """The dedicated H8 kernel must stay within the caller's eight-row scratch."""
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _MODEL_TYPE_GLM53_NOPE,
+        sparse_mla_sm120_decode_dsv3_2,
+    )
+
+    device = torch.device("cuda")
+    num_heads, topk, d_v = 8, 2176, 512
+    num_splits = (topk + 63) // 64
+
+    def guarded(shape, dtype):
+        size = 1
+        for dim in shape:
+            size *= dim
+        storage = torch.full((2 * size,), 37, device=device, dtype=dtype)
+        return storage[:size].view(shape), storage[size:]
+
+    mid_out, out_guard = guarded(
+        (num_tokens, num_heads, num_splits, d_v), torch.bfloat16
+    )
+    mid_lse, lse_guard = guarded((num_tokens, num_heads, num_splits), torch.float32)
+    kv = quantize_kv_glm53_nope(
+        torch.full((1, 64, 1, 512), 0.5, dtype=torch.bfloat16, device=device)
+    )[..., :528].contiguous()
+    q = torch.zeros(num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device)
+    indices = torch.full((num_tokens, topk), -1, dtype=torch.int32, device=device)
+    indices[:, 0] = 1
+    output = torch.empty_like(q)
+    lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
+    sparse_mla_sm120_decode_dsv3_2(
+        q,
+        kv,
+        indices,
+        mid_out,
+        mid_lse,
+        output,
+        lse,
+        512**-0.5,
+        model_type=_MODEL_TYPE_GLM53_NOPE,
+        chunks_per_block=1,
+    )
+    assert torch.all(out_guard == 37)
+    assert torch.all(lse_guard == 37)
+    torch.testing.assert_close(
+        output, torch.full_like(output, 0.5), atol=1e-3, rtol=1e-3
+    )
 
 
 @pytest.mark.parametrize("layout", [528, 656])
