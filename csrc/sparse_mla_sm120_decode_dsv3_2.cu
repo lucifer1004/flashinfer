@@ -9,7 +9,7 @@
 // Supports the V32-family dispatch grid: dedicated instantiations at
 //   num_heads ∈ {8, 16, 32, 64, 128}
 // plus one runtime-H instantiation (any num_heads <= 128 off the grid) and
-// GLM53_NOPE dedicated 32/64 + runtime-H. topk is a runtime argument — one
+// GLM53_NOPE dedicated 8/32/64 + runtime-H. topk is a runtime argument — one
 // instantiation serves every indices-row width.
 
 #include <cuda_runtime.h>

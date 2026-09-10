@@ -53,11 +53,11 @@ struct PagedKVLayout {
   int stride_kv_row;
 };
 
-// inline_scale: the model stores scales inside the row (DSV3_2 / GLM_NSA /
-// GLM53_NOPE) and gathers whole rows with cp.async.bulk, so the row advance
-// must be 16B-aligned. Footer-scale models (DSV4 / DOTS3_SWA) address data
-// rows by the packed data stride and skip the check (584 % 16 != 0 is legal
-// there).
+// Inline-scale rows may be padded, with a 16B-aligned row advance.
+// Footer-scale caches must keep data and scale sections packed. Their data
+// rows use an aligned stride (e.g. 576B for DSV4), separate from the total
+// payload per token (584B including footer scales). Both families require
+// 16B-aligned cache origins and block strides for cp.async.bulk.
 inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, bool inline_scale,
                                            const char* name) {
   const size_t elem_bytes = static_cast<size_t>(kv.dtype().bits / 8);

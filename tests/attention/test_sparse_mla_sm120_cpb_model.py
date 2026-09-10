@@ -288,6 +288,41 @@ def test_missing_or_corrupt_cache_falls_back(clean_cpb_state, tmp_path) -> None:
     assert _resolve_cpb(device, "dsv4", 1, 16, 1024, 0) == -1
 
 
+def test_stale_schema_is_read_once_until_file_changes(
+    clean_cpb_state, monkeypatch
+) -> None:
+    """Repeated misses skip stale JSON, but a replaced tuning file is picked up."""
+    from unittest.mock import patch
+    import os
+
+    device = torch.device("cpu")
+    path = cpb_mod.default_cache_path()
+    path.write_text('{"schema_version": 1, "devices": {}}')
+    old_mtime = path.stat().st_mtime
+    read_text = type(path).read_text
+    with patch.object(
+        type(path), "read_text", autospec=True, side_effect=read_text
+    ) as read:
+        for _ in range(3):
+            assert cpb_mod.get_constants(device, "glm53_nope") is None
+            assert cpb_mod.get_cpb_override(device, "glm53_nope", 32, 512, 4) is None
+            assert cpb_mod.get_decode_max_tokens(device, "glm53_nope", 32, 512) is None
+        assert read.call_count == 1
+        path.write_text(
+            cpb_mod.json.dumps(
+                {
+                    "schema_version": cpb_mod._SCHEMA_VERSION,
+                    "devices": {
+                        cpb_mod._device_key(device): {"dsv4": cpb_mod.asdict(_C)}
+                    },
+                }
+            )
+        )
+        os.utime(path, (old_mtime + 1, old_mtime + 1))
+        assert cpb_mod.get_constants(device, "dsv4") == _C
+        assert read.call_count == 2
+
+
 def test_legacy_glm_layout_calibration_is_invalidated(clean_cpb_state) -> None:
     """A payload-layout change invalidates constants and measured tuning picks."""
     from flashinfer.mla._sparse_mla_sm120 import _resolve_cpb

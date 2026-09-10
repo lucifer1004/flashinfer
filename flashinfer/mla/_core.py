@@ -702,7 +702,9 @@ def _check_sm120_sparse_v32_kv_cache(
     # stores 512 FP8 values and four FP32 scales (528B); v32/GLM_NSA also
     # stores 128B of RoPE. The binding validates the actual row stride.
     min_row_bytes = 528 if glm53_nope else 656
-    layout_desc = f">={min_row_bytes} ({min_row_bytes}B payload, padded rows allowed)"
+    layout_desc = (
+        f">={min_row_bytes} ({min_row_bytes}B payload, 16B-aligned padded rows allowed)"
+    )
     if kv_cache.ndim == 3:
         if kv_cache.size(-1) < min_row_bytes:
             raise ValueError(

@@ -4058,6 +4058,55 @@ def test_sparse_mla_sm120_prefill_footer_row_gap_rejected(
         )
 
 
+@pytest.mark.parametrize("layout", ["3d", "hnd", "nhd"])
+@pytest.mark.parametrize(
+    "model_type,bpt", [(_MODEL_TYPE_DSV4, 584), (_MODEL_TYPE_DSV4_1, 528)]
+)
+@pytest.mark.parametrize("padded_width", [False, True])
+@pytest.mark.parametrize("extra_cache", [False, True])
+def test_sparse_mla_sm120_decode_footer_row_gap_rejected(
+    layout: str, model_type: int, bpt: int, padded_width: bool, extra_cache: bool
+) -> None:
+    """The standalone decode binding validates both footer cache views."""
+    from flashinfer.mla._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
+
+    kv = torch.zeros(2, 64, bpt + 16, dtype=torch.uint8, device="cuda")
+    if not padded_width:
+        kv = kv[..., :bpt]
+    if layout == "hnd":
+        kv = kv.unsqueeze(1)
+    elif layout == "nhd":
+        kv = kv.unsqueeze(2)
+    packed = torch.zeros(2, 64 * bpt, dtype=torch.uint8, device="cuda")
+    q = torch.zeros(1, 64, 512, dtype=torch.bfloat16, device="cuda")
+    indices = torch.zeros(1, 64, dtype=torch.int32, device="cuda")
+    output = torch.empty_like(q)
+    lse = torch.empty(1, 64, dtype=torch.float32, device="cuda")
+    mid_out, mid_lse = _make_decode_scratch(
+        1, 64, 64, 512, q.device, extra_topk=64 if extra_cache else 0
+    )
+    module = _get_sparse_mla_sm120_decode_module()
+    with pytest.raises(RuntimeError, match="tightly packed KV rows"):
+        module.sparse_mla_sm120_decode_dsv4(
+            q,
+            packed if extra_cache else kv,
+            indices,
+            mid_out,
+            mid_lse,
+            output,
+            lse,
+            2 if extra_cache else 1,
+            512**-0.5,
+            None,
+            None,
+            kv if extra_cache else None,
+            indices if extra_cache else None,
+            None,
+            model_type,
+            -1,
+        )
+
+
 @pytest.mark.parametrize("num_tokens", [4, 65])
 @pytest.mark.parametrize("dual_cache", [False, True])
 def test_sparse_mla_sm120_footer_flat_block_stride(

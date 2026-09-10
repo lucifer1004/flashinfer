@@ -1023,10 +1023,12 @@ def _maybe_load_disk() -> None:
         return
     try:
         payload = json.loads(path.read_text())
-        if (
-            not isinstance(payload, dict)
-            or payload.get("schema_version") != _SCHEMA_VERSION
-        ):
+        if not isinstance(payload, dict):
+            return
+        if payload.get("schema_version") != _SCHEMA_VERSION:
+            # This file version cannot supply entries. Retry only after it
+            # changes, rather than reparsing stale tuning on every lookup.
+            _cache_mtime = mtime
             return
         devices = payload["devices"]
         if not isinstance(devices, dict):
