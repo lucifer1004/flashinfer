@@ -178,8 +178,9 @@ _DECODE_GLM53_NOPE_DISPATCH = _DecodeDispatchEnvelope(1)
 # layer (TP4 -> 16) and any other count up to 128.
 _DECODE_DOTS3_SWA_DISPATCH = _DecodeDispatchEnvelope(513)
 
-# DSV4_1 decode: the decode-dsv4 kernel at BI=64 / 4 math warps (the 32-wide
-# quant groups bound the XV warp split). Dual-cache is supported like DSV4.
+# DSV4_1 decode: the decode-dsv4 kernel at BI=64 / 8 math warps; its 32-wide
+# quant groups are served by the pair-folded XV (DecodeTileCfg::XV_FOLD=2).
+# Dual-cache is supported like DSV4.
 _DECODE_DSV4_1_DISPATCH = _DecodeDispatchEnvelope(1)
 
 # Calibration/documented topk values per family (the crossover sweep points).

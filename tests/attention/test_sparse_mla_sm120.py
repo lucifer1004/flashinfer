@@ -2027,7 +2027,7 @@ _DSV4_1_DECODE_CONFIGS = [
 def test_sparse_mla_sm120_decode_dsv4_1(
     num_heads: int, topk: int, num_tokens: int, with_sink: bool
 ) -> None:
-    """DeepSeek-V4.1 decode (4-math-warp decode-dsv4 tile, BI=64)."""
+    """DeepSeek-V4.1 decode (decode-dsv4 tile, BI=64, pair-folded XV)."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 512, 512

@@ -66,26 +66,23 @@ struct DecodeTilePrimary<ModelType::DOTS3_SWA> {
   static constexpr int WINDOW = 513;
 };
 
-// DSV4_1 halves the math warps at the full 64-candidate window: its 32-wide
-// quant groups make V_CHUNK=32, and the XV fold ties a W buffer to one scale
-// group, so 8 dim-tiles per chunk serve at most V_CHUNK/8 = 4 warps
-// (NT_PER_WARP_XV >= 1). With 4 warps each takes 16 candidates per tile.
-template <>
-struct DecodeTilePrimary<ModelType::DSV4_1> {
-  static constexpr int N_WARPS = 4;
-  static constexpr int IO_WARPS = 1;
-  static constexpr int CAND_WINDOW = 64;
-  static constexpr int KV_BUF_COUNT = 2;
-  static constexpr int WINDOW = 0;
-};
-
 template <ModelType MT>
 struct DecodeTileCfg {
   using P = DecodeTilePrimary<MT>;
+  using KV = KVCacheTraits<MT>;
   static constexpr int N_WARPS = P::N_WARPS;
   static constexpr int IO_WARPS = P::IO_WARPS;
   static constexpr int CAND_WINDOW = P::CAND_WINDOW;
   static constexpr int KV_BUF_COUNT = P::KV_BUF_COUNT;
+
+  // XV W-fold arity. The FP8 weight buffer carries the V dequant scale folded
+  // in per (candidate, scale group), so one buffer serves exactly one
+  // QUANT_TILE-wide group and a chunk feeds at most QUANT_TILE/8 warps. When
+  // the math warps outnumber that (DSV4_1: 8 warps, 32-wide groups), each
+  // loop step folds W once per group in an XV_FOLD-wide chunk group
+  // (pair-fold) instead of narrowing the warp count.
+  static constexpr int XV_FOLD = (N_WARPS * 8 + KV::QUANT_TILE - 1) / KV::QUANT_TILE;
+  static constexpr int XV_WARPS = N_WARPS / XV_FOLD;
 
   static constexpr int N_TOTAL_WARPS = N_WARPS + IO_WARPS;  // DSV4 9,   DOTS3_SWA 5
   static constexpr int BLOCK_THREADS = N_TOTAL_WARPS * 32;  // DSV4 288, DOTS3_SWA 160
@@ -103,6 +100,11 @@ struct DecodeTileCfg {
                 "ENTRIES_PER_WARP < 8 floors QK_N_TILES to 0 and silently drops the QK MMA; "
                 "halve N_WARPS along with CAND_WINDOW");
   static_assert(QK_N_TILES >= 1, "QK tiling degenerate");
+  static_assert(XV_FOLD >= 1 && XV_FOLD <= 2,
+                "beyond pair-fold the XV stage needs a wider W buffer design");
+  static_assert(N_WARPS % XV_FOLD == 0, "the XV folds must split the math warps evenly");
+  static_assert(KV::D_NOPE % (KV::QUANT_TILE * XV_FOLD) == 0,
+                "the XV chunk group must tile the nope dims");
 };
 
 template <ModelType MT>
@@ -127,6 +129,8 @@ struct DecodeDsv4Smem {
   static constexpr size_t SMEM_REDUCE = 2 * Cfg::N_WARPS * HPB * sizeof(float);
   static constexpr size_t SMEM_W_HEAD_SC = N_V_CHUNKS * HPB * sizeof(float);
   static constexpr size_t SMEM_W_FP8_BUF = HPB * (Cfg::BI + 16);
+  // W buffers: one per (double-buffer parity, XV fold) — see DecodeTileCfg.
+  static constexpr int W_FP8_SLOTS = 2 * Cfg::XV_FOLD;
 
   static constexpr size_t OFF_Q_ROPE = 0;
   static constexpr size_t OFF_Q_FP8 = OFF_Q_ROPE + SMEM_Q_ROPE;
@@ -177,8 +181,9 @@ struct DecodeDsv4Smem {
   __device__ __forceinline__ float* w_head_sc() const {
     return reinterpret_cast<float*>(base + OFF_W_HEAD_SC);
   }
-  __device__ __forceinline__ uint8_t* w_fp8(int parity) const {
-    return reinterpret_cast<uint8_t*>(base + OFF_W_FP8 + parity * SMEM_W_FP8_BUF);
+  // slot = parity * Cfg::XV_FOLD + fold
+  __device__ __forceinline__ uint8_t* w_fp8(int slot) const {
+    return reinterpret_cast<uint8_t*>(base + OFF_W_FP8 + slot * SMEM_W_FP8_BUF);
   }
 };
 
@@ -287,9 +292,14 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
     return;
   }
 
-  constexpr int V_CHUNK = QUANT_TILE;                          // 64
-  constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;                 // 7
-  constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / Cfg::N_WARPS;   // 1
+  constexpr int V_CHUNK = QUANT_TILE;  // DSV4 64, DOTS3_SWA 128, DSV4_1 32
+  constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;
+  constexpr int XV_FOLD = Cfg::XV_FOLD;    // W foldings per XV step (DSV4_1: 2)
+  constexpr int XV_WARPS = Cfg::XV_WARPS;  // warps per chunk within a step
+  constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / XV_WARPS;
+  // acc_nope's first index is the chunk-GROUP step, not the chunk: at
+  // XV_FOLD=2 a warp's chunk within step vs is vs*2 + warp_id/XV_WARPS.
+  constexpr int ACC_V_STEPS = N_V_CHUNKS / XV_FOLD;
   constexpr int XV_KSTEPS = Cfg::BI / 32;                      // 2
   constexpr int W_FP8_STRIDE = Cfg::BI + 16;                   // 80
   constexpr int ROPE_DIMS_PER_WARP = D_ROPE_C / Cfg::N_WARPS;  // 8
@@ -318,8 +328,9 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   //   sm_kv_rope   2 * Cfg::BI * D_ROPE * 2B      = 16 KB
   //   sm_reduce    2 * Cfg::N_WARPS * HPB * 4     = 1 KB  (8 warps)
   //   sm_w_head_sc N_V_CHUNKS * HPB * 4         = 448 B
-  //   sm_w_fp8 ×2  2 * HPB * (Cfg::BI + 16)       = 2.5 KB  (double-buf
-  //                across vc iters to drop the if-vc>0 bar_sync)
+  //   sm_w_fp8 ×2×XV_FOLD  W_FP8_SLOTS * HPB * (Cfg::BI + 16)
+  //                                          = 2.5-5 KB (double-buf
+  //                across step iters to drop the if-step>0 bar_sync)
   //   Total                                     ~ 88 KB
   // Plus static sm_p_full HPB * Cfg::BI * 2B (bf16) = 2 KB.
   // Grand total ~ 90 KB (under 100 KB SM120 carveout, 1 block/SM).
@@ -480,7 +491,7 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h);
 
   // Persistent state across chunks (per-thread registers).
-  float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};
+  float acc_nope[ACC_V_STEPS][NT_PER_WARP_XV][4] = {0};
   // Sized 1 when unused: a zero-length array is ill-formed, and every read is
   // behind `if constexpr (V_ROPE)`.
   float acc_rope[V_ROPE ? ROPE_N_TILES : 1][4] = {0};
@@ -685,13 +696,13 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
 
     if (chunk_idx > chunk_lo) {
 #pragma unroll
-      for (int vc = 0; vc < N_V_CHUNKS; vc++) {
+      for (int vs = 0; vs < ACC_V_STEPS; vs++) {
 #pragma unroll
         for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
-          acc_nope[vc][nt][0] *= alpha0;
-          acc_nope[vc][nt][1] *= alpha0;
-          acc_nope[vc][nt][2] *= alpha1;
-          acc_nope[vc][nt][3] *= alpha1;
+          acc_nope[vs][nt][0] *= alpha0;
+          acc_nope[vs][nt][1] *= alpha0;
+          acc_nope[vs][nt][2] *= alpha1;
+          acc_nope[vs][nt][3] *= alpha1;
         }
       }
       if constexpr (V_ROPE) {
@@ -768,13 +779,18 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
     bar_sync_t<3, Cfg::MATH_THREADS>();
 
 #pragma unroll
-    for (int vc = 0; vc < N_V_CHUNKS; vc++) {
-      // Double-buffered: vc=N quants into buf[N&1]; vc=N+1's quant targets the
-      // OTHER buffer, so it cannot race with vc=N's MMA read. The bar_sync
-      // after quant is the only sync needed within the vc loop.
-      uint8_t* sm_w_fp8 = sm.w_fp8(vc & 1);
-      // Phase 3 quant.
-      {
+    for (int vs = 0; vs < ACC_V_STEPS; vs++) {
+      const int vc0 = vs * XV_FOLD;
+      // Double-buffered by step parity: step N quants into parity N&1 while
+      // step N-1's MMA reads the other buffer set, so quant cannot race the
+      // reads. Each parity owns XV_FOLD W buffers (one folding per scale
+      // group in the chunk group). The bar_sync after quant is the only sync
+      // needed within the step loop.
+      // Phase 3 quant: fold each candidate once per scale group in the step.
+#pragma unroll
+      for (int f = 0; f < XV_FOLD; f++) {
+        const int vc = vc0 + f;
+        uint8_t* sm_w_fp8 = sm.w_fp8((vs & 1) * XV_FOLD + f);
         const int warp_first_cand_xv = warp_id * Cfg::ENTRIES_PER_WARP;
         const float si0 = 1.f / sm.w_head_sc()[vc * HPB + gid];
         const float si1 = 1.f / sm.w_head_sc()[vc * HPB + gid + 8];
@@ -795,12 +811,15 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
         }
       }
       bar_sync_t<3, Cfg::MATH_THREADS>();
-      // Phase 4 FP8 MMA. Accumulate into persistent acc_nope[vc][nt][k].
+      // Phase 4 FP8 MMA. This warp's chunk within the step and its W folding:
+      // warp groups of XV_WARPS share one chunk, tiling its dims.
+      const int vc = vc0 + warp_id / XV_WARPS;
+      uint8_t* sm_w_fp8 = sm.w_fp8((vs & 1) * XV_FOLD + warp_id / XV_WARPS);
       const float sc0 = sm.w_head_sc()[vc * HPB + gid];
       const float sc1 = sm.w_head_sc()[vc * HPB + gid + 8];
 #pragma unroll
       for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
-        const int dim = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8;
+        const int dim = vc * V_CHUNK + (warp_id % XV_WARPS) * (NT_PER_WARP_XV * 8) + nt * 8;
         float xv[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
         for (int kstep = 0; kstep < XV_KSTEPS; kstep++) {
@@ -814,10 +833,10 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
           xv[2] = r.d2;
           xv[3] = r.d3;
         }
-        acc_nope[vc][nt][0] += xv[0] * sc0;
-        acc_nope[vc][nt][1] += xv[1] * sc0;
-        acc_nope[vc][nt][2] += xv[2] * sc1;
-        acc_nope[vc][nt][3] += xv[3] * sc1;
+        acc_nope[vs][nt][0] += xv[0] * sc0;
+        acc_nope[vs][nt][1] += xv[1] * sc0;
+        acc_nope[vs][nt][2] += xv[2] * sc1;
+        acc_nope[vs][nt][3] += xv[3] * sc1;
       }
     }
 
@@ -885,17 +904,18 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   // emits STG.E.64 instead of two STG.E.U16 — halves the global-store
   // instruction count and ~doubles sector-byte utilization (NCU A1.3 reported
   // 8.6 / 32 B/sector on these scalar stores, matching the unfused pattern).
-  // d0 = warp_id*(NT_PER_WARP_XV*8) + nt*8 + tid*2 is always even ⇒ the
-  // mid_out base+offset is 4-byte aligned, safe for __nv_bfloat162 access.
+  // d0's + tid*2 term is always even ⇒ the mid_out base+offset is 4-byte
+  // aligned, safe for __nv_bfloat162 access.
 #pragma unroll
-  for (int vc = 0; vc < N_V_CHUNKS; vc++) {
+  for (int vs = 0; vs < ACC_V_STEPS; vs++) {
 #pragma unroll
     for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
-      const int d0 = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8 + tid * 2;
+      const int vc = vs * XV_FOLD + warp_id / XV_WARPS;
+      const int d0 = vc * V_CHUNK + (warp_id % XV_WARPS) * (NT_PER_WARP_XV * 8) + nt * 8 + tid * 2;
       const __nv_bfloat162 pair_lo =
-          __floats2bfloat162_rn(acc_nope[vc][nt][0] * inv_g0, acc_nope[vc][nt][1] * inv_g0);
+          __floats2bfloat162_rn(acc_nope[vs][nt][0] * inv_g0, acc_nope[vs][nt][1] * inv_g0);
       const __nv_bfloat162 pair_hi =
-          __floats2bfloat162_rn(acc_nope[vc][nt][2] * inv_g1, acc_nope[vc][nt][3] * inv_g1);
+          __floats2bfloat162_rn(acc_nope[vs][nt][2] * inv_g1, acc_nope[vs][nt][3] * inv_g1);
       *reinterpret_cast<__nv_bfloat162*>(
           &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
       // gid + 8 slot exists only when the kernel tile holds > 8 heads. The

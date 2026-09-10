@@ -44,7 +44,7 @@ static bool launch_decode_dsv4_impl(int num_heads, int topk, const bf16* Q, cons
   // against a 101376 B per-block opt-in cap:
   //
   //   term                                        DSV4       DOTS3_SWA   DSV4_1
-  //                                            (BI=64,W=8)  (BI=32,W=4)  (BI=64,W=4)
+  //                                            (BI=64,W=8)  (BI=32,W=4)  (BI=64,W=8)
   //   sm_q_rope    HPB * D_ROPE * 2B               2048         2048          0
   //   sm_q_fp8     HPB * Q_NOPE_STRIDE             7424        16640       8448
   //   sm_q_sc      HPB * NUM_SCALES * 4B            448          512       1024
@@ -52,13 +52,13 @@ static bool launch_decode_dsv4_impl(int num_heads, int topk, const bf16* Q, cons
   //   sm_kv_sc     2 * BI * SCALE_BYTES_PER_TOKEN  1024          512       2048
   //   sm_kv_rope   2 * BI * D_ROPE * 2B           16384         8192          0
   //   mbar + pad                                     48           48         48
-  //   sm_reduce    2 * N_WARPS * HPB * 4           1024          512        512
+  //   sm_reduce    2 * N_WARPS * HPB * 4           1024          512       1024
   //   sm_w_head_sc N_V_CHUNKS * HPB * 4             448          512       1024
-  //   sm_w_fp8 x2  2 * HPB * (BI + 16)             2560         1536       2560
-  //   dynamic total                               90800        97072      83248
+  //   sm_w_fp8     2 * XV_FOLD * HPB * (BI + 16)   2560         1536       5120
+  //   dynamic total                               90800        97072      86296
   // Static smem (kernel-side), sm_p_full = HPB * BI * 2B:
   //   DSV4 2048 B; DOTS3_SWA/DSV4_1 0 (V_HAS_ROPE=false makes the bf16 P dead).
-  //   grand total                                 92848        97072      83248
+  //   grand total                                 92848        97072      86296
   //
   // DOTS3_SWA leaves ~4.2 KB spare. BI=64 for it needs 173872 B and the driver
   // rejects the opt-in outright. All configs run 1 block/SM.
@@ -74,7 +74,7 @@ static bool launch_decode_dsv4_impl(int num_heads, int topk, const bf16* Q, cons
       + 4 * (int)sizeof(uint64_t)                                     // mbar_full+empty
       + 2 * Cfg::N_WARPS * HPB * (int)sizeof(float)                   // sm_reduce
       + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                  // sm_w_head_sc
-      + 2 * HPB * (Cfg::BI + 16);                                     // sm_w_fp8 ×2 (vc parity)
+      + 2 * Cfg::XV_FOLD * HPB * (Cfg::BI + 16);  // sm_w_fp8 ×2 parities × XV_FOLD
 
   auto kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, PAGE_BLOCK_SIZE>;
   CUDA_CHECK_BOOL(
@@ -223,7 +223,8 @@ bool launch_sparse_mla_decode_dsv4(
   DECODE_DISPATCH_RT(ModelType::DOTS3_SWA)
   // DSV4_1 (DeepSeek-V4.1): all-FP8 512-wide K, 16B UE8M0 footer. Same dual-
   // cache capability as DSV4 (vLLM routes the SWA cache as main + compressed
-  // as extra); 4 math warps per DecodeTilePrimary.
+  // as extra); the 32-wide quant groups run the pair-folded XV
+  // (DecodeTileCfg::XV_FOLD=2) on the standard 8-warp tile.
   DECODE_DISPATCH(ModelType::DSV4_1, 8)
   DECODE_DISPATCH(ModelType::DSV4_1, 16)
   DECODE_DISPATCH(ModelType::DSV4_1, 32)
