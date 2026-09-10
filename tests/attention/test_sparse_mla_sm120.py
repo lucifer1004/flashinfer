@@ -35,6 +35,9 @@ import torch
 
 import flashinfer
 from flashinfer.mla._sparse_mla_sm120 import (
+    _MODEL_TYPE_DSV4,
+    _MODEL_TYPE_DSV4_1,
+    _MODEL_TYPE_GLM53_NOPE,
     _SparseMLAPagedAttentionRunner,
     _sparse_mla_sm120_paged_attention as sparse_mla_sm120_paged_attention,
 )
@@ -3899,7 +3902,10 @@ def test_sparse_mla_sm120_inline_scale_rejects_padded_block_stride() -> None:
 
 
 @pytest.mark.parametrize("prefill", [False, True])
-@pytest.mark.parametrize("model_type,bpt", [(1, 584), (3, 528)])
+@pytest.mark.parametrize(
+    "model_type,bpt",
+    [(_MODEL_TYPE_DSV4, 584), (_MODEL_TYPE_GLM53_NOPE, 528), (_MODEL_TYPE_DSV4_1, 528)],
+)
 @pytest.mark.parametrize("layout", ["2d", "3d"])
 @pytest.mark.parametrize("misaligned", ["origin", "block"])
 def test_sparse_mla_sm120_cache_alignment_rejected(
@@ -3931,14 +3937,14 @@ def test_sparse_mla_sm120_cache_alignment_rejected(
                 lse,
                 512**-0.5,
                 model_type,
-                2,
+                1 if model_type == _MODEL_TYPE_DSV4_1 else 2,
                 None,
                 None,
                 None,
                 None,
                 None,
             )
-        elif model_type == 3:
+        elif model_type == _MODEL_TYPE_GLM53_NOPE:
             module.sparse_mla_sm120_decode_dsv3_2(
                 q,
                 kv,
@@ -3970,14 +3976,20 @@ def test_sparse_mla_sm120_cache_alignment_rejected(
                 None,
                 None,
                 None,
+                model_type,
                 -1,
             )
 
 
 @pytest.mark.parametrize("layout", ["3d", "hnd", "nhd"])
-def test_sparse_mla_sm120_prefill_footer_row_gap_rejected(layout: str) -> None:
+@pytest.mark.parametrize(
+    "bpt,scale_format,impl", [(584, "auto", "mg"), (528, "ue8m0_g32", "sg")]
+)
+def test_sparse_mla_sm120_prefill_footer_row_gap_rejected(
+    layout: str, bpt: int, scale_format: str, impl: str
+) -> None:
     """A payload-width view must not hide row padding from footer validation."""
-    kv = torch.zeros(2, 64, 600, dtype=torch.uint8, device="cuda")[..., :584]
+    kv = torch.zeros(2, 64, bpt + 16, dtype=torch.uint8, device="cuda")[..., :bpt]
     if layout == "hnd":
         kv = kv.unsqueeze(1)
     elif layout == "nhd":
@@ -3988,7 +4000,15 @@ def test_sparse_mla_sm120_prefill_footer_row_gap_rejected(layout: str) -> None:
     lse = torch.empty(65, 64, dtype=torch.float32, device="cuda")
     with pytest.raises(RuntimeError, match="footer-scale rows must stay packed"):
         sparse_mla_sm120_paged_attention(
-            q, kv, indices, output, lse, 512**-0.5, d_v=512, prefill_impl="mg"
+            q,
+            kv,
+            indices,
+            output,
+            lse,
+            512**-0.5,
+            d_v=512,
+            kv_scale_format=scale_format,
+            prefill_impl=impl,
         )
 
 

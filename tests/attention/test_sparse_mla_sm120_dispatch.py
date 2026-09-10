@@ -166,12 +166,16 @@ def test_supported_configs_nvfp4_envelope() -> None:
 
 
 @pytest.mark.parametrize("layout", ["2d", "3d", "hnd", "nhd"])
-def test_glm53_canonical_payload_is_scoped_to_model(layout: str) -> None:
-    """A 528-byte row is valid only with GLM NoPE geometry and scale semantics."""
+def test_equal_payload_sizes_keep_model_selection_explicit(layout: str) -> None:
+    """GLM NoPE and DSV4_1 share 528 bytes, but have different scale layouts."""
     glm = _resolve_model_type(512, "arbitrary_fp32")
+    dsv41 = _resolve_model_type(512, "ue8m0_g32")
     assert glm == _MODEL_TYPE_GLM53_NOPE
+    assert dsv41 == _MODEL_TYPE_DSV4_1
+    assert glm != dsv41
     assert _resolve_model_type(512, "auto") == _MODEL_TYPE_DSV4
     assert supported_sparse_mla_sm120_configs()["glm53_nope"].bytes_per_token == 528
+    assert supported_sparse_mla_sm120_configs()["dsv4_1"].bytes_per_token == 528
     shape = {
         "2d": (2, 64 * 528),
         "3d": (2, 64, 528),
@@ -180,6 +184,7 @@ def test_glm53_canonical_payload_is_scoped_to_model(layout: str) -> None:
     }[layout]
     cache = torch.empty(shape, dtype=torch.uint8, device="meta")
     assert _packed_kv_page_block_size(cache, model_type=glm, name="kv") == 64
+    assert _packed_kv_page_block_size(cache, model_type=dsv41, name="kv") == 64
     for model_type in (_MODEL_TYPE_DSV4, _MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
         with pytest.raises(ValueError):
             _packed_kv_page_block_size(cache, model_type=model_type, name="kv")
