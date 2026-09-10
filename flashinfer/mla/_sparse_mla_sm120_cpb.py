@@ -83,7 +83,9 @@ logger = logging.getLogger(__name__)
 _BI = 64  # chunk width in candidates (BLOCK_SIZE_N)
 _HPB = 16  # head tile per block
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+# Version 2 invalidates tuning from before GLM53_NOPE's canonical 528B payload.
+# Constants and measured overrides can otherwise retain the old 656B footprint.
 # Only current-schema files load; any other version counts as absent and the
 # families recalibrate on the next tuning-mode pass.
 _BYTES_PER_TOKEN = {
