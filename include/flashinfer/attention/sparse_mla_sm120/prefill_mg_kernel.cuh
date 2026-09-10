@@ -80,8 +80,12 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
     int h_start, int topk_len) {
   using KV = KVCacheTraits<MT>;
   using Cfg = PrefillTileCfg<MT>;
-  // CT pinned to FP8: XV always uses FP8 W; CM only flips the QK side.
-  using CT = ComputeTraits<MT, ComputeMode::FP8, Cfg::BI, Cfg::MATH_WARPS>;
+  // CT pinned to FP8: XV always uses FP8 W; CM only flips the QK side. Only
+  // warp-count-independent members (N_V_CHUNKS, V_CHUNK, W_FP8_STRIDE) are read
+  // through CT, so it takes the XV warp count: at the full MATH_WARPS a
+  // 32-wide-group model (DSV4_1) would floor NT_PER_WARP_XV to 0 and trip the
+  // ComputeTraits assert even though no QK warp runs the XV mapping.
+  using CT = ComputeTraits<MT, ComputeMode::FP8, Cfg::BI, Cfg::MATH_WARPS - Cfg::QK_WARPS>;
   using CT_XV = ComputeTraits<MT, ComputeMode::FP8, Cfg::BI, Cfg::MATH_WARPS - Cfg::QK_WARPS>;
   using L = SmemLayout<MT, CM, Cfg::BI, Cfg::MATH_WARPS>;
   static_assert(Cfg::SPLIT_QK_XV, "the producer/consumer path requires a QK/XV warp split");
@@ -523,7 +527,12 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
   using KV = KVCacheTraits<MT>;
   using Cfg = PrefillTileCfg<MT>;
   // CT pinned to FP8: XV always uses FP8 W; CM only flips the QK side.
-  using CT = ComputeTraits<MT, ComputeMode::FP8, Cfg::BI, Cfg::MATH_WARPS>;
+  // On a split tile the serial tail below is unreachable (the pc path above
+  // returns first), but it is still instantiated — use the XV warp count there
+  // so the ComputeTraits NT_PER_WARP_XV assert sees the warp count the XV MMA
+  // would run at (a 32-wide-group model floors it to 0 at MATH_WARPS).
+  using CT = ComputeTraits<MT, ComputeMode::FP8, Cfg::BI,
+                           Cfg::SPLIT_QK_XV ? Cfg::MATH_WARPS - Cfg::QK_WARPS : Cfg::MATH_WARPS>;
   using L = SmemLayout<MT, CM, Cfg::BI, Cfg::MATH_WARPS>;
 
   // Ceil-div so NUM_HEADS < HPB (small-TP shards) still launches 1 CTA per token.

@@ -86,13 +86,31 @@ _HPB = 16  # head tile per block
 _SCHEMA_VERSION = 1
 # Only current-schema files load; any other version counts as absent and the
 # families recalibrate on the next tuning-mode pass.
-_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 528, "dots3_swa": 1160}
-_D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
-_D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
+_BYTES_PER_TOKEN = {
+    "dsv4": 584,
+    "dsv3_2": 656,
+    "glm53_nope": 528,
+    "dots3_swa": 1160,
+    "dsv4_1": 528,
+}
+_D_QK = {
+    "dsv4": 512,
+    "dsv3_2": 576,
+    "glm53_nope": 512,
+    "dots3_swa": 1088,
+    "dsv4_1": 512,
+}
+_D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024, "dsv4_1": 512}
 # Kernel candidate-tile width per family: DOTS3_SWA decodes at BI=32 (its
 # 1040-byte KV smem stride does not fit BI=64); the others run 64. The head
 # tile is HPB=16 for every family.
-_CHUNK_WIDTH = {"dsv4": 64, "dsv3_2": 64, "glm53_nope": 64, "dots3_swa": 32}
+_CHUNK_WIDTH = {
+    "dsv4": 64,
+    "dsv3_2": 64,
+    "glm53_nope": 64,
+    "dots3_swa": 32,
+    "dsv4_1": 64,
+}
 
 # Device-level key in the JSON payload holding the crossover table.
 _DECODE_MAX_TOKENS_KEY = "decode_max_tokens"
@@ -105,6 +123,28 @@ _CROSSOVER_MARGIN = 0.95
 # measured best; the window covers every model-vs-oracle gap observed in the
 # kernel-bench sweep matrix (max distance 6 at mid-T wave-quantization rows).
 _REFINE_WINDOW = 6
+
+
+def _model_type_for_family(family: str) -> int:
+    """FFI model_type for one calibration family (the decode-dsv4 FFI needs the
+    explicit selector: DSV4_1 shares d_qk=512 with DSV4)."""
+    from ._sparse_mla_sm120_plan import (
+        _MODEL_TYPE_DSV3_2,
+        _MODEL_TYPE_DSV4,
+        _MODEL_TYPE_DSV4_1,
+        _MODEL_TYPE_DOTS3_SWA,
+        _MODEL_TYPE_GLM53_NOPE,
+    )
+
+    return {
+        "dsv4": _MODEL_TYPE_DSV4,
+        "dsv4_1": _MODEL_TYPE_DSV4_1,
+        "dots3_swa": _MODEL_TYPE_DOTS3_SWA,
+        "glm53_nope": _MODEL_TYPE_GLM53_NOPE,
+        # dsv3_2 and glm_nsa share the dsv3_2-kernel call path, which re-maps
+        # glm_nsa at the builder; calibrate() only ever passes dsv3_2 here.
+    }.get(family, _MODEL_TYPE_DSV3_2)
+
 
 # (num_tokens, num_heads, topk, chunks_per_block); see calibrate().
 _MEASUREMENTS = (
@@ -438,8 +478,9 @@ def _make_decode_call_builder(
     cpb)`` to a ``call(indices) -> None`` closure that drives the family's
     decode kernel over ``kv_cache``, so the two calibration passes' FFI
     argument lists cannot drift apart. ``model_type`` only reaches the
-    dsv3_2-kernel families; the decode-dsv4 FFI resolves the model type from
-    ``d_qk`` itself (512 -> DSV4, 1088 -> DOTS3_SWA).
+    dsv3_2-kernel families (where one family hosts several model types); the
+    decode-dsv4 branch derives it from the family itself (DSV4_1 shares
+    d_qk=512 with DSV4, so width alone cannot resolve it).
     """
     d_qk = _D_QK[family]
     d_v = _D_V[family]
@@ -480,7 +521,7 @@ def _make_decode_call_builder(
             num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
         )
         out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
-        if family in ("dsv4", "dots3_swa"):
+        if family in ("dsv4", "dots3_swa", "dsv4_1"):
 
             def call(indices: torch.Tensor) -> None:
                 module.sparse_mla_sm120_decode_dsv4(
@@ -498,6 +539,7 @@ def _make_decode_call_builder(
                     None,
                     None,
                     None,
+                    _model_type_for_family(family),
                     cpb,
                 )
 
@@ -546,10 +588,6 @@ def calibrate(
         raise CalibrationError(
             "sparse-MLA SM120 calibration must not run under CUDA graph capture"
         )
-    from ._sparse_mla_sm120_plan import (
-        _MODEL_TYPE_DSV3_2,
-        _MODEL_TYPE_GLM53_NOPE,
-    )
 
     device = torch.device(device)
     props = torch.cuda.get_device_properties(device)
@@ -564,9 +602,7 @@ def calibrate(
         "dots3_swa": _MEASUREMENTS_DOTS3_SWA,
     }
     measurements = _CPB_PAIR_MEASUREMENTS.get(family, _MEASUREMENTS)
-    model_type = (
-        _MODEL_TYPE_GLM53_NOPE if family == "glm53_nope" else _MODEL_TYPE_DSV3_2
-    )
+    model_type = _model_type_for_family(family)
 
     kv_cache, num_slots = _allocate_kv_pool(family, device)
 
@@ -711,11 +747,13 @@ def calibrate_crossover(
     from ._sparse_mla_sm120_plan import (
         _DECODE_DSV3_2_CALIBRATION_GRID,
         _DECODE_DSV4_CALIBRATION_GRID,
+        _DECODE_DSV4_1_CALIBRATION_GRID,
         _DECODE_GLM53_NOPE_CALIBRATION_GRID,
         _DECODE_DOTS3_SWA_CALIBRATION_GRID,
         _PREFILL_IMPL_AUTO,
         _MODEL_TYPE_DSV3_2,
         _MODEL_TYPE_DSV4,
+        _MODEL_TYPE_DSV4_1,
         _MODEL_TYPE_GLM_NSA,
         _MODEL_TYPE_GLM53_NOPE,
         _MODEL_TYPE_DOTS3_SWA,
@@ -736,6 +774,14 @@ def calibrate_crossover(
         # (key prefix, calibration grid, FFI model_type)
         spaces = [
             ("dsv4", grid or sorted(_DECODE_DSV4_CALIBRATION_GRID), _MODEL_TYPE_DSV4)
+        ]
+    elif family == "dsv4_1":
+        spaces = [
+            (
+                "dsv4_1",
+                grid or sorted(_DECODE_DSV4_1_CALIBRATION_GRID),
+                _MODEL_TYPE_DSV4_1,
+            )
         ]
     elif family == "dsv3_2":
         pairs = grid or sorted(_DECODE_DSV3_2_CALIBRATION_GRID)
@@ -867,11 +913,6 @@ def refine_cpb(
     up. Dual-cache (extra_topk > 0) shapes stay on the model: their measured
     pick error stays within ~6%.
     """
-    from ._sparse_mla_sm120_plan import (
-        _MODEL_TYPE_DSV3_2,
-        _MODEL_TYPE_GLM53_NOPE,
-    )
-
     if family not in _BYTES_PER_TOKEN:
         raise ValueError(f"unknown sparse-MLA family {family!r}")
     if torch.cuda.is_current_stream_capturing():
@@ -884,9 +925,7 @@ def refine_cpb(
     center = select_cpb(num_tokens, num_heads, topk, 0, c, chunk_width=bi)
     kv_cache, num_slots = _allocate_kv_pool(family, device)
     build_call = _make_decode_call_builder(module_getter(), family, device, kv_cache)
-    model_type = (
-        _MODEL_TYPE_GLM53_NOPE if family == "glm53_nope" else _MODEL_TYPE_DSV3_2
-    )
+    model_type = _model_type_for_family(family)
     best_cpb, best_t = center, float("inf")
     lo = max(1, center - _REFINE_WINDOW)
     hi = min(n, center + _REFINE_WINDOW)
@@ -1156,12 +1195,14 @@ def crossover_grid_complete(device: torch.device, family: str) -> bool:
     from ._sparse_mla_sm120_plan import (
         _DECODE_DSV3_2_CALIBRATION_GRID,
         _DECODE_DSV4_CALIBRATION_GRID,
+        _DECODE_DSV4_1_CALIBRATION_GRID,
         _DECODE_GLM53_NOPE_CALIBRATION_GRID,
         _DECODE_DOTS3_SWA_CALIBRATION_GRID,
     )
 
     key_spaces = {
         "dsv4": (("dsv4", _DECODE_DSV4_CALIBRATION_GRID),),
+        "dsv4_1": (("dsv4_1", _DECODE_DSV4_1_CALIBRATION_GRID),),
         "dsv3_2": (
             ("dsv3_2", _DECODE_DSV3_2_CALIBRATION_GRID),
             ("glm_nsa", _DECODE_DSV3_2_CALIBRATION_GRID),

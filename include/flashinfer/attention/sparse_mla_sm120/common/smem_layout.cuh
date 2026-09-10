@@ -44,7 +44,13 @@
 template <ModelType MT, ComputeMode CM, int TILE_BI = BI, int TILE_MATH_WARPS = N_MATH_WARPS>
 struct SmemLayout {
   using KV = KVCacheTraits<MT>;
-  using CT = ComputeTraits<MT, CM, TILE_BI, TILE_MATH_WARPS>;
+  // Only warp-count-independent CT members (N_V_CHUNKS) are read here, but the
+  // ComputeTraits assert still fires on a degenerate XV mapping: on a split
+  // tile the XV warps are TILE_MATH_WARPS - TILE_BI/8, and a 32-wide-group
+  // model (DSV4_1) floors NT_PER_WARP_XV to 0 at the full warp count.
+  static constexpr bool SPLIT_PC = (TILE_MATH_WARPS * 8 != TILE_BI);
+  static constexpr int XV_WARPS = SPLIT_PC ? TILE_MATH_WARPS - TILE_BI / 8 : TILE_MATH_WARPS;
+  using CT = ComputeTraits<MT, CM, TILE_BI, XV_WARPS>;
 
   // Q buffers
   static constexpr bool BF16_Q = (CM == ComputeMode::BF16);
@@ -78,7 +84,6 @@ struct SmemLayout {
   // math warps run a QK-producer / XV-consumer pipeline, so the handoff
   // buffers (w_fp8, w_head_sc_all) are double-buffered by tile parity and a
   // small alpha array carries the softmax rescale factor between the groups.
-  static constexpr bool SPLIT_PC = (TILE_MATH_WARPS * 8 != TILE_BI);
   static constexpr size_t SMEM_W_SC_ONE = CT::N_V_CHUNKS * HPB * sizeof(float);
   static constexpr size_t SMEM_W_SC_ALL = SMEM_W_SC_ONE * (SPLIT_PC ? 2 : 1);
   static constexpr size_t SMEM_W_FP8_ONE = HPB * (TILE_BI + 16);

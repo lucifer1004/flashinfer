@@ -40,12 +40,18 @@
 //               and a compact 528B pool are the same kernel (the payload prefix
 //               is identical). A flat 2D cache must be packed at 528B.
 //   DOTS3_SWA: d_nope=1024, d_rope=64, UE8M0 scale footer, 1160B/token
+//   DSV4_1:  d_nope=512, d_rope=0, UE8M0 scale footer (32-wide groups),
+//            528B/token. DeepSeek-V4.1 quantizes the full 512-wide K (rope
+//            lanes included) to FP8, so there is no BF16 rope segment: the
+//            geometry matches GLM53_NOPE while the scale placement matches
+//            DSV4. The 528B payload collides with GLM53_NOPE's, so this type
+//            can only be selected explicitly, never inferred from widths.
 //
 // DOTS3_SWA is the sliding-window family: its candidate list is a 513-token
 // positional window rather than a genuine top-k. It is the first model whose
 // d_v diverges from 512 (it is 1024), so it opts out of the shared D_V assert
 // in kv_cache_traits.cuh.
-enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA };
+enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA, DSV4_1 };
 
 // Bytes per packed KV cache token row, per model type. For GLM53_NOPE this is
 // the payload; the gmem row advance is a runtime stride >= this value.
@@ -60,6 +66,8 @@ constexpr int bytes_per_token(ModelType mt) {
       return 584;
     case ModelType::DOTS3_SWA:
       return 1160;
+    case ModelType::DSV4_1:
+      return 528;
   }
   return 0;  // unreachable for a valid ModelType
 }

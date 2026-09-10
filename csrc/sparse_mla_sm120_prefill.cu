@@ -32,7 +32,8 @@
 //     GLM_NSA / GLM53_NOPE), num_heads 64 / 128, single cache
 //   - SG (single-group, 16 heads/CTA): V32 family num_heads 8 / 16;
 //     DOTS3_SWA num_heads {8, 16, 32, 64} — SG-only, its D_NOPE=1024 does not
-//     fit the MG layout
+//     fit the MG layout; DSV4_1 num_heads {8, 16, 32, 64} — also SG-only, its
+//     32-wide quant groups floor the MG XV warp split to zero tiles
 //   - MG (multi-group, 32 heads/CTA): V32 family num_heads >= 32; DSV4
 //     num_heads {8..128}
 //   - MG_DUAL: dual-cache MG variants (DSV4 only)
@@ -388,6 +389,42 @@ inline bool dispatch_dots3_swa_sg(int num_heads, int topk, int page_block_size, 
 #undef DISPATCH_DOTS3_SWA_SG
 }
 
+// DSV4_1 is SG-only for the same structural reason as DOTS3_SWA, but with the
+// warp split driven by its 32-wide quant groups (V_CHUNK=32 floors
+// NT_PER_WARP_XV to 0 for an 8-warp XV) rather than by smem capacity. Any
+// runtime topk made of whole index tiles is served; the binding enforces
+// topk % 64 == 0. TP1..TP8 shards of the 64-head layer ride REPLICATE_H.
+inline bool dispatch_dsv4_1_sg(int num_heads, int topk, int page_block_size, const bf16* Q,
+                               const uint8_t* KV, const int32_t* indices, const float* attn_sink,
+                               bf16* output, float* out_lse, float sm_scale, int num_tokens,
+                               size_t stride_kv_block, size_t stride_out_lse,
+                               const int* topk_length_ptr, cudaStream_t stream) {
+  if (page_block_size != 64) return false;
+
+#define DISPATCH_DSV4_1_SG(NH)                                                                 \
+  launch_prefill_sg<ModelType::DSV4_1, ComputeMode::FP8, NH, 64>(                              \
+      Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, stride_kv_block, \
+      stride_out_lse, topk_length_ptr, stream)
+
+  switch (num_heads) {
+    case 8:
+      DISPATCH_DSV4_1_SG(8);
+      return true;
+    case 16:
+      DISPATCH_DSV4_1_SG(16);
+      return true;
+    case 32:
+      DISPATCH_DSV4_1_SG(32);
+      return true;
+    case 64:
+      DISPATCH_DSV4_1_SG(64);
+      return true;
+    default:
+      return false;
+  }
+#undef DISPATCH_DSV4_1_SG
+}
+
 inline bool dispatch_dsv4_single(int num_heads, int topk, int page_block_size, const bf16* Q,
                                  const uint8_t* KV, const int32_t* indices, const float* attn_sink,
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
@@ -575,6 +612,11 @@ bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_h
         return dispatch_dots3_swa_sg(num_heads, topk, page_block_size, Q, KV_cache, indices,
                                      attn_sink, output, out_lse, sm_scale, num_tokens,
                                      stride_kv_block, stride_out_lse, topk_length, stream);
+      }
+      if (mt == ModelType::DSV4_1) {
+        return dispatch_dsv4_1_sg(num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink,
+                                  output, out_lse, sm_scale, num_tokens, stride_kv_block,
+                                  stride_out_lse, topk_length, stream);
       }
       DISPATCH_V32(dispatch_v32_sg);
     }

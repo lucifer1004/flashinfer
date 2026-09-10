@@ -170,9 +170,10 @@ __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, int idx,
   constexpr int SCALE_BYTES = KV::SCALE_BYTES_PER_TOKEN;
   // Only reachable for footer-scale models (the inline ones return above), so
   // the width check is disjoined rather than applied to every instantiation.
-  static_assert(KV::SCALE_IN_KV_SMEM || SCALE_BYTES == sizeof(uint64_t),
-                "the footer gather moves one uint64 per token; a different footer width needs a "
-                "different load");
+  static_assert(
+      KV::SCALE_IN_KV_SMEM || SCALE_BYTES == sizeof(uint64_t) || SCALE_BYTES == sizeof(uint4),
+      "the footer gather moves one wide word per token; a different footer width "
+      "needs a different load");
   static_assert(TILE_BI <= TILE_IO_THREADS,
                 "per-thread index staging assumes at most one candidate per IO thread");
   if (io_tid >= TILE_BI) return;
@@ -187,6 +188,11 @@ __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, int idx,
   const uint8_t* src = kv_ptr + (size_t)(idx / pbs) * stride_kv_block +
                        (size_t)pbs * IO::IO_STRIDE + (size_t)(idx % pbs) * SCALE_BYTES;
   src = valid ? src : sparse_mla_zero_row;
-  *reinterpret_cast<uint64_t*>(scale_dst + io_tid * SCALE_BYTES) =
-      __ldg(reinterpret_cast<const uint64_t*>(src));
+  if constexpr (SCALE_BYTES == sizeof(uint4)) {
+    *reinterpret_cast<uint4*>(scale_dst + io_tid * SCALE_BYTES) =
+        __ldg(reinterpret_cast<const uint4*>(src));
+  } else {
+    *reinterpret_cast<uint64_t*>(scale_dst + io_tid * SCALE_BYTES) =
+        __ldg(reinterpret_cast<const uint64_t*>(src));
+  }
 }

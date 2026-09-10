@@ -127,6 +127,22 @@ struct PrefillTilePrimary {
   static constexpr int WINDOW = 0;
 };
 
+// DSV4_1 takes the DOTS3_SWA split tile (BI=32, 4 QK warps + 4 XV warps) for a
+// different reason: its 32-wide quant groups make V_CHUNK=32, and the XV fold
+// ties each W buffer to one scale group, so an 8-warp XV split would floor
+// NT_PER_WARP_XV to 0. The MG kernel's XV mapping has the same constraint and
+// no warp split, so DSV4_1 is SG-only; NUM_HEADS > 16 is served by CTA
+// replication.
+template <>
+struct PrefillTilePrimary<ModelType::DSV4_1> {
+  static constexpr int CAND_WINDOW = 32;  // -> QK_WARPS = 4
+  static constexpr int MATH_WARPS = 8;    // XV/epilogue split, decoupled from QK
+  static constexpr int IO_WARPS = 4;
+  static constexpr bool REG_REALLOC = true;
+  static constexpr bool L2_EVICT_FIRST = true;  // genuine top-k, like DSV4
+  static constexpr int WINDOW = 0;
+};
+
 template <>
 struct PrefillTilePrimary<ModelType::DOTS3_SWA> {
   // 1024-wide nope: at BI=64 the KV double buffer alone is 64 * 1040 * 2 =

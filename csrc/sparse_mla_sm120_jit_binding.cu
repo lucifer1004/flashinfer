@@ -120,7 +120,7 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
                               Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
                               Optional<TensorView> extra_kv_cache,
                               Optional<TensorView> extra_indices,
-                              Optional<TensorView> extra_topk_length,
+                              Optional<TensorView> extra_topk_length, int64_t model_type,
                               int64_t chunks_per_block_override) {
   TVM_FFI_ICHECK_EQ(q.ndim(), 3) << "q must be [T, H, D_QK]";
   TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2);
@@ -151,11 +151,18 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
       << "indices leading dimension must match num_tokens";
   const int topk = static_cast<int>(indices.size(-1));
   const int d_qk = static_cast<int>(q.size(2));
-  // This kernel serves the footer-scale model types. d_qk selects between them:
-  // 512 -> DSV4, 1088 -> DOTS3_SWA (sliding-window family, d_v 1024).
+  // This kernel serves the footer-scale model types. model_type is the
+  // explicit selector from the Python planner; -1 keeps the legacy width
+  // inference (512 -> DSV4, 1088 -> DOTS3_SWA). Width alone cannot separate
+  // DSV4 from DSV4_1 (both are d_qk=512), so DSV4_1 is only reachable
+  // explicitly.
   TVM_FFI_ICHECK(d_qk == 512 || d_qk == 1088)
-      << "decode-dsv4 supports d_qk 512 (DSV4) or 1088 (DOTS3_SWA); got " << d_qk;
-  const ModelType mt = (d_qk == 512) ? ModelType::DSV4 : ModelType::DOTS3_SWA;
+      << "decode-dsv4 supports d_qk 512 (DSV4/DSV4_1) or 1088 (DOTS3_SWA); got " << d_qk;
+  const ModelType mt = model_type == -1 ? ((d_qk == 512) ? ModelType::DSV4 : ModelType::DOTS3_SWA)
+                                        : static_cast<ModelType>(model_type);
+  TVM_FFI_ICHECK((d_qk == 512 && (mt == ModelType::DSV4 || mt == ModelType::DSV4_1)) ||
+                 (d_qk == 1088 && mt == ModelType::DOTS3_SWA))
+      << "decode-dsv4 model_type mismatch: d_qk=" << d_qk << " model_type=" << model_type;
   // DOTS3_SWA's sliding window (513 candidates, DecodeTileCfg::WINDOW) needs an
   // indices buffer at least that wide; a narrower one can never name the full
   // window. Report it here so the message names the actual constraint.
@@ -165,7 +172,7 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
       << topk;
   TVM_FFI_ICHECK(mt != ModelType::DOTS3_SWA || !extra_kv_cache.has_value())
       << "decode-dsv4 (dots3_swa) has no dual-cache form; extra_kv_cache is "
-         "DSV4-only";
+         "DSV4/DSV4_1-only";
 
   // topk_length is optional for DOTS3_SWA: DecodeTileCfg<DOTS3_SWA>::WINDOW caps
   // the per-token candidate count inside the kernel, so omitting it costs

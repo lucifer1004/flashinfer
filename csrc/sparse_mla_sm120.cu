@@ -69,8 +69,8 @@ inline ModelType resolve_model_type(int d_qk, int64_t model_type) {
   if (d_qk == 512) {
     const auto mt = static_cast<ModelType>(
         model_type == kAuto ? static_cast<int64_t>(ModelType::DSV4) : model_type);
-    TVM_FFI_ICHECK(mt == ModelType::DSV4 || mt == ModelType::GLM53_NOPE)
-        << "d_qk=512 supports model_type auto, DSV4, or GLM53_NOPE; got " << model_type;
+    TVM_FFI_ICHECK(mt == ModelType::DSV4 || mt == ModelType::GLM53_NOPE || mt == ModelType::DSV4_1)
+        << "d_qk=512 supports model_type auto, DSV4, GLM53_NOPE, or DSV4_1; got " << model_type;
     return mt;
   }
   if (d_qk == 1088) {
@@ -81,8 +81,8 @@ inline ModelType resolve_model_type(int d_qk, int64_t model_type) {
     return mt;
   }
   TVM_FFI_ICHECK(false) << "Unsupported d_qk=" << d_qk
-                        << "; expected 576 (DSV3_2/GLM_NSA), 512 (DSV4/GLM53_NOPE) or 1088 "
-                           "(DOTS3_SWA)";
+                        << "; expected 576 (DSV3_2/GLM_NSA), 512 (DSV4/GLM53_NOPE/DSV4_1) "
+                           "or 1088 (DOTS3_SWA)";
   return ModelType::DSV4;
 }
 
@@ -358,6 +358,9 @@ void SparseMlaSm120PagedAttention(
       break;
     case ModelType::DOTS3_SWA:
       mt_name = "DOTS3_SWA";
+      break;
+    case ModelType::DSV4_1:
+      mt_name = "DSV4_1";
       break;
     case ModelType::DSV4:
       break;

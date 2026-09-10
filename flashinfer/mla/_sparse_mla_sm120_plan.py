@@ -70,6 +70,11 @@ _MODEL_TYPE_DSV4 = 1
 _MODEL_TYPE_GLM_NSA = 2
 _MODEL_TYPE_GLM53_NOPE = 3
 _MODEL_TYPE_DOTS3_SWA = 4
+# DeepSeek-V4.1: GLM53_NOPE geometry (512-wide all-FP8 K, no BF16 rope) with a
+# DSV4-style UE8M0 footer, but 32-wide quant groups (16 scales, 16B/token).
+# Its 528B payload collides with GLM53_NOPE's, so it is only ever selected
+# explicitly (kv_scale_format="ue8m0_g32"), never inferred from widths.
+_MODEL_TYPE_DSV4_1 = 5
 # The V32 kernel family: the inline-scale cache ABI. DSV3_2/GLM_NSA rows are
 # 656B; GLM53_NOPE is the rope-free member (d_qk=512) with a 528B payload and
 # a runtime gmem row stride (a legacy 656B vLLM pool works unchanged — the
@@ -82,6 +87,7 @@ _BPT_DSV3_2 = 656
 _BPT_GLM53_NOPE = 528
 _BPT_DSV4 = 584
 _BPT_DOTS3_SWA = 1160
+_BPT_DSV4_1 = 528
 
 # d_v per model type. Every DeepSeek-family type is 512; DOTS3_SWA is the one
 # divergence (its latent V is the full 1024-wide latent, rope excluded).
@@ -91,6 +97,7 @@ _D_V_BY_MODEL_TYPE = {
     _MODEL_TYPE_GLM_NSA: 512,
     _MODEL_TYPE_GLM53_NOPE: 512,
     _MODEL_TYPE_DOTS3_SWA: 1024,
+    _MODEL_TYPE_DSV4_1: 512,
 }
 
 # Kernel-family names used in the public config query and error messages.
@@ -100,6 +107,7 @@ _MODEL_TYPE_TO_FAMILY = {
     _MODEL_TYPE_GLM_NSA: "glm_nsa",
     _MODEL_TYPE_GLM53_NOPE: "glm53_nope",
     _MODEL_TYPE_DOTS3_SWA: "dots3_swa",
+    _MODEL_TYPE_DSV4_1: "dsv4_1",
 }
 
 
@@ -170,6 +178,10 @@ _DECODE_GLM53_NOPE_DISPATCH = _DecodeDispatchEnvelope(1)
 # layer (TP4 -> 16) and any other count up to 128.
 _DECODE_DOTS3_SWA_DISPATCH = _DecodeDispatchEnvelope(513)
 
+# DSV4_1 decode: the decode-dsv4 kernel at BI=64 / 4 math warps (the 32-wide
+# quant groups bound the XV warp split). Dual-cache is supported like DSV4.
+_DECODE_DSV4_1_DISPATCH = _DecodeDispatchEnvelope(1)
+
 # Calibration/documented topk values per family (the crossover sweep points).
 # Any width >= min_topk above is served; these are the values with measured
 # crossover data.
@@ -177,6 +189,7 @@ _DECODE_DSV4_TOPKS = frozenset({128, 192, 256, 512, 1024})
 _DECODE_DSV3_2_TOPKS = frozenset({128, 512, 1024, 2048})
 _DECODE_GLM53_NOPE_TOPK = 2176
 _DECODE_DOTS3_SWA_TOPK = 576
+_DECODE_DSV4_1_TOPK = 512  # the V4.1 indexer topk
 
 # Crossover-calibration grids: the (num_heads, topk) pairs the tuning-mode
 # sweep times on both paths. Deliberately NOT the full eligibility envelope —
@@ -196,6 +209,9 @@ _DECODE_GLM53_NOPE_CALIBRATION_GRID = frozenset(
 )
 _DECODE_DOTS3_SWA_CALIBRATION_GRID = frozenset(
     (h, _DECODE_DOTS3_SWA_TOPK) for h in (8, 16, 32, 64)
+)
+_DECODE_DSV4_1_CALIBRATION_GRID = frozenset(
+    (h, _DECODE_DSV4_1_TOPK) for h in _CALIBRATION_HEADS
 )
 
 
@@ -291,6 +307,9 @@ def decode_splitk_eligible(
     if model_type == _MODEL_TYPE_DSV4:
         # The decode-dsv4 kernel takes the secondary cache as runtime args.
         return (num_heads, topk) in _DECODE_DSV4_DISPATCH
+    if model_type == _MODEL_TYPE_DSV4_1:
+        # Same kernel, DSV4_1 tile; dual-cache supported like DSV4.
+        return (num_heads, topk) in _DECODE_DSV4_1_DISPATCH
     if model_type == _MODEL_TYPE_GLM53_NOPE:
         # decode-v32 has no dual-cache form.
         return not has_extra and (num_heads, topk) in _DECODE_GLM53_NOPE_DISPATCH
@@ -322,6 +341,11 @@ def prefill_swapab_eligible(
 _DOTS3_SWA_MIN_TOPK = 513
 _DOTS3_SWA_SG_HEADS = frozenset({8, 16, 32, 64})
 
+# DSV4_1 prefill is likewise SG-only: its 32-wide quant groups floor the MG XV
+# warp split to zero tiles (see PrefillTilePrimary<DSV4_1>). SG runs it on the
+# BI=32 producer/consumer tile; num_heads > 16 replicates CTAs.
+_DSV4_1_SG_HEADS = frozenset({8, 16, 32, 64})
+
 
 def prefill_sg_eligible(
     model_type: int, num_heads: int, topk: int, page_block_size: int, has_extra: bool
@@ -333,6 +357,13 @@ def prefill_sg_eligible(
             and topk >= _DOTS3_SWA_MIN_TOPK
             and topk % _BI == 0
             and num_heads in _DOTS3_SWA_SG_HEADS
+        )
+    if model_type == _MODEL_TYPE_DSV4_1:
+        return (
+            not has_extra
+            and page_block_size == _PAGE_BLOCK_SIZE
+            and _prefill_topk_ok(topk)
+            and num_heads in _DSV4_1_SG_HEADS
         )
     return (
         model_type in _V32_MODEL_TYPES

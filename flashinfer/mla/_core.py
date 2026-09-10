@@ -544,7 +544,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     lse: Optional[torch.Tensor],
     return_lse: bool,
     kv_scale_format: str,
-    kv_cache_format: Literal["fp8", "nvfp4"] = "fp8",
+    kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41"] = "fp8",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if not is_sm12x_supported(query.device):
         raise ValueError(
@@ -644,9 +644,10 @@ def _trtllm_batch_decode_sparse_mla_sm120(
         if return_lse:
             return out, user_lse if user_lse is not None else out_lse_arg
         return out
-    if kv_cache_format != "fp8":
+    if kv_cache_format not in ("fp8", "fp8_dsv41"):
         raise ValueError(
-            f"kv_cache_format must be either 'fp8' or 'nvfp4', got {kv_cache_format!r}"
+            "kv_cache_format must be 'fp8', 'fp8_dsv41', or 'nvfp4', got "
+            f"{kv_cache_format!r}"
         )
 
     from ._sparse_mla_sm120 import SparseMLASm120Wrapper
@@ -1385,7 +1386,7 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     bmm2_scale: float,
     sinks: Optional[torch.Tensor],
     kv_layout: Literal["HND", "NHD"],
-    kv_cache_format: Literal["fp8", "nvfp4"],
+    kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41"],
 ) -> torch.Tensor:
     if bmm2_scale != 1.0:
         raise ValueError("SM120 DSv4 sparse MLA does not support bmm2_scale")
@@ -1408,6 +1409,11 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
         raise ValueError("backend='sparse' requires swa_topk_lens")
     if kv_cache_format == "nvfp4" and num_heads == 8:
         raise ValueError("NVFP4 sparse MLA does not yet support 8 query heads")
+
+    # Packed FP8 row width per cache format: DSV4 is 584B (448B FP8 + 128B
+    # BF16 rope + 8B UE8M0 footer); DSV4.1 is 528B (512B all-FP8 K + 16B
+    # 32-wide-group UE8M0 footer).
+    packed_row_bytes = 528 if kv_cache_format == "fp8_dsv41" else 584
 
     swa_kv_cache = _check_sm120_dsv4_kv_cache_layout(
         swa_kv_cache, kv_layout, "swa_kv_cache"
@@ -1432,10 +1438,10 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             )
     else:
         if swa_kv_cache.dtype == torch.uint8:
-            if swa_kv_cache.size(-1) != 584:
+            if swa_kv_cache.size(-1) != packed_row_bytes:
                 raise ValueError(
-                    "Expected packed SM120 DSV4 swa_kv_cache head dim 584, got "
-                    f"{swa_kv_cache.size(-1)}"
+                    f"Expected packed SM120 {kv_cache_format} swa_kv_cache head dim "
+                    f"{packed_row_bytes}, got {swa_kv_cache.size(-1)}"
                 )
         elif swa_kv_cache.dtype != query.dtype:
             raise ValueError(
@@ -1492,10 +1498,11 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
                 )
         else:
             if compressed_kv_cache.dtype == torch.uint8:
-                if compressed_kv_cache.size(-1) != 584:
+                if compressed_kv_cache.size(-1) != packed_row_bytes:
                     raise ValueError(
-                        "Expected packed SM120 DSV4 compressed_kv_cache head dim "
-                        f"584, got {compressed_kv_cache.size(-1)}"
+                        f"Expected packed SM120 {kv_cache_format} compressed_kv_cache "
+                        f"head dim {packed_row_bytes}, got "
+                        f"{compressed_kv_cache.size(-1)}"
                     )
             elif compressed_kv_cache.dtype != query.dtype:
                 raise ValueError(
@@ -1527,7 +1534,9 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             sinks=sinks,
             lse=None,
             return_lse=False,
-            kv_scale_format="auto",
+            # fp8_dsv41 selects the DSV4_1 model type (32-wide UE8M0 groups)
+            # in the SM120 runner; 'fp8' stays on the DSV4 default.
+            kv_scale_format=("ue8m0_g32" if kv_cache_format == "fp8_dsv41" else "auto"),
             kv_cache_format=kv_cache_format,
         ),
     )
@@ -1868,7 +1877,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None,
     dsv4_output_scale: Optional[torch.Tensor] = None,
     *,
-    kv_cache_format: Literal["fp8", "nvfp4"] = "fp8",
+    kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41"] = "fp8",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode DeepSeek V4 sparse MLA.
 
@@ -1887,8 +1896,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     length for the SWA validity window.
 
     On SM120/SM121, this calls the packed sparse backend. ``swa_kv_cache`` is
-    the required packed uint8 SWA pool: 584 bytes per token for FP8 or 384
-    bytes per token for group-16 NVFP4, selected by ``kv_cache_format``.
+    the required packed uint8 SWA pool: 584 bytes per token for FP8, 528 for
+    FP8 DSv4.1 (``kv_cache_format="fp8_dsv41"``), or 384 bytes per token for
+    group-16 NVFP4, selected by ``kv_cache_format``.
     ``sparse_indices`` and ``swa_topk_lens`` describe the active SWA segment.
     To add a compressed segment, pass ``compressed_kv_cache`` as another pool
     in the same format and pass ``extra_sparse_indices`` with
@@ -2054,18 +2064,24 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``[sum_q, 16, 4096]`` and group-major strides
         ``(4096, sum_q * 4096, 1)``; ``out_scale`` uses the packed UE8M0
         layout described above.
-    kv_cache_format : {"fp8", "nvfp4"}
+    kv_cache_format : {"fp8", "nvfp4", "fp8_dsv41"}
         SM120/SM121 sparse-cache storage format. ``"fp8"`` preserves the
-        existing 584-byte DSv4 cache ABI. ``"nvfp4"`` selects the 384-byte
-        group-16 NVFP4 cache ABI and its native prefill/decode kernels.
-        NVFP4 currently supports 16/32/64/128 heads, primary top-k 128 or 512,
-        primary page size 64, and optional extra-cache page size 2 or 64.
+        existing 584-byte DSv4 cache ABI. ``"fp8_dsv41"`` selects the
+        528-byte DeepSeek-V4.1 ABI (all-FP8 512-wide K with a 16-byte
+        32-wide-group UE8M0 footer, no BF16 rope segment). ``"nvfp4"`` selects
+        the 384-byte group-16 NVFP4 cache ABI and its native prefill/decode
+        kernels. NVFP4 currently supports 16/32/64/128 heads, primary top-k
+        128 or 512, primary page size 64, and optional extra-cache page size 2
+        or 64.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
-    if kv_cache_format not in ("fp8", "nvfp4"):
+    if kv_cache_format not in ("fp8", "nvfp4", "fp8_dsv41"):
         raise ValueError(
-            f"kv_cache_format must be either 'fp8' or 'nvfp4', got {kv_cache_format!r}"
+            "kv_cache_format must be 'fp8', 'fp8_dsv41', or 'nvfp4', got "
+            f"{kv_cache_format!r}"
         )
+    if kv_cache_format == "fp8_dsv41" and backend != "sparse":
+        raise ValueError("kv_cache_format='fp8_dsv41' requires backend='sparse'")
     if kv_cache_format == "nvfp4" and backend != "sparse":
         raise ValueError("kv_cache_format='nvfp4' requires backend='sparse'")
 

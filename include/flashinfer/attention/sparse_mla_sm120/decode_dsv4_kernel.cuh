@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "arch/barrier.cuh"
 #include "arch/cp_async.cuh"
 #include "arch/ldmatrix_sm120.cuh"
@@ -64,6 +66,19 @@ struct DecodeTilePrimary<ModelType::DOTS3_SWA> {
   static constexpr int WINDOW = 513;
 };
 
+// DSV4_1 halves the math warps at the full 64-candidate window: its 32-wide
+// quant groups make V_CHUNK=32, and the XV fold ties a W buffer to one scale
+// group, so 8 dim-tiles per chunk serve at most V_CHUNK/8 = 4 warps
+// (NT_PER_WARP_XV >= 1). With 4 warps each takes 16 candidates per tile.
+template <>
+struct DecodeTilePrimary<ModelType::DSV4_1> {
+  static constexpr int N_WARPS = 4;
+  static constexpr int IO_WARPS = 1;
+  static constexpr int CAND_WINDOW = 64;
+  static constexpr int KV_BUF_COUNT = 2;
+  static constexpr int WINDOW = 0;
+};
+
 template <ModelType MT>
 struct DecodeTileCfg {
   using P = DecodeTilePrimary<MT>;
@@ -95,10 +110,10 @@ struct DecodeDsv4Smem {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT>;
   // This layout assumes footer scales (a separate kv_sc buffer) and a KV smem
-  // region holding nope only. Both DSV4 and DOTS3_SWA satisfy that; the inline-
-  // scale models (DSV3_2 / GLM_NSA) bulk-copy their scales inside the KV region
-  // and use decode_dsv3_2_kernel.cuh instead.
-  static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA);
+  // region holding nope only. DSV4, DOTS3_SWA, and DSV4_1 satisfy that; the
+  // inline-scale models (DSV3_2 / GLM_NSA) bulk-copy their scales inside the
+  // KV region and use decode_dsv3_2_kernel.cuh instead.
+  static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA || MT == ModelType::DSV4_1);
   static_assert(!KV::SCALE_IN_KV_SMEM, "this smem layout keeps scales in a separate buffer");
 
   static constexpr int N_V_CHUNKS = KV::D_NOPE / KV::QUANT_TILE;
@@ -192,8 +207,8 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
     size_t stride_indices_token, size_t stride_extra_indices_token) {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT>;
-  static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA,
-                "decode-dsv4 serves the footer-scale model types (DSV4, DOTS3_SWA)");
+  static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA || MT == ModelType::DSV4_1,
+                "decode-dsv4 serves the footer-scale model types (DSV4, DOTS3_SWA, DSV4_1)");
   constexpr int D_NOPE = KV::D_NOPE;                                // 448
   constexpr int D_ROPE_C = KV::D_ROPE;                              // 64
   constexpr int D_QK = KV::D_QK;                                    // 512
@@ -331,8 +346,8 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   __syncthreads();
 
   // ── TMA bulk constants ──
-  constexpr uint32_t DSV4_BULK_NOPE_BYTES = (uint32_t)D_NOPE;                   // 448
-  constexpr uint32_t DSV4_BULK_ROPE_BYTES = (uint32_t)D_ROPE_C * sizeof(bf16);  // 128
+  constexpr uint32_t DSV4_BULK_NOPE_BYTES = (uint32_t)D_NOPE;  // DSV4 448, DSV4_1 512
+  constexpr uint32_t DSV4_BULK_ROPE_BYTES = (uint32_t)D_ROPE_C * sizeof(bf16);  // DSV4 128
   constexpr uint32_t DSV4_BULK_TX_BYTES =
       (uint32_t)Cfg::BI * (DSV4_BULK_NOPE_BYTES + DSV4_BULK_ROPE_BYTES);
 
@@ -373,10 +388,18 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
       idx_raw[e] = (cand_pos < g_end) ? section_idx_base[cand_pos] : -1;
     }
 
-    uint64_t scale_word[EPW];
+    // Footer scale rows are 8B (DSV4, DOTS3_SWA) or 16B (DSV4_1); both stay
+    // naturally aligned (the block stride and the in-block footer offset are
+    // multiples of the row width).
+    using ScaleWord = typename std::conditional<SCALE_BYTES_PER_TOKEN == 16, uint4, uint64_t>::type;
+    ScaleWord scale_word[EPW];
 #pragma unroll
     for (int e = 0; e < EPW; e++) {
-      scale_word[e] = 0;
+      if constexpr (sizeof(ScaleWord) == 16) {
+        scale_word[e] = make_uint4(0, 0, 0, 0);
+      } else {
+        scale_word[e] = 0;
+      }
       if (idx_raw[e] >= 0) {
         const int idx = idx_raw[e];
         const int block_idx_g = idx / section_pbs;
@@ -384,13 +407,13 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
         const uint8_t* scale_base = section_kv + (size_t)block_idx_g * section_stride +
                                     (size_t)section_pbs * IO_STRIDE +
                                     (size_t)local_idx_g * SCALE_BYTES_PER_TOKEN;
-        scale_word[e] = __ldg(reinterpret_cast<const uint64_t*>(scale_base));
+        scale_word[e] = __ldg(reinterpret_cast<const ScaleWord*>(scale_base));
       }
     }
 #pragma unroll
     for (int e = 0; e < EPW; e++) {
-      *reinterpret_cast<uint64_t*>(kv_sc_dst + (size_t)(e * Cfg::IO_THREADS + lane) *
-                                                   SCALE_BYTES_PER_TOKEN) = scale_word[e];
+      *reinterpret_cast<ScaleWord*>(kv_sc_dst + (size_t)(e * Cfg::IO_THREADS + lane) *
+                                                    SCALE_BYTES_PER_TOKEN) = scale_word[e];
     }
     __threadfence_block();
 
@@ -398,7 +421,8 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
       mbarrier_arrive_expect_tx(sm.mbar_full(buf), DSV4_BULK_TX_BYTES);
     }
 
-    // Issue cp.async.bulk for NoPE (448 B/entry) + RoPE (128 B/entry).
+    // Issue cp.async.bulk for the FP8 data row (D_NOPE B/entry), plus the BF16
+    // rope segment when the model has one (DSV4: 128 B/entry; DSV4_1: none).
     // Bulk completion decrements mbar tx; phase flips when arrival count
     // (1, by leader above) AND tx=0 both met.
 #pragma unroll
@@ -416,8 +440,12 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
       static_assert(DSV4_BULK_NOPE_BYTES + DSV4_BULK_ROPE_BYTES <= SPARSE_MLA_ZERO_ROW_BYTES);
       cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
                         DSV4_BULK_NOPE_BYTES, sm.mbar_full(buf));
-      cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + D_NOPE,
-                        DSV4_BULK_ROPE_BYTES, sm.mbar_full(buf));
+      // DSV4_1 has no BF16 rope segment (rope lanes live in the FP8 row), so
+      // there is no second bulk to issue.
+      if constexpr (D_ROPE_C > 0) {
+        cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + D_NOPE,
+                          DSV4_BULK_ROPE_BYTES, sm.mbar_full(buf));
+      }
     }
   };
 

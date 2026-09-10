@@ -94,18 +94,22 @@ from ._sparse_mla_sm120_plan import (
     _BI,
     _BPT_DSV3_2,
     _BPT_DSV4,
+    _BPT_DSV4_1,
     _BPT_DOTS3_SWA,
     _BPT_GLM53_NOPE,
     _DECODE_DSV3_2_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_DSV4_DISPATCH,  # noqa: F401  (vLLM probe surface)
+    _DECODE_DSV4_1_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_MAX_HEADS,
     _DECODE_MAX_TOKENS,
     _DECODE_DSV3_2_TOPKS,
     _DECODE_DSV4_TOPKS,
+    _DECODE_DSV4_1_TOPK,
     _DECODE_DOTS3_SWA_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_DOTS3_SWA_TOPK,
     _MODEL_TYPE_DSV3_2,
     _MODEL_TYPE_DSV4,
+    _MODEL_TYPE_DSV4_1,
     _MODEL_TYPE_GLM53_NOPE,
     _MODEL_TYPE_GLM_NSA,
     _MODEL_TYPE_DOTS3_SWA,
@@ -133,7 +137,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
+_KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32", "ue8m0_g32"})
 _KV_CACHE_FORMATS = frozenset({"fp8", "nvfp4"})
 
 # Page block size the decode kernels are instantiated for (same constant for
@@ -351,6 +355,15 @@ def supported_sparse_mla_sm120_configs(
             max_num_heads=_DECODE_MAX_HEADS,
             bytes_per_token=_BPT_DOTS3_SWA,
         ),
+        "dsv4_1": SparseMLASm120DecodeConfig(
+            d_qk=512,
+            page_block_size=_DECODE_DSV4_PAGE_BLOCK_SIZE,
+            max_num_tokens=_DECODE_MAX_TOKENS,
+            topks=frozenset({_DECODE_DSV4_1_TOPK}),
+            min_topk=1,
+            max_num_heads=_DECODE_MAX_HEADS,
+            bytes_per_token=_BPT_DSV4_1,
+        ),
     }
 
 
@@ -482,16 +495,27 @@ def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
     if d_qk == 576:
         if fmt == "arbitrary_fp32":
             return _MODEL_TYPE_GLM_NSA
+        if fmt not in ("auto", "pow2_fp32"):
+            raise ValueError(
+                "kv_scale_format for d_qk=576 must be 'auto'/'pow2_fp32' "
+                f"(DSV3_2) or 'arbitrary_fp32' (GLM_NSA); got {kv_scale_format!r}"
+            )
         return _MODEL_TYPE_DSV3_2
     if d_qk == 512:
-        # GLM-5.3 native NoPE (512+0) shares the DSv4 query width; the scale
-        # format disambiguates.
+        # Three model families share the 512-wide query: DSV4 ('auto', 64-wide
+        # UE8M0 groups + BF16 rope), GLM-5.3 native NoPE ('arbitrary_fp32'
+        # inline scales), and DeepSeek-V4.1 ('ue8m0_g32', 32-wide UE8M0 footer
+        # over the all-FP8 512-wide K). Width alone cannot separate them; the
+        # scale format is the explicit selector.
         if fmt == "arbitrary_fp32":
             return _MODEL_TYPE_GLM53_NOPE
+        if fmt == "ue8m0_g32":
+            return _MODEL_TYPE_DSV4_1
         if fmt != "auto":
             raise ValueError(
-                "kv_scale_format for d_qk=512 must be 'auto' (DSV4) or "
-                f"'arbitrary_fp32' (GLM53_NOPE); got {kv_scale_format!r}"
+                "kv_scale_format for d_qk=512 must be 'auto' (DSV4), "
+                f"'arbitrary_fp32' (GLM53_NOPE), or 'ue8m0_g32' (DSV4_1); "
+                f"got {kv_scale_format!r}"
             )
         return _MODEL_TYPE_DSV4
     if d_qk == 1088:
@@ -514,6 +538,8 @@ def _bytes_per_token_for_model_type(model_type: int) -> int:
         return _BPT_GLM53_NOPE
     if model_type == _MODEL_TYPE_DSV4:
         return _BPT_DSV4
+    if model_type == _MODEL_TYPE_DSV4_1:
+        return _BPT_DSV4_1
     if model_type == _MODEL_TYPE_DOTS3_SWA:
         return _BPT_DOTS3_SWA
     raise ValueError(f"Unsupported SM120 sparse-MLA model_type={model_type}")
@@ -714,7 +740,11 @@ def get_sparse_mla_sm120_module():
                 )
             )
         if planned.variant is KernelVariant.DECODE_SPLITK:
-            if model_type in (_MODEL_TYPE_DSV4, _MODEL_TYPE_DOTS3_SWA):
+            if model_type in (
+                _MODEL_TYPE_DSV4,
+                _MODEL_TYPE_DOTS3_SWA,
+                _MODEL_TYPE_DSV4_1,
+            ):
                 num_splits = _decode_dsv4_num_splits(topk, extra_topk, model_type)
                 mid_out_view, mid_lse_view = _decode_scratch_views(
                     mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
@@ -737,6 +767,7 @@ def get_sparse_mla_sm120_module():
                     extra_indices=extra_indices,
                     extra_topk_length=extra_topk_length,
                     chunks_per_block=planned.cpb,
+                    model_type=model_type,
                 )
                 return
 
@@ -852,7 +883,8 @@ def _sparse_mla_sm120_paged_attention(
         inline scales at ``d_qk=576``; ``"arbitrary_fp32"`` selects
         GLM-style arbitrary FP32 inline scales (GLM_NSA at ``d_qk=576``,
         GLM53_NOPE at ``d_qk=512``); ``"auto"`` at ``d_qk=512`` selects
-        DSV4.
+        DSV4; ``"ue8m0_g32"`` at ``d_qk=512`` selects DSV4_1 (DeepSeek-V4.1:
+        32-wide UE8M0 groups over the all-FP8 512-wide K).
     topk_length : Optional[torch.Tensor]
         Effective top-k length per query token, shape ``[num_tokens]``, dtype
         int32. Required for sliding-window MLA near sequence start; ``None``
@@ -958,7 +990,8 @@ class _SparseMLAPagedAttentionRunner:
         inline scales at ``d_qk=576``; ``"arbitrary_fp32"`` selects
         GLM-style arbitrary FP32 inline scales (GLM_NSA at ``d_qk=576``,
         GLM53_NOPE at ``d_qk=512``); ``"auto"`` at ``d_qk=512`` selects
-        DSV4.
+        DSV4; ``"ue8m0_g32"`` at ``d_qk=512`` selects DSV4_1 (DeepSeek-V4.1:
+        32-wide UE8M0 groups over the all-FP8 512-wide K).
     kv_cache_format : {"fp8", "nvfp4"}
         Packed cache format. Both formats reuse this wrapper and its ``run``
         signature; each format keeps its own planner and internal kernels.
@@ -1503,6 +1536,7 @@ def sparse_mla_sm120_decode_dsv4(
     extra_indices: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     chunks_per_block: Optional[int] = None,
+    model_type: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Sparse-MLA paged decode (DSv4 standalone kernel) on SM120.
 
@@ -1568,9 +1602,14 @@ def sparse_mla_sm120_decode_dsv4(
     output : torch.Tensor
         The mutated output tensor (for chaining).
     """
-    # d_qk resolves the model type: 512 -> DSV4 (d_v 512), 1088 -> DOTS3_SWA
-    # (d_v 1024). The FFI applies the same resolution.
-    model_type = _MODEL_TYPE_DOTS3_SWA if q.shape[-1] == 1088 else _MODEL_TYPE_DSV4
+    # model_type selects the footer-scale model explicitly; None keeps the
+    # legacy width inference: 512 -> DSV4 (d_v 512), 1088 -> DOTS3_SWA (d_v
+    # 1024). DSV4_1 shares d_qk=512 with DSV4 and is only reachable explicitly
+    # (e.g. _MODEL_TYPE_DSV4_1 from the planner, keyed by
+    # kv_scale_format="ue8m0_g32" upstream).
+    if model_type is None:
+        model_type = _MODEL_TYPE_DOTS3_SWA if q.shape[-1] == 1088 else _MODEL_TYPE_DSV4
+    model_type = int(model_type)
     _check_last_dim(output, "output", model_type)
     _check_last_dim(mid_out, "mid_out", model_type)
     if q.shape[0] == 0:
@@ -1609,6 +1648,7 @@ def sparse_mla_sm120_decode_dsv4(
         extra_kv_cache,
         extra_indices,
         extra_topk_length,
+        model_type,
         cpb_override,
     )
     return output

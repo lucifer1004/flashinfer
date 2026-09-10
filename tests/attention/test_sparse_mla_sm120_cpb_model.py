@@ -460,6 +460,7 @@ def test_model_cpb_accuracy_guard_dual_cache(
                 extra_kv_cache,
                 extra_indices,
                 None,
+                -1,  # model_type: legacy width inference (d_qk=512 -> DSV4)
                 cpb_override,
             )
 

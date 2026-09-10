@@ -163,6 +163,18 @@ def dequantize_kv_dots3_swa(packed: torch.Tensor) -> torch.Tensor:
     return _dequantize_kv_footer(packed, 1024, 64, 128, 8)
 
 
+def quantize_kv_dsv4_1(kv_bf16: torch.Tensor) -> torch.Tensor:
+    """Pack bf16 KV into DeepSeek-V4.1 FP8 FOOTER format (528 B/token):
+    512 B all-FP8 data (rope lanes included, no BF16 segment) + 16 B footer
+    of 16 UE8M0 scales over 32-wide groups."""
+    return _quantize_kv_footer(kv_bf16, 512, 0, 32, 16)
+
+
+def dequantize_kv_dsv4_1(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack DSV4_1 FP8 FOOTER → bf16. Inverse of :func:`quantize_kv_dsv4_1`."""
+    return _dequantize_kv_footer(packed, 512, 0, 32, 16)
+
+
 # DSv3.2 INLINE pack.
 
 
@@ -1987,6 +1999,322 @@ def test_sparse_mla_sm120_glm53_nope_masked_rows_ignore_poisoned_slot_zero(
         kv_scale_format="arbitrary_fp32",
         mid_out=mid_out,
         mid_lse=mid_lse,
+    )
+
+    assert torch.isfinite(output.float()).all()
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+# ── DeepSeek-V4.1 (DSV4_1) ────────────────────────────────────────────────
+# 528B/token: 512B all-FP8 K (rope lanes quantized, no BF16 rope segment) +
+# 16B footer of 16 UE8M0 scales over 32-wide groups. Selected explicitly via
+# kv_scale_format="ue8m0_g32" (d_qk=512 collides with DSV4; the 528B payload
+# collides with GLM53_NOPE).
+
+_DSV4_1_DECODE_CONFIGS = [
+    (8, 512),  # dedicated instantiation, the V4.1 indexer topk
+    (64, 512),
+    (128, 512),
+    (24, 512),  # runtime-H instantiation (in-block pad path)
+    (64, 500),  # partial tail chunk (runtime topk width)
+]
+
+
+@pytest.mark.parametrize("num_heads,topk", _DSV4_1_DECODE_CONFIGS)
+@pytest.mark.parametrize("num_tokens", [1, 16])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_sparse_mla_sm120_decode_dsv4_1(
+    num_heads: int, topk: int, num_tokens: int, with_sink: bool
+) -> None:
+    """DeepSeek-V4.1 decode (4-math-warp decode-dsv4 tile, BI=64)."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v = 512, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4_1(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4_1(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+
+    attn_sink = (
+        torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
+        if with_sink
+        else None
+    )
+
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(
+        q, kv_dequant, indices, sm_scale, d_v, attn_sink=attn_sink
+    )
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        kv_scale_format="ue8m0_g32",
+        attn_sink=attn_sink,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("num_heads", [16, 64])
+def test_sparse_mla_sm120_prefill_dsv4_1(num_heads: int) -> None:
+    """DeepSeek-V4.1 prefill: SG-only on the BI=32 producer/consumer tile;
+    H=64 rides CTA replication. num_tokens=65 forces the prefill route."""
+    torch.manual_seed(5)
+    device = torch.device("cuda")
+    d_qk, d_v = 512, 512
+    num_tokens, topk = 65, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4_1(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4_1(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        kv_scale_format="ue8m0_g32",
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_decode_dsv4_1_dual() -> None:
+    """DSV4_1 dual-cache decode through the TRTLLM-compat entry: SWA main
+    segment + compressed extra segment, both in the 528B V4.1 layout."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, num_heads = 4, 64
+    topk, extra_topk = 128, 512
+    d_qk, d_v = 512, 512
+    main_pbs, extra_pbs = 64, 2
+    main_num_blocks = 16
+    extra_num_blocks = (extra_topk + extra_pbs - 1) // extra_pbs
+    main_s_kv = main_num_blocks * main_pbs
+    extra_s_kv = extra_num_blocks * extra_pbs
+
+    main_bf16 = (
+        torch.randn(
+            main_num_blocks, main_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    extra_bf16 = (
+        torch.randn(
+            extra_num_blocks, extra_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    main_packed = quantize_kv_dsv4_1(main_bf16)
+    extra_packed = quantize_kv_dsv4_1(extra_bf16)
+    main_dequant = dequantize_kv_dsv4_1(main_packed)
+    extra_dequant = dequantize_kv_dsv4_1(extra_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    main_idx = torch.randint(
+        0, main_s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    extra_idx = torch.randint(
+        0, extra_s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
+    )
+
+    sm_scale = d_qk**-0.5
+    virtual_kv = torch.cat(
+        [main_dequant.reshape(-1, d_qk), extra_dequant.reshape(-1, d_qk)], dim=0
+    ).reshape(-1, 1, 1, d_qk)
+    virtual_idx = torch.cat(
+        [main_idx, torch.where(extra_idx < 0, extra_idx, extra_idx + main_s_kv)], dim=-1
+    )
+    ref_out, _ = _ref_sparse_attn(q, virtual_kv, virtual_idx, sm_scale, d_v)
+
+    output = flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+        query=q.unsqueeze(1),
+        swa_kv_cache=main_packed,
+        workspace_buffer=torch.empty(1, dtype=torch.int8, device=device),
+        sparse_indices=main_idx,
+        compressed_kv_cache=extra_packed,
+        swa_topk_lens=torch.full((num_tokens,), topk, dtype=torch.int32, device=device),
+        extra_sparse_indices=extra_idx,
+        extra_sparse_topk_lens=torch.full(
+            (num_tokens,), extra_topk, dtype=torch.int32, device=device
+        ),
+        bmm1_scale=sm_scale,
+        kv_layout="NHD",
+        kv_cache_format="fp8_dsv41",
+    )
+
+    torch.testing.assert_close(output.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_decode_dsv4_1_masked_rows_ignore_poisoned_slot_zero() -> None:
+    """DSV4_1 decode gathers the shared zero row for masked candidates: slot 0
+    is poisoned with 0xFF (NaN FP8 values, +inf UE8M0 scales) and must not leak."""
+    torch.manual_seed(8)
+    device = torch.device("cuda")
+    d_qk, d_v = 512, 512
+    page_block_size, num_blocks, topk = 64, 64, 512
+    num_tokens, num_heads = 16, 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4_1(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4_1(kv_packed)
+    # Poison slot 0 (block 0 token 0): the 512B data row plus its 16B footer scale.
+    flat = kv_packed.view(num_blocks, -1)
+    flat[0, :512].fill_(0xFF)
+    flat[0, page_block_size * 512 : page_block_size * 512 + 16].fill_(0xFF)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        1, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        kv_scale_format="ue8m0_g32",
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )
+
+    assert torch.isfinite(output.float()).all()
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_prefill_dsv4_1_masked_rows_ignore_poisoned_slot_zero() -> (
+    None
+):
+    """The DSV4_1 prefill gather (512B bulk + 16B scale footer read) applies the
+    same zero-row masking. num_tokens=128 forces the prefill route."""
+    torch.manual_seed(10)
+    device = torch.device("cuda")
+    d_qk, d_v = 512, 512
+    page_block_size, num_blocks, topk = 64, 64, 512
+    num_tokens, num_heads = 128, 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4_1(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4_1(kv_packed)
+    flat = kv_packed.view(num_blocks, -1)
+    flat[0, :512].fill_(0xFF)
+    flat[0, page_block_size * 512 : page_block_size * 512 + 16].fill_(0xFF)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        1, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        kv_scale_format="ue8m0_g32",
     )
 
     assert torch.isfinite(output.float()).all()

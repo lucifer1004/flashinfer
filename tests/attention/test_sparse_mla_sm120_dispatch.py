@@ -49,11 +49,13 @@ from flashinfer.mla import (
 from flashinfer.mla._sparse_mla_sm120 import (
     _DECODE_DSV3_2_DISPATCH,
     _DECODE_DSV4_DISPATCH,
+    _DECODE_DSV4_1_DISPATCH,
     _DECODE_GLM53_NOPE_DISPATCH,
     _DECODE_MAX_TOKENS,
     _DECODE_DOTS3_SWA_DISPATCH,
     _MODEL_TYPE_DSV3_2,
     _MODEL_TYPE_DSV4,
+    _MODEL_TYPE_DSV4_1,
     _MODEL_TYPE_GLM_NSA,
     _MODEL_TYPE_GLM53_NOPE,
     _MODEL_TYPE_DOTS3_SWA,
@@ -72,7 +74,14 @@ from flashinfer.mla._sparse_mla_sm120_plan import (
 def test_supported_configs_families() -> None:
     """The query API mirrors the decode dispatch envelopes exactly."""
     configs = supported_sparse_mla_sm120_configs()
-    assert set(configs) == {"dsv4", "dsv3_2", "glm_nsa", "glm53_nope", "dots3_swa"}
+    assert set(configs) == {
+        "dsv4",
+        "dsv3_2",
+        "glm_nsa",
+        "glm53_nope",
+        "dots3_swa",
+        "dsv4_1",
+    }
     assert all(
         isinstance(config, SparseMLASm120DecodeConfig) for config in configs.values()
     )
@@ -117,6 +126,16 @@ def test_supported_configs_families() -> None:
     assert (64, 513) in _DECODE_DOTS3_SWA_DISPATCH
     assert (64, 576) in _DECODE_DOTS3_SWA_DISPATCH
     assert (64, 512) not in _DECODE_DOTS3_SWA_DISPATCH
+
+    dsv4_1 = configs["dsv4_1"]
+    assert dsv4_1.d_qk == 512
+    assert dsv4_1.page_block_size == 64
+    assert dsv4_1.topks == frozenset({512})  # the V4.1 indexer topk
+    assert dsv4_1.min_topk == 1
+    assert dsv4_1.bytes_per_token == 528
+    assert (64, 512) in _DECODE_DSV4_1_DISPATCH
+    assert (48, 384) in _DECODE_DSV4_1_DISPATCH  # off the calibrated grid
+    assert (256, 512) not in _DECODE_DSV4_1_DISPATCH
 
     # The lazy export resolves through the public flashinfer.mla namespace.
     assert (
@@ -508,6 +527,7 @@ def test_plan_arbitrary_num_heads_rides_runtime_h(known_crossover) -> None:
         ("dsv4", _MODEL_TYPE_DSV4, 64, 512, "PREFILL_MG"),
         ("glm53_nope", _MODEL_TYPE_GLM53_NOPE, 32, 2176, "PREFILL_MG"),
         ("dots3_swa", _MODEL_TYPE_DOTS3_SWA, 64, 576, "PREFILL_SG"),
+        ("dsv4_1", _MODEL_TYPE_DSV4_1, 64, 512, "PREFILL_SG"),
     ],
 )
 def test_plan_crossover_injection(
@@ -813,6 +833,91 @@ def test_plan_dots3_swa_decode_and_prefill(known_crossover) -> None:
             64,
             576,
             _MODEL_TYPE_DOTS3_SWA,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_SWAPAB,
+            torch.device("cpu"),
+        )
+
+
+def test_resolve_model_type_dsv4_1_explicit_only() -> None:
+    """DSV4_1 shares d_qk=512 with DSV4 and its 528B payload with GLM53_NOPE,
+    so it is reachable only through the explicit ue8m0_g32 scale format."""
+    assert _resolve_model_type(512, "auto") == _MODEL_TYPE_DSV4
+    assert _resolve_model_type(512, "arbitrary_fp32") == _MODEL_TYPE_GLM53_NOPE
+    assert _resolve_model_type(512, "ue8m0_g32") == _MODEL_TYPE_DSV4_1
+    # The format is pinned to the 512-wide layout; other widths reject it.
+    with pytest.raises(ValueError, match="kv_scale_format"):
+        _resolve_model_type(576, "ue8m0_g32")
+    with pytest.raises(ValueError, match="kv_scale_format"):
+        _resolve_model_type(1088, "ue8m0_g32")
+
+
+def test_plan_dsv4_1_decode_and_prefill(known_crossover) -> None:
+    """DSV4_1: decode (incl. dual-cache) at (H, 512) for T<=64; SG-only
+    prefill above (its 32-wide quant groups floor the MG XV warp split)."""
+    plan_mod, _ = known_crossover
+    for num_heads in (8, 16, 32, 64):
+        planned = plan_mod.plan(
+            4,
+            num_heads,
+            512,
+            _MODEL_TYPE_DSV4_1,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        assert planned is not None
+        assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
+    # Dual-cache decode stays on the decode-dsv4 kernel (same as DSV4).
+    planned = plan_mod.plan(
+        4,
+        64,
+        512,
+        _MODEL_TYPE_DSV4_1,
+        64,
+        True,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+        extra_topk=512,
+    )
+    assert planned is not None
+    assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
+    # Past the decode-form cutoff every supported head count routes to SG.
+    for num_heads in (8, 16, 32, 64):
+        planned = plan_mod.plan(
+            65,
+            num_heads,
+            512,
+            _MODEL_TYPE_DSV4_1,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        assert planned is not None
+        assert planned.variant is plan_mod.KernelVariant.PREFILL_SG
+    # Dual-cache prefill has no DSV4_1 form: the call decodes instead.
+    planned = plan_mod.plan(
+        65,
+        64,
+        512,
+        _MODEL_TYPE_DSV4_1,
+        64,
+        True,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+        extra_topk=512,
+    )
+    assert planned is None  # T > 64 is past the decode-form cutoff
+    # Forcing swapAB on the SG-only family raises.
+    with pytest.raises(ValueError, match="V32-family"):
+        plan_mod.plan(
+            128,
+            64,
+            512,
+            _MODEL_TYPE_DSV4_1,
             64,
             False,
             plan_mod._PREFILL_IMPL_SWAPAB,

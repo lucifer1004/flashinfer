@@ -250,6 +250,54 @@ struct KVCacheTraits<ModelType::DSV4> {
   }
 };
 
+template <>
+struct KVCacheTraits<ModelType::DSV4_1> {
+  // DeepSeek-V4.1: the full 512-wide K — rope lanes included — is FP8, so
+  // there is no BF16 rope segment anywhere (QK runs one unified block-scaled
+  // FP8 pass, V is pure nope). Geometry matches GLM53_NOPE; scale placement
+  // matches DSV4 (footer), but the quant groups are 32 wide.
+  static constexpr int D_NOPE = 512;
+  static constexpr int D_ROPE = 0;
+  static constexpr int D_QK = D_NOPE;  // 512
+  static constexpr int D_V = 512;
+
+  // FP8 quantization: UE8M0 scales, footer, 32-wide groups → 16 scales per
+  // token covering all 512 lanes; the 16B footer row needs no pad.
+  using Scales = ScaleSpec<ScaleFormat::UE8M0_BYTE, 32, false>;
+  static constexpr int QUANT_TILE = Scales::GROUP;
+  static constexpr int NUM_SCALES = Scales::count(D_NOPE);  // 16
+  static constexpr ScaleFormat SCALE_FORMAT = Scales::FORMAT;
+
+  // KV cache layout (FlashMLA ABI): FOOTER, 528 logical bytes per token.
+  //   [0 : block_size*512)                data (512B FP8 per token)
+  //   [block_size*512 : block_size*528)   scale footer (16B each: 16×UE8M0)
+  // IO stride = 512 (data only), 512 % 16 = 0 ✓ for cp.async.bulk.
+  static constexpr bool SCALE_INLINE = Scales::INLINE;
+  static constexpr int SCALE_BYTES_PER_TOKEN = Scales::bytes_per_token(D_NOPE);  // 16
+  static constexpr int KV_GMEM_STRIDE = D_NOPE + SCALE_BYTES_PER_TOKEN;          // 528
+  static constexpr int KV_ROPE_GMEM_OFFSET = D_NOPE;                             // no rope segment
+  static constexpr int KV_SCALE_GMEM_OFFSET = Scales::gmem_offset(D_NOPE, 0);    // 512
+
+  // Smem layout (nope only + padding, no rope, no inline scales).
+  // stride=528: 528/4=132, 132%32=4 → 4-way bank conflict, the same class as
+  // DSV3_2 (acceptable).
+  static constexpr int KV_SMEM_STRIDE = D_NOPE + 16;  // 528
+  static constexpr int KV_SMEM_COPY_BYTES = D_NOPE;   // copy 512B per entry
+  static constexpr bool SCALE_IN_KV_SMEM = false;
+
+  // Q nope stride
+  static constexpr int Q_NOPE_STRIDE = D_NOPE + 16;      // 528
+  static constexpr int Q_NOPE_BF16_STRIDE = D_NOPE + 8;  // 520 bf16 (1040 B)
+
+  // V = pure nope (the rope lanes are part of the quantized row).
+  static constexpr bool V_HAS_ROPE = false;
+
+  // UE8M0 scales are native — no conversion needed
+  __device__ static __forceinline__ uint8_t scale_to_ue8m0(uint8_t scale) {
+    return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
+  }
+};
+
 // ============================================================================
 // Shared constants across all model types
 // ============================================================================
@@ -273,6 +321,8 @@ static_assert(KVCacheTraits<ModelType::GLM_NSA>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::GLM_NSA>::D_V == D_V);
 static_assert(KVCacheTraits<ModelType::GLM53_NOPE>::D_ROPE == 0);
 static_assert(KVCacheTraits<ModelType::GLM53_NOPE>::D_V == D_V);
+static_assert(KVCacheTraits<ModelType::DSV4_1>::D_ROPE == 0);
+static_assert(KVCacheTraits<ModelType::DSV4_1>::D_V == D_V);
 static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::D_V != D_V,
               "DOTS3_SWA is the D_V opt-out; if it ever equals 512, fold it back "
@@ -295,6 +345,10 @@ static_assert(KVCacheTraits<ModelType::DSV4>::KV_SCALE_GMEM_OFFSET == 576);
 static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::NUM_SCALES == 8);
 static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::SCALE_BYTES_PER_TOKEN == 8);
 static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::KV_GMEM_STRIDE == 1160);
+static_assert(KVCacheTraits<ModelType::DSV4_1>::NUM_SCALES == 16);
+static_assert(KVCacheTraits<ModelType::DSV4_1>::SCALE_BYTES_PER_TOKEN == 16);
+static_assert(KVCacheTraits<ModelType::DSV4_1>::KV_GMEM_STRIDE == 528);
+static_assert(KVCacheTraits<ModelType::DSV4_1>::KV_SCALE_GMEM_OFFSET == 512);
 
 // Warp configuration
 static constexpr int N_MATH_WARPS = 8;
