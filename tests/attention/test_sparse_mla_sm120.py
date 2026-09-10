@@ -4072,6 +4072,58 @@ def test_sparse_mla_sm120_footer_flat_block_stride(
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
+def test_glm53_decode_flat_block_stride() -> None:
+    """GLM decode preserves gaps between flat pages, independently of row stride."""
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _MODEL_TYPE_GLM53_NOPE,
+        sparse_mla_sm120_decode_dsv3_2,
+    )
+
+    torch.manual_seed(14)
+    device = torch.device("cuda")
+    num_tokens, num_heads, topk = 4, 32, 2176
+    q = (
+        torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device)
+        / 10
+    )
+    packed = (
+        quantize_kv_glm53_nope(
+            torch.randn(4, 64, 1, 512, dtype=torch.bfloat16, device=device) / 10
+        )[..., :528]
+        .contiguous()
+        .view(4, 64 * 528)
+    )
+    storage = torch.full((4, 64 * 528 + 16), 0xFF, dtype=torch.uint8, device=device)
+    gapped = storage[:, : 64 * 528]
+    gapped.copy_(packed)
+    # Every read uses a later page, making the incorrect dense stride observable.
+    indices = torch.randint(
+        64, 256, (num_tokens, topk), dtype=torch.int32, device=device
+    )
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, 512, device)
+
+    def run(cache: torch.Tensor):
+        output = torch.empty_like(q)
+        lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
+        sparse_mla_sm120_decode_dsv3_2(
+            q,
+            cache,
+            indices,
+            mid_out,
+            mid_lse,
+            output,
+            lse,
+            512**-0.5,
+            model_type=_MODEL_TYPE_GLM53_NOPE,
+            chunks_per_block=1,
+        )
+        return output, lse
+
+    expected = run(packed)
+    for actual, reference in zip(run(gapped), expected, strict=True):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "num_tokens,num_heads", [(65, 8), (65, 32), (128, 64), (16, 64)]
 )
